@@ -19,8 +19,16 @@ class ParseResult:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?m")
 _TOOL_CALL_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
 _TOOL_CALL_PAREN_RE = re.compile(r"^●\s+(\w+)\((.+)\)$")
-_PROMPT_RE = re.compile(r"❯\s*$")
+_PROMPT_RE = re.compile(r"^❯")
 _PERMISSION_RE = re.compile(r"(Allow\?.*|.*permission.*|.*Yes.*No.*)", re.IGNORECASE)
+# Bottom status bar patterns — these are NOT real permission prompts
+_DECORATION_RE = re.compile(r"^[─━]{5,}$")  # thin or thick separator lines
+_STATUS_BAR_RE = re.compile(
+    r"(bypass permissions (on|off)|shift\+tab to cycle|esc to interrupt|"
+    r"⏵⏵|/model|/mcp|/ide for Visual Studio Code|"
+    r"[─━]{5,})",  # horizontal separator lines (thin ─ or thick ━)
+    re.IGNORECASE,
+)
 _ERROR_RE = re.compile(r"(Error:.*|Failed:.*|error:.*)", re.IGNORECASE)
 
 
@@ -55,13 +63,26 @@ class OutputParser:
         if error_match:
             return ParseResult(state="ERROR", error_text=error_match.group(0))
 
-        # Check PERMISSION
-        perm_match = _PERMISSION_RE.search(all_text)
-        if perm_match:
-            return ParseResult(state="PERMISSION", permission_text=perm_match.group(0))
+        # Check PERMISSION — but exclude bottom status bar lines
+        # Status bar contains "bypass permissions on" etc. which falsely match
+        non_status_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
+        if non_status_lines:
+            non_status_text = "\n".join(non_status_lines)
+            perm_match = _PERMISSION_RE.search(non_status_text)
+            if perm_match:
+                return ParseResult(state="PERMISSION", permission_text=perm_match.group(0))
 
-        # Check TOOL_CALL (scan all lines, pick last occurrence)
-        for line in reversed(lines):
+        # Check IDLE before TOOL_CALL — if there's a prompt anywhere in
+        # the recent non-decorative lines, the tool call is from a completed turn.
+        idle_check_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
+        for line in reversed(idle_check_lines):
+            if _PROMPT_RE.search(line):
+                return ParseResult(state="IDLE")
+
+        # Check TOOL_CALL (scan recent lines only — last 10, not all)
+        # Old ● lines from completed turns should not trigger this.
+        recent_lines = lines[-10:] if len(lines) >= 10 else lines
+        for line in reversed(recent_lines):
             tool_info = OutputParser._parse_tool_line(line)
             if tool_info:
                 return ParseResult(
@@ -69,10 +90,6 @@ class OutputParser:
                     tool_name=tool_info["tool_name"],
                     tool_target=tool_info["target"],
                 )
-
-        # Check IDLE (prompt at last line)
-        if _PROMPT_RE.search(last_lines[-1]):
-            return ParseResult(state="IDLE")
 
         # Default: THINKING
         return ParseResult(state="THINKING")
