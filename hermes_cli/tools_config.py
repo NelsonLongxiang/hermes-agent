@@ -66,6 +66,7 @@ CONFIGURABLE_TOOLSETS = [
     ("messaging",       "📨 Cross-Platform Messaging",  "send_message"),
     ("rl",              "🧪 RL Training",               "Tinker-Atropos training tools"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
+    ("claude_session",   "🤖 Claude Code Session",       "interactive Claude Code control via tmux"),
 ]
 
 # Toolsets that are OFF by default for new installs.
