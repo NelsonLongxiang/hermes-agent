@@ -6167,6 +6167,16 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
+        # Track consecutive stale detections so we can auto-fallback to
+        # non-streaming when the provider's streaming endpoint is
+        # consistently unresponsive (accepts SSE connections but never
+        # sends chunks).  Without this, the agent wastes 10+ minutes
+        # retrying a dead streaming endpoint.
+        _stale_count = 0
+        _max_stale_before_fallback = int(
+            os.getenv("HERMES_STALE_STREAM_FALLBACK_THRESHOLD", 2)
+        )
+
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         _last_heartbeat = time.time()
@@ -6226,6 +6236,30 @@ class AIAgent:
                 self._touch_activity(
                     f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
                 )
+
+                # ── Auto-fallback to non-streaming ───────────────
+                # If the provider's streaming endpoint is consistently
+                # unresponsive (accepts SSE connections but never sends
+                # chunks), stop wasting time retrying streaming and
+                # fall back to non-streaming mode for this session.
+                _stale_count += 1
+                if _stale_count >= _max_stale_before_fallback:
+                    logger.warning(
+                        "Stream stale %d consecutive times — auto-disabling "
+                        "streaming for this session. model=%s",
+                        _stale_count,
+                        api_kwargs.get("model", "unknown"),
+                    )
+                    self._disable_streaming = True
+                    self._emit_status(
+                        "⚠️ Provider unresponsive to streaming after "
+                        f"{_stale_count} attempts ({int(_stale_elapsed)}s each). "
+                        "Switching to non-streaming mode\u2026"
+                    )
+                    self._safe_print(
+                        "\n⚠  Streaming endpoint is not responding. "
+                        "Switching to non-streaming mode for this session.\n"
+                    )
 
             if self._interrupt_requested:
                 try:
