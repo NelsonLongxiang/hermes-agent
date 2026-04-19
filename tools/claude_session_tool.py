@@ -45,7 +45,7 @@ CLAUDE_SESSION_SCHEMA = {
         "'output' (get output with pagination), "
         "'respond_permission' (handle permission dialog), "
         "'stop' (terminate session), 'history' (turn history), "
-        "'events' (get queued events)."
+        "'events' (get queued events), 'diagnose' (check dependencies)."
     ),
     "parameters": {
         "type": "object",
@@ -56,6 +56,7 @@ CLAUDE_SESSION_SCHEMA = {
                     "start", "send", "type", "submit", "cancel_input",
                     "status", "wait_for_idle", "wait_for_state",
                     "output", "respond_permission", "stop", "history", "events",
+                    "diagnose",
                 ],
                 "description": "Action to perform on the Claude session",
             },
@@ -186,12 +187,14 @@ def _handle_claude_session(args, **kw):
         result = mgr.history()
     elif action == "events":
         result = mgr.events(since_turn=args.get("since_turn", 0))
+    elif action == "diagnose":
+        result = _diagnose_claude_session()
     else:
         return tool_error(
             f"Unknown action: {action}. "
             "Valid: start, send, type, submit, cancel_input, status, "
             "wait_for_idle, wait_for_state, output, respond_permission, "
-            "stop, history, events"
+            "stop, history, events, diagnose"
         )
 
     return json.dumps(result, ensure_ascii=False)
@@ -202,8 +205,124 @@ def _handle_claude_session(args, **kw):
 # ---------------------------------------------------------------------------
 
 def _check_claude_session():
-    """Check if tmux and claude are available."""
-    return shutil.which("tmux") is not None
+    """Check if tmux (hard dep) and claude CLI (soft dep) are available.
+    
+    Only tmux is required for the tool to register. Claude CLI availability
+    is logged as a warning but does not prevent registration, because the
+    user might install it later.
+    """
+    tmux_ok = shutil.which("tmux") is not None
+    claude_ok = shutil.which("claude") is not None
+    
+    if not claude_ok:
+        logger.warning(
+            "claude_session: Claude Code CLI not found in PATH. "
+            "Install with: npm install -g @anthropic-ai/claude-code"
+        )
+    
+    if not tmux_ok:
+        logger.warning(
+            "claude_session: tmux not found in PATH. "
+            "Install with: apt install tmux / brew install tmux"
+        )
+    
+    return tmux_ok
+
+
+def _diagnose_claude_session() -> dict:
+    """Diagnose claude_session dependencies and configuration.
+    
+    Returns a structured report of all dependencies, their status,
+    and remediation hints. Used by the 'diagnose' action.
+    """
+    import os
+    
+    checks = []
+    all_ok = True
+    
+    # 1. tmux
+    tmux_path = shutil.which("tmux")
+    checks.append({
+        "dependency": "tmux",
+        "status": "ok" if tmux_path else "missing",
+        "path": tmux_path,
+        "hint": "Install: apt install tmux / brew install tmux" if not tmux_path else None,
+        "required": True,
+    })
+    if not tmux_path:
+        all_ok = False
+    
+    # 2. claude CLI
+    claude_path = shutil.which("claude")
+    checks.append({
+        "dependency": "Claude Code CLI",
+        "status": "ok" if claude_path else "missing",
+        "path": claude_path,
+        "hint": "Install: npm install -g @anthropic-ai/claude-code" if not claude_path else None,
+        "required": True,
+    })
+    if not claude_path:
+        all_ok = False
+    
+    # 3. HERMES_STREAM_STALE_TIMEOUT
+    timeout_val = os.environ.get("HERMES_STREAM_STALE_TIMEOUT", "")
+    timeout_ok = timeout_val.isdigit() and int(timeout_val) >= 300
+    checks.append({
+        "dependency": "HERMES_STREAM_STALE_TIMEOUT",
+        "status": "ok" if timeout_ok else ("not_set" if not timeout_val else "too_low"),
+        "value": timeout_val or "(not set)",
+        "hint": (
+            "Set to >= 300 in ~/.hermes/.env to prevent Stream Stalled errors"
+            if not timeout_ok else None
+        ),
+        "required": False,
+    })
+    
+    # 4. tmux version
+    tmux_version = ""
+    if tmux_path:
+        try:
+            import subprocess
+            result = subprocess.run(
+                [tmux_path, "-V"], capture_output=True, text=True, timeout=5
+            )
+            tmux_version = result.stdout.strip()
+        except Exception:
+            tmux_version = "unknown"
+    checks.append({
+        "dependency": "tmux version",
+        "status": "ok" if tmux_version else "unknown",
+        "value": tmux_version or "unknown",
+        "required": False,
+    })
+    
+    # 5. Claude Code version
+    claude_version = ""
+    if claude_path:
+        try:
+            import subprocess
+            result = subprocess.run(
+                [claude_path, "--version"], capture_output=True, text=True, timeout=10
+            )
+            claude_version = result.stdout.strip()
+        except Exception:
+            claude_version = "unknown"
+    checks.append({
+        "dependency": "Claude Code version",
+        "status": "ok" if claude_version else "unknown",
+        "value": claude_version or "unknown",
+        "required": False,
+    })
+    
+    return {
+        "status": "ready" if all_ok else "missing_deps",
+        "checks": checks,
+        "summary": (
+            "All dependencies met — claude_session is ready to use."
+            if all_ok
+            else "Missing required dependencies. See hints above."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

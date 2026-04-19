@@ -1,36 +1,97 @@
 #!/usr/bin/env bash
-# claude-session 环境优化配置脚本
-# 用途：自动配置 HERMES_STREAM_STALE_TIMEOUT，防止 Stream Stalled 中断
+# claude-session 安装配置钩子
+# 用途：检查依赖 + 自动配置环境变量 + 权限预设
 # 使用：bash ~/.hermes/skills/claude-session/scripts/configure.sh
+# 触发：首次启用 claude_session toolset 时由 tools_config.py 调用
 
 set -euo pipefail
 
 HERMES_ENV="${HERMES_HOME:-$HOME/.hermes}/.env"
 VAR_NAME="HERMES_STREAM_STALE_TIMEOUT"
 RECOMMENDED_VALUE="300"
+ISSUES=()
+ALL_OK=true
 
-echo "=== Claude Session 环境优化配置 ==="
+echo "=== 🤖 Claude Code Session — 安装配置 ==="
 echo ""
 
-# 检查是否已配置
-if grep -q "^${VAR_NAME}=" "$HERMES_ENV" 2>/dev/null; then
-    current=$(grep "^${VAR_NAME}=" "$HERMES_ENV" | cut -d'=' -f2)
-    echo "✅ ${VAR_NAME} 已配置为 ${current}"
-    if [ "$current" != "$RECOMMENDED_VALUE" ]; then
-        echo "⚠️  当前值 ${current} 与推荐值 ${RECOMMENDED_VALUE} 不同"
-        echo "   推荐值 ${RECOMMENDED_VALUE} 适合大多数场景（研究、编码、长任务）"
-    fi
+# ── 1. 依赖检查 ──────────────────────────────────────────────────────────────
+
+# tmux
+echo "Checking tmux..."
+if command -v tmux >/dev/null 2>&1; then
+    TMUX_VER=$(tmux -V 2>/dev/null || echo "unknown")
+    echo "  ✅ tmux: $TMUX_VER"
 else
-    echo "🔧 正在配置 ${VAR_NAME}=${RECOMMENDED_VALUE} ..."
-    echo "" >> "$HERMES_ENV"
-    echo "# Claude Session 优化 - 防止 Stream Stalled 中断" >> "$HERMES_ENV"
-    echo "${VAR_NAME}=${RECOMMENDED_VALUE}" >> "$HERMES_ENV"
-    echo "✅ 已写入 ${HERMES_ENV}"
+    echo "  ❌ tmux: 未安装"
+    ISSUES+=("tmux — Install: apt install tmux / brew install tmux")
+    ALL_OK=false
+fi
+
+# Claude Code CLI
+echo "Checking Claude Code CLI..."
+if command -v claude >/dev/null 2>&1; then
+    CLAUDE_VER=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+    echo "  ✅ Claude Code: $CLAUDE_VER"
+else
+    echo "  ❌ Claude Code CLI: 未安装"
+    ISSUES+=("Claude Code CLI — Install: npm install -g @anthropic-ai/claude-code")
+    ALL_OK=false
 fi
 
 echo ""
-echo "⚠️  重要：需要重启 Hermes Gateway 才能生效！"
-echo "   在运行 gateway 的终端中 Ctrl+C，然后运行："
-echo "   hermes gateway run"
+
+# ── 2. 环境变量配置 ──────────────────────────────────────────────────────────
+
+echo "Configuring environment variables..."
+
+if grep -q "^${VAR_NAME}=" "$HERMES_ENV" 2>/dev/null; then
+    current=$(grep "^${VAR_NAME}=" "$HERMES_ENV" | cut -d'=' -f2)
+    if [ "$current" -lt "$RECOMMENDED_VALUE" ] 2>/dev/null; then
+        echo "  ⚠️  ${VAR_NAME}=${current} (recommend ≥ ${RECOMMENDED_VALUE})"
+    else
+        echo "  ✅ ${VAR_NAME}=${current}"
+    fi
+else
+    echo "" >> "$HERMES_ENV"
+    echo "# Claude Session 优化 - 防止 Stream Stalled 中断" >> "$HERMES_ENV"
+    echo "${VAR_NAME}=${RECOMMENDED_VALUE}" >> "$HERMES_ENV"
+    echo "  ✅ Auto-configured ${VAR_NAME}=${RECOMMENDED_VALUE}"
+    echo "     (Prevents 'Stream Stalled' errors during long tasks)"
+fi
+
 echo ""
-echo "配置完成 ✅"
+
+# ── 3. Claude Code 权限预设（可选） ──────────────────────────────────────────
+
+CLAUDE_DIR="$HOME/.claude"
+if [ -d "$CLAUDE_DIR" ]; then
+    echo "Detected Claude Code config directory..."
+    SETTINGS="$CLAUDE_DIR/settings.json"
+
+    if [ ! -f "$SETTINGS" ]; then
+        echo "  ℹ️  No settings.json yet — will be created on first claude run"
+    else
+        echo "  ✅ Claude Code settings.json exists"
+    fi
+    echo ""
+fi
+
+# ── 4. 结果汇总 ──────────────────────────────────────────────────────────────
+
+if [ "$ALL_OK" = true ]; then
+    echo "✅ All dependencies met — claude_session is ready to use."
+else
+    echo "⚠️  Missing dependencies:"
+    for issue in "${ISSUES[@]}"; do
+        echo "    • $issue"
+    done
+    echo ""
+    echo "  claude_session will not work until these are installed."
+fi
+
+echo ""
+echo "⚠️  Important: Restart Hermes Gateway for env changes to take effect!"
+echo "   Ctrl+C the gateway, then run: hermes gateway run"
+echo ""
+echo "Configuration complete ✅"

@@ -1373,6 +1373,64 @@ def _reconfigure_simple_requirements(ts_key: str):
             _print_info("    Kept current")
 
 
+# ─── Claude Session Post-Setup ────────────────────────────────────────────────
+
+def _post_setup_claude_session():
+    """Check dependencies and auto-configure environment for claude_session.
+    
+    Called after the user enables claude_session in the tools checklist.
+    Performs three things:
+    1. Checks for tmux and claude CLI availability
+    2. Auto-configures HERMES_STREAM_STALE_TIMEOUT if not set
+    3. Reports status and remediation hints
+    """
+    import shutil as _shutil
+    
+    print()
+    print(color("  🤖 Claude Code Session — Dependency Check", Colors.CYAN))
+    
+    issues = []
+    
+    # 1. Check tmux
+    if not _shutil.which("tmux"):
+        issues.append(("tmux", "apt install tmux / brew install tmux"))
+    
+    # 2. Check claude CLI
+    if not _shutil.which("claude"):
+        issues.append(("Claude Code CLI", "npm install -g @anthropic-ai/claude-code"))
+    
+    # 3. Auto-configure HERMES_STREAM_STALE_TIMEOUT
+    current_timeout = get_env_value("HERMES_STREAM_STALE_TIMEOUT")
+    if not current_timeout:
+        save_env_value("HERMES_STREAM_STALE_TIMEOUT", "300")
+        print(color("  ✓ Auto-configured HERMES_STREAM_STALE_TIMEOUT=300", Colors.GREEN))
+        print(color("    (Prevents 'Stream Stalled' errors during long tasks)", Colors.DIM))
+    elif current_timeout.isdigit() and int(current_timeout) < 300:
+        print(color(
+            f"  ⚠ HERMES_STREAM_STALE_TIMEOUT={current_timeout} (recommend ≥ 300)",
+            Colors.YELLOW,
+        ))
+        print(color("    Run: hermes env HERMES_STREAM_STALE_TIMEOUT 300", Colors.DIM))
+    else:
+        print(color(f"  ✓ HERMES_STREAM_STALE_TIMEOUT={current_timeout}", Colors.GREEN))
+    
+    # 4. Report issues
+    if issues:
+        print()
+        print(color("  ⚠ Missing dependencies:", Colors.YELLOW))
+        for dep, hint in issues:
+            print(color(f"    • {dep}: {hint}", Colors.DIM))
+        print(color(
+            "  claude_session will not work until these are installed.",
+            Colors.YELLOW,
+        ))
+        print(color("  After installing, restart the gateway.", Colors.DIM))
+    else:
+        print(color("  ✓ All dependencies met", Colors.GREEN))
+    
+    print()
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
 def tools_command(args=None, first_install: bool = False, config: dict = None):
@@ -1474,6 +1532,10 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             save_config(config)
             print(color(f"  ✓ Saved {pinfo['label']} tool configuration", Colors.GREEN))
             print()
+
+            # ── Post-check: claude_session dependency setup ──
+            if "claude_session" in new_enabled:
+                _post_setup_claude_session()
 
         return
 
@@ -1595,6 +1657,10 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             _save_platform_tools(config, pkey, new_enabled)
             save_config(config)
             print(color(f"  ✓ Saved {pinfo['label']} configuration", Colors.GREEN))
+
+            # ── Post-check: claude_session dependency setup ──
+            if "claude_session" in added:
+                _post_setup_claude_session()
         else:
             print(color(f"  No changes to {pinfo['label']}", Colors.DIM))
 
