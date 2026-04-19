@@ -45,7 +45,7 @@ _HERMES_CORE_TOOLS = [
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
-    "browser_vision", "browser_console",
+    "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -123,7 +123,7 @@ TOOLSETS = {
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "web_search"
+            "browser_vision", "browser_console", "browser_cdp", "web_search"
         ],
         "includes": []
     },
@@ -257,7 +257,7 @@ TOOLSETS = {
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
-            "browser_vision", "browser_console",
+            "browser_vision", "browser_console", "browser_cdp",
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
@@ -282,7 +282,7 @@ TOOLSETS = {
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
-            "browser_vision", "browser_console",
+            "browser_vision", "browser_console", "browser_cdp",
             # Planning & memory
             "todo", "memory",
             # Session history search

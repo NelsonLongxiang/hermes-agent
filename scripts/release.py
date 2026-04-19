@@ -48,6 +48,7 @@ AUTHOR_MAP = {
     "35742124+0xbyt4@users.noreply.github.com": "0xbyt4",
     "82637225+kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
+    "kshitijk4poor@gmail.com": "kshitijk4poor",
     "16443023+stablegenius49@users.noreply.github.com": "stablegenius49",
     "185121704+stablegenius49@users.noreply.github.com": "stablegenius49",
     "101283333+batuhankocyigit@users.noreply.github.com": "batuhankocyigit",
@@ -74,6 +75,10 @@ AUTHOR_MAP = {
     "109555139+davetist@users.noreply.github.com": "davetist",
     "39405770+yyq4193@users.noreply.github.com": "yyq4193",
     "Asunfly@users.noreply.github.com": "Asunfly",
+    "2500400+honghua@users.noreply.github.com": "honghua",
+    "nish3451@users.noreply.github.com": "nish3451",
+    "Mibayy@users.noreply.github.com": "Mibayy",
+    "135070653+sgaofen@users.noreply.github.com": "sgaofen",
     # contributors (manual mapping from git names)
     "ahmedsherif95@gmail.com": "asheriif",
     "liujinkun@bytedance.com": "liujinkun2025",
@@ -150,6 +155,7 @@ AUTHOR_MAP = {
     "1115117931@qq.com": "aaronagent",
     "1506751656@qq.com": "hqhq1025",
     "364939526@qq.com": "luyao618",
+    "906014227@qq.com": "bingo906",
     "aaronwong1999@icloud.com": "AaronWong1999",
     "agents@kylefrench.dev": "DeployFaith",
     "angelos@oikos.lan.home.malaiwah.com": "angelos",
@@ -172,6 +178,7 @@ AUTHOR_MAP = {
     "duerzy@gmail.com": "duerzy",
     "emozilla@nousresearch.com": "emozilla",
     "fancydirty@gmail.com": "fancydirty",
+    "farion1231@gmail.com": "farion1231",
     "floptopbot33@gmail.com": "flobo3",
     "fontana.pedro93@gmail.com": "pefontana",
     "francis.x.fitzpatrick@gmail.com": "fxfitz",
@@ -212,6 +219,7 @@ AUTHOR_MAP = {
     "ziliangpeng@users.noreply.github.com": "ziliangpeng",
     "centripetal-star@users.noreply.github.com": "centripetal-star",
     "LeonSGP43@users.noreply.github.com": "LeonSGP43",
+    "154585401+LeonSGP43@users.noreply.github.com": "LeonSGP43",
     "Lubrsy706@users.noreply.github.com": "Lubrsy706",
     "niyant@spicefi.xyz": "spniyant",
     "olafthiele@gmail.com": "olafthiele",
@@ -264,6 +272,10 @@ AUTHOR_MAP = {
     "asurla@nvidia.com": "anniesurla",
     "limkuan24@gmail.com": "WideLee",
     "aviralarora002@gmail.com": "AviArora02-commits",
+    "junminliu@gmail.com": "JimLiu",
+    "jarvischer@gmail.com": "maxchernin",
+    "levantam.98.2324@gmail.com": "LVT382009",
+    "zhurongcheng@rcrai.com": "heykb",
 }
 
 
