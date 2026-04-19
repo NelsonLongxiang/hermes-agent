@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
@@ -137,20 +138,24 @@ class ClaudeSessionManager:
                     # Start Claude Code
                     claude_cmd = "claude"
                     if permission_mode == "skip":
-                        claude_cmd = "claude --dangerously-skip-permissions"
+                        claude_cmd = "claude --permission-mode bypassPermissions"
                     if model:
                         claude_cmd += f" --model {model}"
                     self._tmux.send_keys(claude_cmd, enter=True)
                     # Wait briefly for Claude Code to start
                     time.sleep(2)
 
-                    # Handle skip permission warning dialog
+                    # Handle skip permission confirmation if any
                     if permission_mode == "skip":
                         time.sleep(1)
-                        self._tmux.send_special_key("Down")
-                        time.sleep(0.3)
-                        self._tmux.send_special_key("Enter")
-                        time.sleep(1)
+                        # --permission-mode bypassPermissions may show a confirmation
+                        # dialog; try to dismiss it with Down+Enter
+                        pane = self._tmux.capture_pane()
+                        if "permission" in pane.lower() or "bypass" in pane.lower() or "yes" in pane.lower():
+                            self._tmux.send_special_key("Down")
+                            time.sleep(0.3)
+                            self._tmux.send_special_key("Enter")
+                            time.sleep(1)
 
             except Exception as e:
                 return {"error": f"Failed to start session: {e}"}
@@ -442,6 +447,10 @@ class ClaudeSessionManager:
 
         Runs in the poller background thread. All shared state mutations
         are protected by self._lock.
+
+        When permission_mode is 'skip' and state transitions to PERMISSION,
+        automatically approves the permission request without requiring
+        external respond_permission calls.
         """
         now = time.monotonic()
 
@@ -475,6 +484,72 @@ class ClaudeSessionManager:
 
         # Signal waiters outside lock
         self._state_event.set()
+
+        # Auto-approve permissions when in skip mode
+        if (
+            transition.to_state == ClaudeState.PERMISSION
+            and self._permission_mode == "skip"
+        ):
+            self._auto_approve_permission()
+
+    def _auto_approve_permission(self) -> None:
+        """Auto-approve a permission request when in skip mode.
+
+        First checks if this is a real permission prompt (not the bottom
+        status bar "bypass permissions on" line). For real prompts, sends
+        'y' + Enter. Runs in the poller background thread.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Small delay to let the permission prompt fully render
+            time.sleep(0.3)
+
+            if self._sm.current_state != ClaudeState.PERMISSION:
+                # Already transitioned away, nothing to do
+                return
+
+            # Verify this is a REAL permission prompt, not the status bar
+            # by capturing and checking the pane content directly
+            try:
+                pane = self._tmux.capture_pane()
+                # If the only "permission" text is the status bar, skip
+                from tools.claude_session.output_parser import OutputParser, _STATUS_BAR_RE
+                lines = OutputParser.clean_lines(pane)
+                last_lines = lines[-5:] if len(lines) >= 5 else lines
+                non_status = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
+                non_status_text = "\n".join(non_status)
+
+                # Check for real permission keywords (Allow?, Yes/No, etc.)
+                # but NOT status bar "bypass permissions on"
+                has_real_prompt = bool(
+                    re.search(r"(Allow\?|Yes.*No|permission to|wants to)", non_status_text, re.IGNORECASE)
+                )
+
+                if not has_real_prompt:
+                    logger.info("Skipping auto-approve: no real permission prompt found (status bar only)")
+                    # Force state back to THINKING — the poller will correct it next cycle
+                    self._sm.transition(ClaudeState.THINKING)
+                    return
+            except Exception as e:
+                logger.warning("Auto-approve pane check failed: %s", e)
+
+            # Send 'y' + Enter to approve the real permission
+            logger.info(
+                "Auto-approving permission (skip mode, attempt %d/%d)",
+                attempt + 1, max_retries,
+            )
+            self._tmux.send_keys("y", enter=True)
+
+            # Wait for state to change (up to 2 seconds)
+            for _ in range(10):
+                time.sleep(0.2)
+                if self._sm.current_state != ClaudeState.PERMISSION:
+                    logger.info("Permission auto-approved successfully")
+                    return
+
+        logger.warning(
+            "Auto-approve: still in PERMISSION after %d attempts", max_retries,
+        )
 
     def _fire_event(self, event_type: str, data: dict) -> None:
         """Push event to queue and optionally to completion_queue."""
