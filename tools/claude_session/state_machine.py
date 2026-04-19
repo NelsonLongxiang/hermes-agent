@@ -36,9 +36,9 @@ class ClaudeState:
 
     # TUI output patterns for state detection
     TUI_PATTERNS = {
-        "idle": re.compile(r"❯\s*$"),
+        "idle": re.compile(r"^❯\s*$"),
         "tool_call": re.compile(r"^●\s+(\w+)"),
-        "permission": re.compile(r"Allow\?|permission|Yes.*No", re.IGNORECASE),
+        "permission": re.compile(r"Allow\s+.*\?|permission\s+to|❯\s*(Allow|Yes)\b", re.IGNORECASE),
         "error": re.compile(r"Error:|Failed:|error:", re.IGNORECASE),
     }
 

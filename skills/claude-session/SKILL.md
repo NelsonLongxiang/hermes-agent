@@ -1,7 +1,7 @@
 ---
 name: claude-session
 description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux
-version: 2.1
+version: 2.0
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
     prompt: "Stream stale timeout (秒，推荐 300)"
@@ -35,13 +35,6 @@ Use this skill when you need to delegate a coding task to Claude Code:
 - Parallel work (you handle strategy, Claude handles implementation)
 
 ## Quick Start
-
-0. **Diagnose dependencies** (首次使用或排查问题时):
-   ```
-   claude_session(action="diagnose")
-   ```
-   返回 5 项检查：tmux、Claude Code CLI、HERMES_STREAM_STALE_TIMEOUT、版本信息。
-   如果用户反馈 claude_session 不可用，先调用 diagnose 排查。
 
 1. **Start a session**:
    ```
@@ -142,53 +135,14 @@ Use `status` to check current state at any time.
 - 简单单步任务（修bug、格式化）→ 可以用 print 模式
 - 多步复杂任务（研究、分析、重构+测试）→ 必须用交互模式（claude_session）
 
-## 快速诊断：diagnose action
-
-当 claude_session 行为异常或需要排查环境问题时，使用内置诊断：
-
-```
-claude_session(action="diagnose")
-```
-
-返回结构化 JSON，包含 5 项检查：
-1. **tmux** — 是否安装、路径、版本
-2. **Claude Code CLI** — 是否安装、路径、版本
-3. **HERMES_STREAM_STALE_TIMEOUT** — 是否配置、值是否 ≥ 300
-4. **tmux version** — 版本号
-5. **Claude Code version** — 版本号
-
-每项包含 `status`（ok/missing/not_set/too_low）、`hint`（修复建议）、`required`（是否必须）。
-最终 `status` 为 `ready` 或 `missing_deps`。
-
-**优先用 diagnose 排查，不要手动 tmux/which 检查。**
-
-## 快速诊断：diagnose action
-
-运行 `claude_session(action="diagnose")` 可获取结构化依赖报告，包含 5 项检查：
-
-| 检查项 | 内容 | required |
-|--------|------|----------|
-| tmux | 路径 + 版本 | ✅ 硬依赖 |
-| Claude Code CLI | 路径 + 版本 | ✅ 硬依赖 |
-| HERMES_STREAM_STALE_TIMEOUT | 当前值是否 ≥ 300 | 可选 |
-| tmux version | 版本号 | 信息 |
-| Claude Code version | 版本号 | 信息 |
-
-返回结构：`{"status": "ready"|"missing_deps", "checks": [...], "summary": "..."}`
-
-**使用场景：**
-- 用户报告 claude_session 不工作时，先调 diagnose 排查
-- 新机器部署后验证环境
-- 排查流程的第一步，不要跳过
-
 ## 工具不可用时的排查流程
 
 如果 `claude_session` 不在当前可用工具列表中，按以下步骤排查：
 
-1. **先运行 diagnose**：`claude_session(action="diagnose")` — 获取结构化依赖报告
-2. **确认工具是否注册**：`hermes tools --summary` 查看是否有 Claude Code Session
-3. **确认 toolset 配置**：运行 `hermes tools` 确认已勾选
-4. **检查 gateway 日志**：启动时日志会显示 `claude_session: Claude Code CLI not found` 等 warning
+1. **确认工具是否注册**：`hermes tools list` 查看是否有 claude 相关工具集
+2. **确认 Hermes 安装中有此工具**：查找 `claude_session_tool.py` 文件是否存在
+3. **确认 toolset 配置**：查看 config.yaml 中 toolsets 是否包含 `hermes-cli` 或 `hermes-telegram`（它们都包含 `claude_session`）
+4. **检查 gateway 日志**：`hermes logs` 查看是否有 claude_session 加载错误
 5. **可能的原因**：平台工具过滤、工具加载时 import 失败（静默跳过）、模型 provider 兼容性问题
 6. **如果确认不可用**：如实告知用户排查结果，**不要偷偷换成 delegate_task 或 terminal**
 
@@ -197,9 +151,9 @@ claude_session(action="diagnose")
 如果 `claude_session` 工具没有出现在可用工具列表中：
 
 ### 根因分析链路
-1. `tools/claude_session_tool.py` — 工具注册（`registry.register()`），`toolset="claude_session"`，`check_fn` 检查 tmux（硬依赖）+ claude CLI（软依赖，仅日志警告）
+1. `tools/claude_session_tool.py` — 工具注册（`registry.register()`），`toolset="claude_session"`，`check_fn` 检查 tmux 是否存在
 2. `toolsets.py` — `_HERMES_CORE_TOOLS` 包含 `"claude_session"`，`TOOLSETS["claude_session"]` 定义工具集
-3. **`hermes_cli/tools_config.py`** — `CONFIGURABLE_TOOLSETS` 列表定义所有可配置工具集；`_post_setup_claude_session()` 在用户启用时自动检查依赖和配置环境变量
+3. **`hermes_cli/tools_config.py`** — `CONFIGURABLE_TOOLSETS` 列表定义所有可配置工具集
 4. `_get_platform_tools()` — 无显式配置时，将默认 toolset（如 `hermes-telegram`）展开为工具名，再**反向映射回 CONFIGURABLE_TOOLSETS**
 5. 如果工具集不在 `CONFIGURABLE_TOOLSETS` 中 → 反向映射丢失 → 工具对模型不可用
 
@@ -275,53 +229,13 @@ tmux capture-pane -t claude-work -p -S -3000 2>/dev/null > /tmp/claude_output.tx
 **现象**：Claude Code 启动后显示"Bypass permissions"确认界面，需要手动确认。
 **应对**：循环调用 `respond_permission(action="allow")` 2-3 次，然后用 `wait_for_idle` 等待初始化完成。
 
-### 陷阱7："y" 污染对话（2026-04-19 新增）
-**现象**：`respond_permission("allow")` 向 tmux 发送 "y"，但 Claude Code 在某些状态下将其解释为用户消息，而非权限确认。Claude 随后回复 "It looks like you sent 'y' but there's no prior question"。
-**原因**：权限确认界面和正常输入框共用同一终端，状态切换有时序竞争。
-**应对**：
-- 启动后等待 Claude 完全初始化（显示 `❯` 提示符）再发送任务
-- 如果 "y" 已污染对话，在 send 任务时忽略它（Claude 会自动上下文切换）
-- 污染不影响最终输出质量，但会增加 token 消耗
-
-### 陷阱8：permission_mode="skip" 不跳过 Bash 权限（2026-04-19 新增）
-**现象**：即使设置了 `permission_mode="skip"`，Claude Code 执行 Bash 命令时仍会弹出权限确认。
-**原因**：`skip` 模式主要跳过文件读写权限，但 Bash 命令（特别是网络请求如 `curl`）默认仍需确认。
-**应对**：
-- 在任务执行过程中，持续监控 PERMISSION 状态并 `respond_permission("allow")`
-- 或者在启动后预先配置：`/permissions add Bash:* allow`
-- 预计每个复杂任务需要 3-5 次 permission 响应
-
-### 自动安装配置（首次启用时）
-
-当用户在 `hermes setup` 或 `hermes tools` 中勾选 `🤖 Claude Code Session` 时，Hermes 自动执行 `_post_setup_claude_session()`：
-
-1. **检测 tmux** — 缺失时输出安装命令
-2. **检测 Claude Code CLI** — 缺失时输出安装命令
-3. **自动配置 `HERMES_STREAM_STALE_TIMEOUT=300`** — 防止 Stream Stalled（幂等，不会覆盖已有配置）
-4. **输出状态报告** — 所有依赖 ✅ 或缺失 ⚠️
-
-**check_fn 注册门控：**
-- `tmux` 是硬依赖 — 缺失则工具不注册
-- `claude` CLI 是软依赖 — 缺失仅输出 warning 日志，工具仍注册（用户可能稍后安装）
-- 缺失时日志格式：`claude_session: Claude Code CLI not found in PATH. Install with: npm install -g @anthropic-ai/claude-code`
-
-## 提取长报告的最佳实践
+### 提取长报告的最佳实践
 当 Claude 生成了很长的报告/代码时：
 1. 用 `tmux capture-pane -t claude-work -p -S -5000` 捕获完整 pane 历史
 2. 保存到 `/tmp/claude_raw_output.txt`
 3. 用 `grep -n` 定位报告起止行号
 4. 用 `sed` 提取并清理内容
 5. 用 `read_file` 最终读取干净内容
-
-### Ctrl+O 展开折叠输出（2026-04-19 新增）
-**现象**：Claude Code TUI 对长输出折叠显示 `… +292 lines (ctrl+o to expand)`，tmux capture-pane 只能捕获折叠后的内容。
-**解决**：
-```bash
-tmux send-keys -t claude-work C-o    # 展开/折叠切换
-sleep 1
-tmux capture-pane -t claude-work -p 2>/dev/null
-```
-**技巧**：先 capture 获取全局视图（折叠），定位到需要展开的区域后再 C-O 展开，避免一次展开所有内容。
 
 ## Error Recovery
 
@@ -421,52 +335,7 @@ claude_session(action="history")
 claude_session(action="events", since_turn=2)
 ```
 
-### diagnose
-```
-claude_session(action="diagnose")
-```
-Returns structured JSON with dependency checks (tmux, claude CLI, timeout, versions).
-Use this FIRST when troubleshooting claude_session issues.
-
 ### stop
 ```
 claude_session(action="stop")
 ```
-
-## 自动安装配置（hermes setup 时触发）
-
-当用户在 `hermes setup` → tools checklist 中启用 claude_session 时，`_post_setup_claude_session()` 自动执行：
-
-1. **检测依赖**：tmux（硬）、Claude Code CLI（软，仅警告不阻断）
-2. **自动配置环境变量**：`HERMES_STREAM_STALE_TIMEOUT=300`（如未设置）
-3. **输出安装引导**：缺失依赖时给出安装命令
-
-此逻辑在 `hermes_cli/tools_config.py` 中，对首次安装和回访用户（`hermes tools`）两条路径都生效。
-
-## 改动 claude_session 代码后的测试流程
-
-修改 `tools/claude_session_tool.py` 或相关文件后，按以下顺序验证：
-
-1. **单元测试**（秒级）：
-   ```bash
-   .venv/bin/python -m pytest tests/tools/test_claude_session_tool.py -v
-   ```
-
-2. **Python 直接调用**（秒级，不需要重启 Gateway）：
-   ```bash
-   venv/bin/python -c "
-   from tools.claude_session_tool import _diagnose_claude_session
-   import json; print(json.dumps(_diagnose_claude_session(), indent=2))
-   "
-   ```
-
-3. **Shell 脚本验证**（秒级）：
-   ```bash
-   bash skills/claude-session/scripts/configure.sh
-   ```
-
-4. **Gateway 线上验证**（需重启）：
-   - 重启 gateway：`hermes gateway run`
-   - 通过 Telegram 调用：`claude_session(action="diagnose")`
-
-注意：Gateway 代码从项目目录直接加载（editable install），重启即可加载新代码，不需要重新安装。

@@ -20,7 +20,10 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?m")
 _TOOL_CALL_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
 _TOOL_CALL_PAREN_RE = re.compile(r"^●\s+(\w+)\((.+)\)$")
 _PROMPT_RE = re.compile(r"^❯")
-_PERMISSION_RE = re.compile(r"(Allow\?.*|.*permission.*|.*Yes.*No.*)", re.IGNORECASE)
+_PERMISSION_RE = re.compile(
+    r"(Allow\s+.*\?|.*permission\s+to.*|❯\s*(Allow|Yes)\b|.*Yes.*No\b)",
+    re.IGNORECASE,
+)
 # Bottom status bar patterns — these are NOT real permission prompts
 _DECORATION_RE = re.compile(r"^[─━]{5,}$")  # thin or thick separator lines
 _STATUS_BAR_RE = re.compile(
@@ -51,6 +54,10 @@ class OutputParser:
         """Detect the current Claude Code state from cleaned output lines.
 
         Priority order: ERROR > PERMISSION > TOOL_CALL > IDLE > THINKING
+
+        Key insight: Claude Code's permission UI uses ❯ as a selector arrow
+        (e.g. "❯ Allow"), which must not be confused with the IDLE prompt ❯.
+        We detect permission prompts BEFORE checking for IDLE to avoid this.
         """
         if not lines:
             return ParseResult(state="THINKING")
@@ -63,7 +70,7 @@ class OutputParser:
         if error_match:
             return ParseResult(state="ERROR", error_text=error_match.group(0))
 
-        # Check PERMISSION — but exclude bottom status bar lines
+        # Check PERMISSION — exclude bottom status bar lines
         # Status bar contains "bypass permissions on" etc. which falsely match
         non_status_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
         if non_status_lines:
@@ -72,11 +79,23 @@ class OutputParser:
             if perm_match:
                 return ParseResult(state="PERMISSION", permission_text=perm_match.group(0))
 
-        # Check IDLE before TOOL_CALL — if there's a prompt anywhere in
-        # the recent non-decorative lines, the tool call is from a completed turn.
+        # Check IDLE — but ONLY if the ❯ appears on a line by itself
+        # (the bare prompt) or followed only by whitespace.
+        # Claude Code's permission selector uses "❯ Allow" or "❯ 1. Yes"
+        # which are NOT idle prompts.
         idle_check_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
         for line in reversed(idle_check_lines):
+            stripped = line.strip()
+            # IDLE prompt is "❯" alone or "❯ " followed by typed user text,
+            # but NOT "❯ Allow" or "❯ 1. Yes" (permission selector).
+            # Heuristic: if the line matches the prompt AND does NOT look like
+            # a permission selector (❯ followed by Allow/Yes/Deny/number),
+            # treat as IDLE.
             if _PROMPT_RE.search(line):
+                # Exclude permission-selector patterns: "❯ Allow", "❯ Yes",
+                # "❯ 1.", "❯ Deny", "❯ No"
+                if re.match(r"^❯\s*(Allow|Yes|Deny|No|\d+\.)", stripped, re.IGNORECASE):
+                    continue  # This is a permission selector, not IDLE
                 return ParseResult(state="IDLE")
 
         # Check TOOL_CALL (scan recent lines only — last 10, not all)
