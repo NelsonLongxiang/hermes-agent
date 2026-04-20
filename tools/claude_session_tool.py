@@ -1,5 +1,6 @@
 """tools/claude_session_tool.py — Hermes tool for Claude Code session management."""
 
+import hashlib
 import json
 import logging
 import shutil
@@ -12,10 +13,23 @@ from tools.registry import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 多会话注册表（替代原单例模式，支持并行运行多个独立会话）
+# Session Registry（支持并行运行多个独立会话 + workdir 隔离）
 # ---------------------------------------------------------------------------
 _sessions: dict = {}   # session_id → ClaudeSessionManager 实例
+_workdir_index: dict = {}  # workdir(绝对路径) → session_id 反向索引
 _sessions_lock = threading.Lock()
+
+
+def _derive_session_name(workdir: str) -> str:
+    """基于 workdir 绝对路径生成确定性 tmux session 名。
+
+    同一 workdir 永远映射到同一 tmux session，防止重复创建。
+    格式：hermes-{sha256前8位}
+    """
+    import os
+    abs_path = os.path.abspath(workdir)
+    h = hashlib.sha256(abs_path.encode()).hexdigest()[:8]
+    return f"hermes-{h}"
 
 
 def _get_session(session_id: str = None):
@@ -26,6 +40,16 @@ def _get_session(session_id: str = None):
         # 无指定时返回最后添加的（最近创建的）会话
         if _sessions:
             return list(_sessions.values())[-1]
+    return None
+
+
+def _get_session_by_workdir(workdir: str):
+    """通过 workdir 查找已注册的会话（无锁，调用方需持有 _sessions_lock）。"""
+    import os
+    abs_path = os.path.abspath(workdir)
+    sid = _workdir_index.get(abs_path)
+    if sid and sid in _sessions:
+        return _sessions[sid]
     return None
 
 
@@ -73,7 +97,7 @@ CLAUDE_SESSION_SCHEMA = {
             },
             "session_name": {
                 "type": "string",
-                "description": "tmux session name (default: 'claude-work')",
+                "description": "tmux session name (default: hermes-{sha256[:8]} based on workdir)",
             },
             "model": {
                 "type": "string",
@@ -147,15 +171,35 @@ def _handle_claude_session(args, **kw):
     """Dispatch claude_session tool calls (支持多会话路由)."""
     action = args.get("action", "")
 
-    # ── start：创建新实例并注册 ──
+    # ── start：创建新实例并注册（workdir 隔离：同 workdir 复用已有会话）──
     if action == "start":
         from tools.claude_session.manager import ClaudeSessionManager
-        mgr = ClaudeSessionManager()
+        import os
+
+        workdir = args.get("workdir", ".")
+        abs_workdir = os.path.abspath(workdir)
+
+        with _sessions_lock:
+            # 检查 workdir 索引：已有活跃会话则复用
+            existing = _get_session_by_workdir(abs_workdir)
+            if existing and existing._session_active:
+                return json.dumps({
+                    "session_id": existing._session_id,
+                    "tmux_session": existing._tmux.session_name if existing._tmux else None,
+                    "state": existing._sm.current_state,
+                    "permission_mode": existing._permission_mode,
+                    "claude_session_uuid": existing._claude_session_uuid,
+                    "note": "Session already active for this workdir",
+                }, ensure_ascii=False)
+
+        # 基于 workdir 生成确定性 tmux session 名（除非显式指定）
         sn = args.get("session_name")
         if not sn:
-            sn = f"claude-{uuid.uuid4().hex[:6]}"
+            sn = _derive_session_name(abs_workdir)
+
+        mgr = ClaudeSessionManager()
         result = mgr.start(
-            workdir=args.get("workdir", "."),
+            workdir=abs_workdir,
             session_name=sn,
             model=args.get("model"),
             permission_mode=args.get("permission_mode", "normal"),
@@ -163,15 +207,16 @@ def _handle_claude_session(args, **kw):
             completion_queue=kw.get("completion_queue"),
             resume_uuid=args.get("resume_uuid"),
         )
-        # 仅启动成功时注册到会话表
+        # 仅启动成功时注册到会话表和 workdir 索引
         if "error" not in result:
             sid = result.get("session_id")
             if sid:
                 with _sessions_lock:
                     _sessions[sid] = mgr
+                    _workdir_index[abs_workdir] = sid
         return json.dumps(result, ensure_ascii=False)
 
-    # ── stop：停止并从注册表移除 ──
+    # ── stop：停止并从注册表和 workdir 索引移除 ──
     if action == "stop":
         mgr = _get_session(args.get("session_id"))
         if mgr is None:
@@ -180,6 +225,10 @@ def _handle_claude_session(args, **kw):
         if result.get("stopped"):
             with _sessions_lock:
                 _sessions.pop(result.get("session_id"), None)
+                # 清理 workdir 索引
+                stale_keys = [k for k, v in _workdir_index.items() if v == result.get("session_id")]
+                for k in stale_keys:
+                    _workdir_index.pop(k, None)
         return json.dumps(result, ensure_ascii=False)
 
     # ── diagnose：不需要会话实例 ──

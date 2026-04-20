@@ -112,7 +112,7 @@ class ClaudeSessionManager:
     def start(
         self,
         workdir: str,
-        session_name: str = "claude-work",
+        session_name: str = "hermes-default",
         model: Optional[str] = None,
         permission_mode: str = "normal",
         on_event: str = "notify",
@@ -122,6 +122,8 @@ class ClaudeSessionManager:
         """Start a Claude Code session in tmux.
 
         Args:
+            session_name: tmux session name. Tool layer uses _derive_session_name()
+                          to generate deterministic names from workdir.
             resume_uuid: 如果提供，用 --resume 恢复指定的 Claude Code 会话。
                          要求对应的 .jsonl 历史文件存在，否则降级为新建会话。
         """
