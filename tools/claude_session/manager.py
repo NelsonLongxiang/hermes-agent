@@ -190,10 +190,12 @@ class ClaudeSessionManager:
                         time.sleep(0.5)
 
                     # 构建 Claude Code 启动命令
+                    # C1 fix: resume 时不传 --session-id，避免覆盖原会话身份
                     claude_cmd = "claude"
                     if actually_resuming:
                         claude_cmd += f" --resume {resume_uuid}"
-                    claude_cmd += f" --session-id {self._claude_session_uuid}"
+                    else:
+                        claude_cmd += f" --session-id {self._claude_session_uuid}"
                     if permission_mode == "skip":
                         claude_cmd += " --permission-mode bypassPermissions"
                     if model:
@@ -240,6 +242,8 @@ class ClaudeSessionManager:
             }
             if actually_resuming:
                 result["resumed_from"] = resume_uuid
+            elif resume_uuid:
+                result["fallback_note"] = f"resume_uuid={resume_uuid} history not found, started new session"
             return result
 
     def stop(self) -> dict:
@@ -266,14 +270,16 @@ class ClaudeSessionManager:
                     pass
 
             sid = self._session_id
+            uuid_to_return = self._claude_session_uuid
             self._session_active = False
             self._session_id = None
+            self._claude_session_uuid = None
             self._sm.transition(ClaudeState.DISCONNECTED)
 
             return {
                 "stopped": True,
                 "session_id": sid,
-                "claude_session_uuid": self._claude_session_uuid,
+                "claude_session_uuid": uuid_to_return,
             }
 
     # ------------------------------------------------------------------
@@ -816,6 +822,16 @@ class ClaudeSessionManager:
         Returns:
             .jsonl 文件的完整路径，如果不存在则返回 None。
         """
+        # C2 fix: 校验 session_uuid 为合法 UUID 格式，防止路径遍历
+        if not re.match(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            session_uuid,
+        ):
+            return None
+
+        # I4 fix: 规范化 workdir 路径（abspath + 去除末尾斜杠）
+        workdir = os.path.abspath(workdir).rstrip("/")
+
         claude_dir = os.path.expanduser("~/.claude/projects")
         # Claude Code 用 / 替换为 - 来构造项目目录名（保留前导 -）
         dir_name = workdir.replace("/", "-")
