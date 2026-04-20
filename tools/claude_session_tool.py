@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import threading
+import uuid
 from typing import Optional
 
 from tools.registry import registry, tool_error, tool_result
@@ -11,21 +12,21 @@ from tools.registry import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Singleton manager
+# 多会话注册表（替代原单例模式，支持并行运行多个独立会话）
 # ---------------------------------------------------------------------------
-_manager = None
-_manager_lock = threading.Lock()
+_sessions: dict = {}   # session_id → ClaudeSessionManager 实例
+_sessions_lock = threading.Lock()
 
 
-def _get_manager():
-    """Lazy-init the singleton manager (thread-safe)."""
-    global _manager
-    if _manager is None:
-        with _manager_lock:
-            if _manager is None:
-                from tools.claude_session.manager import ClaudeSessionManager
-                _manager = ClaudeSessionManager()
-    return _manager
+def _get_session(session_id: str = None):
+    """获取指定会话，无 session_id 时返回最近创建的会话。"""
+    with _sessions_lock:
+        if session_id and session_id in _sessions:
+            return _sessions[session_id]
+        # 无指定时返回最后添加的（最近创建的）会话
+        if _sessions:
+            return list(_sessions.values())[-1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,11 @@ CLAUDE_SESSION_SCHEMA = {
                     "diagnose",
                 ],
                 "description": "Action to perform on the Claude session",
+            },
+            # 多会话路由
+            "session_id": {
+                "type": "string",
+                "description": "目标会话ID（可选，默认最近活跃的会话）",
             },
             # start
             "workdir": {
@@ -95,7 +101,7 @@ CLAUDE_SESSION_SCHEMA = {
             # wait_for_idle / wait_for_state
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to wait (default: 300 for wait_for_idle, 60 for wait_for_state)",
+                "description": "Max seconds to wait (default: 600 for wait_for_idle, 60 for wait_for_state)",
                 "minimum": 1,
             },
             "target_state": {
@@ -134,21 +140,54 @@ CLAUDE_SESSION_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _handle_claude_session(args, **kw):
-    """Dispatch claude_session tool calls."""
-    mgr = _get_manager()
+    """Dispatch claude_session tool calls (支持多会话路由)."""
     action = args.get("action", "")
-    task_id = kw.get("task_id")
 
+    # ── start：创建新实例并注册 ──
     if action == "start":
+        from tools.claude_session.manager import ClaudeSessionManager
+        mgr = ClaudeSessionManager()
+        sn = args.get("session_name")
+        if not sn:
+            sn = f"claude-{uuid.uuid4().hex[:6]}"
         result = mgr.start(
             workdir=args.get("workdir", "."),
-            session_name=args.get("session_name", "claude-work"),
+            session_name=sn,
             model=args.get("model"),
             permission_mode=args.get("permission_mode", "normal"),
             on_event=args.get("on_event", "notify"),
             completion_queue=kw.get("completion_queue"),
         )
-    elif action == "send":
+        # 仅启动成功时注册到会话表
+        if "error" not in result:
+            sid = result.get("session_id")
+            if sid:
+                with _sessions_lock:
+                    _sessions[sid] = mgr
+        return json.dumps(result, ensure_ascii=False)
+
+    # ── stop：停止并从注册表移除 ──
+    if action == "stop":
+        mgr = _get_session(args.get("session_id"))
+        if mgr is None:
+            return tool_error("No active session. Use 'start' first.")
+        result = mgr.stop()
+        if result.get("stopped"):
+            with _sessions_lock:
+                _sessions.pop(result.get("session_id"), None)
+        return json.dumps(result, ensure_ascii=False)
+
+    # ── diagnose：不需要会话实例 ──
+    if action == "diagnose":
+        result = _diagnose_claude_session()
+        return json.dumps(result, ensure_ascii=False)
+
+    # ── 其他动作：通过 _get_session 路由到对应实例 ──
+    mgr = _get_session(args.get("session_id"))
+    if mgr is None:
+        return tool_error("No active session. Use 'start' first.")
+
+    if action == "send":
         message = args.get("message")
         if not message:
             return tool_error("message is required for send action")
@@ -165,7 +204,7 @@ def _handle_claude_session(args, **kw):
     elif action == "status":
         result = mgr.status()
     elif action == "wait_for_idle":
-        result = mgr.wait_for_idle(timeout=args.get("timeout", 300))
+        result = mgr.wait_for_idle(timeout=args.get("timeout", 600))
     elif action == "wait_for_state":
         target = args.get("target_state")
         if not target:
@@ -181,14 +220,10 @@ def _handle_claude_session(args, **kw):
         if not response:
             return tool_error("response is required for respond_permission action")
         result = mgr.respond_permission(response)
-    elif action == "stop":
-        result = mgr.stop()
     elif action == "history":
         result = mgr.history()
     elif action == "events":
         result = mgr.events(since_turn=args.get("since_turn", 0))
-    elif action == "diagnose":
-        result = _diagnose_claude_session()
     else:
         return tool_error(
             f"Unknown action: {action}. "

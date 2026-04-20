@@ -1,6 +1,7 @@
 """tools/claude_session/manager.py — Main ClaudeSessionManager class."""
 
 import logging
+import os
 import queue
 import re
 import threading
@@ -71,8 +72,9 @@ class Turn:
 
 
 class ClaudeSessionManager:
-    """Singleton manager for Claude Code tmux sessions.
+    """Manager for a single Claude Code tmux session.
 
+    所有状态均为实例变量，天然支持多实例并行。
     Provides the full API: start, send, status, wait_for_idle, output, etc.
     """
 
@@ -98,6 +100,9 @@ class ClaudeSessionManager:
         # Threading
         self._lock = threading.Lock()
         self._state_event = threading.Event()
+
+        # wait_for_idle 自适应轮询追踪状态（跨调用持久化，send 时重置）
+        self._wait_state: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -135,6 +140,21 @@ class ClaudeSessionManager:
             try:
                 if not self._tmux.session_exists():
                     self._tmux.create_session(workdir=workdir)
+
+                    # If running as root, switch to non-root user first
+                    # Claude Code refuses --permission-mode bypassPermissions when run as root
+                    current_uid = os.getuid()
+                    if current_uid == 0:
+                        non_root_user = os.environ.get("SUDO_USER") or "longxiang"
+                        self._tmux.send_keys(f"su - {non_root_user}", enter=True)
+                        time.sleep(1.5)
+                        # Set workdir and PATH for the non-root user
+                        self._tmux.send_keys(f"cd {workdir}", enter=True)
+                        time.sleep(0.5)
+                        user_bin = f"/home/{non_root_user}/bin"
+                        self._tmux.send_keys(f"export PATH={user_bin}:$PATH", enter=True)
+                        time.sleep(0.5)
+
                     # Start Claude Code
                     claude_cmd = "claude"
                     if permission_mode == "skip":
@@ -233,6 +253,8 @@ class ClaudeSessionManager:
                 output_marker=marker,
             )
             self._current_turn = turn
+            # 新 Turn 开始，重置等待进度追踪
+            self._wait_state = None
 
             # Atomic send
             self._tmux.send_keys(message, enter=True)
@@ -304,42 +326,139 @@ class ClaudeSessionManager:
         return result
 
     def wait_for_idle(self, timeout: int = 300) -> dict:
-        """Block until Claude returns to IDLE or timeout."""
+        """自适应轮询等待 Claude 回到 IDLE 状态。
+
+        相比固定轮询的改进：
+        1. 自适应间隔：token 持续增长保持 5s，停滞时放慢到 10s
+        2. 巡检保底：每 600s 返回进度摘要，外层决定继续或终止
+        3. 连续无进展检测：3 次巡检（30分钟）token 无增长 → stalled
+
+        Returns:
+            dict 含 status 字段：
+                "idle"        — 任务完成，Claude 已回到 IDLE
+                "permission"  — 需要权限审批，处理后可再次调用
+                "error"       — 发生错误
+                "disconnected"— 会话断开
+                "progress"    — 巡检返回，外层可决定继续等或终止
+                "stalled"     — 连续无进展，建议外层 cancel
+                "timeout"     — 超时
+        """
         if not self._session_active:
-            return {"error": "No active session"}
+            return {"error": "No active session", "status": "disconnected"}
+
+        # ── 常量配置 ──
+        PATROL_INTERVAL = 600        # 巡检间隔：600s（10 分钟）
+        MAX_STALLED_PATROLS = 3      # 连续 3 次巡检无增长 → stalled
+        ACTIVE_INTERVAL = 5.0        # 正常工作时的轮询间隔
+        STALL_SLOW_INTERVAL = 10.0   # 停滞时放慢轮询间隔
+        STALL_THRESHOLD = 30.0       # 30s 无 token 增长视为停滞
+
+        # ── 初始化或恢复进度追踪（跨调用持久化） ──
+        now = time.monotonic()
+        current_tokens = self._buf.total_count()
+
+        if self._wait_state is None:
+            # 首次进入或 send 后重置
+            self._wait_state = {
+                "start_time": now,
+                "start_tokens": current_tokens,
+                "last_patrol_time": now,
+                "last_patrol_tokens": current_tokens,
+                "last_growth_time": now,
+                "last_check_tokens": current_tokens,
+                "stalled_patrols": 0,
+            }
 
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
             state = self._sm.current_state
 
+            # ── 终态：立即返回 ──
             if state == ClaudeState.IDLE:
-                return self._build_idle_result()
+                self._wait_state = None
+                return {**self._build_idle_result(), "status": "idle"}
 
             if state == ClaudeState.PERMISSION:
-                return self._build_permission_result()
+                # 保持 _wait_state，外层处理权限后会再次调用 wait_for_idle
+                return {**self._build_permission_result(), "status": "permission"}
 
             if state == ClaudeState.ERROR:
-                return self._build_error_result()
+                self._wait_state = None
+                return {**self._build_error_result(), "status": "error"}
 
             if state == ClaudeState.DISCONNECTED:
-                return {"error": "Session disconnected", "state": ClaudeState.DISCONNECTED}
+                self._wait_state = None
+                return {
+                    "error": "Session disconnected",
+                    "state": state,
+                    "status": "disconnected",
+                }
 
-            # Wait for state change event (set by _handle_state_change)
+            now = time.monotonic()
+            current_tokens = self._buf.total_count()
+
+            # ── 更新 token 增长追踪 ──
+            if current_tokens > self._wait_state["last_check_tokens"]:
+                self._wait_state["last_growth_time"] = now
+            self._wait_state["last_check_tokens"] = current_tokens
+
+            # ── 巡检检测：每 PATROL_INTERVAL 秒做一次 ──
+            time_since_patrol = now - self._wait_state["last_patrol_time"]
+            if time_since_patrol >= PATROL_INTERVAL:
+                patrol_delta = current_tokens - self._wait_state["last_patrol_tokens"]
+
+                if patrol_delta == 0:
+                    self._wait_state["stalled_patrols"] += 1
+                else:
+                    self._wait_state["stalled_patrols"] = 0
+
+                # 更新巡检基准时间戳和 token 数
+                self._wait_state["last_patrol_time"] = now
+                self._wait_state["last_patrol_tokens"] = current_tokens
+
+                # 连续无进展 → stalled
+                if self._wait_state["stalled_patrols"] >= MAX_STALLED_PATROLS:
+                    result = {
+                        "status": "stalled",
+                        "state": state,
+                        "progress_info": self._check_progress(),
+                    }
+                    self._wait_state = None
+                    return result
+
+                # 正常巡检 → 仅打日志，不中断等待（避免外层模型误判为失败）
+                logger.info(
+                    "wait_for_idle patrol: elapsed=%.0fs, state=%s, token_delta=%d",
+                    now - self._wait_state["start_time"], state, patrol_delta,
+                )
+
+            # ── 自适应轮询间隔 ──
+            stall_duration = now - self._wait_state["last_growth_time"]
+            if stall_duration > STALL_THRESHOLD:
+                # token 停止增长超过 30s → 放慢轮询
+                interval = STALL_SLOW_INTERVAL
+            else:
+                # token 持续增长或刚停止 → 保持快速轮询
+                interval = ACTIVE_INTERVAL
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             self._state_event.clear()
-            self._state_event.wait(timeout=min(0.5, remaining))
+            self._state_event.wait(timeout=min(interval, remaining))
 
-        # Timeout
+        # ── 超时 ──
         result = {
+            "status": "timeout",
             "state": self._sm.current_state,
             "timeout_reached": True,
+            "progress_info": self._check_progress(),
         }
         if self._current_turn:
             result["turn"] = self._current_turn.to_dict()
         result["output_since_send"] = self._get_output_since_send()
+        self._wait_state = None
         return result
 
     def wait_for_state(self, target_state: str, timeout: int = 60) -> dict:
@@ -556,7 +675,7 @@ class ClaudeSessionManager:
         if self._event_mode == "none":
             return
 
-        evt = {"type": event_type, "timestamp": time.time(), **data}
+        evt = {"session_id": self._session_id, "type": event_type, "timestamp": time.time(), **data}
         self._event_queue.put(evt)
 
         if self._event_mode == "notify" and self._on_event:
@@ -598,6 +717,39 @@ class ClaudeSessionManager:
             result["turn"] = self._current_turn.to_dict()
         return result
 
+    def _check_progress(self) -> dict:
+        """检测当前 Claude 工作进度。
+
+        基于 OutputBuffer 行数（作为 token 代理指标）判断工作是否在推进。
+        依赖 self._wait_state 中的追踪数据，由 wait_for_idle 维护。
+
+        Returns:
+            dict: 进度信息，包含：
+                - elapsed_seconds: 自首次等待以来的总时长
+                - token_count: 当前输出总行数
+                - token_delta: 自首次等待以来的行数增量
+                - token_delta_since_patrol: 自上次巡检以来的行数增量
+                - stalled_patrols: 连续无进展的巡检次数
+                - current_state: 当前 Claude 状态
+                - state_duration_seconds: 当前状态已持续时间
+        """
+        ws = self._wait_state
+        if ws is None:
+            return {}
+
+        now = time.monotonic()
+        current_tokens = self._buf.total_count()
+
+        return {
+            "elapsed_seconds": round(now - ws["start_time"], 1),
+            "token_count": current_tokens,
+            "token_delta": current_tokens - ws["start_tokens"],
+            "token_delta_since_patrol": current_tokens - ws["last_patrol_tokens"],
+            "stalled_patrols": ws["stalled_patrols"],
+            "current_state": self._sm.current_state,
+            "state_duration_seconds": round(self._sm.state_duration(), 1),
+        }
+
     def _get_output_since_send(self) -> str:
         """Get all output since last send operation."""
         if self._current_turn:
@@ -608,3 +760,6 @@ class ClaudeSessionManager:
         else:
             lines = self._buf.read()
         return "\n".join(l.text for l in lines)
+
+
+# === wait_for_idle v2 改造完成 ===
