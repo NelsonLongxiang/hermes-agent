@@ -63,7 +63,7 @@ def _get_session_by_workdir(workdir: str):
     import os
     abs_path = os.path.abspath(workdir)
     sid = _workdir_index.get(abs_path)
-    if sid and sid in _sessions:
+    if sid and sid != "__starting__" and sid in _sessions:
         return _sessions[sid]
     return None
 
@@ -194,6 +194,11 @@ def _handle_claude_session(args, **kw):
         workdir = args.get("workdir", ".")
         abs_workdir = os.path.abspath(workdir)
 
+        # 基于 workdir 生成确定性 tmux session 名（除非显式指定）
+        sn = args.get("session_name")
+        if not sn:
+            sn = _derive_session_name(abs_workdir)
+
         with _sessions_lock:
             # 检查 workdir 索引：已有活跃会话则复用
             existing = _get_session_by_workdir(abs_workdir)
@@ -207,21 +212,27 @@ def _handle_claude_session(args, **kw):
                     "note": "Session already active for this workdir",
                 }, ensure_ascii=False)
 
-        # 基于 workdir 生成确定性 tmux session 名（除非显式指定）
-        sn = args.get("session_name")
-        if not sn:
-            sn = _derive_session_name(abs_workdir)
+            # 预占 workdir 槽位，防止并发 start 同一 workdir 时双重创建
+            # 使用占位标记（值为 None），注册完成后替换
+            _workdir_index[abs_workdir] = "__starting__"
 
-        mgr = ClaudeSessionManager()
-        result = mgr.start(
-            workdir=abs_workdir,
-            session_name=sn,
-            model=args.get("model"),
-            permission_mode=args.get("permission_mode", "normal"),
-            on_event=args.get("on_event", "notify"),
-            completion_queue=kw.get("completion_queue"),
-            resume_uuid=args.get("resume_uuid"),
-        )
+        try:
+            mgr = ClaudeSessionManager()
+            result = mgr.start(
+                workdir=abs_workdir,
+                session_name=sn,
+                model=args.get("model"),
+                permission_mode=args.get("permission_mode", "normal"),
+                on_event=args.get("on_event", "notify"),
+                completion_queue=kw.get("completion_queue"),
+                resume_uuid=args.get("resume_uuid"),
+            )
+        except Exception as e:
+            # 启动异常时清理占位
+            with _sessions_lock:
+                _workdir_index.pop(abs_workdir, None)
+            return json.dumps({"error": f"Failed to create session: {e}"}, ensure_ascii=False)
+
         # 仅启动成功时注册到会话表和 workdir 索引
         if "error" not in result:
             sid = result.get("session_id")
@@ -229,6 +240,10 @@ def _handle_claude_session(args, **kw):
                 with _sessions_lock:
                     _sessions[sid] = mgr
                     _workdir_index[abs_workdir] = sid
+        else:
+            # 启动失败时清理占位
+            with _sessions_lock:
+                _workdir_index.pop(abs_workdir, None)
         return json.dumps(result, ensure_ascii=False)
 
     # ── stop：停止并从注册表和 workdir 索引移除 ──
