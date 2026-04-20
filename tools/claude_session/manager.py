@@ -86,6 +86,7 @@ class ClaudeSessionManager:
         self._poller: Optional[AdaptivePoller] = None
         self._session_active = False
         self._permission_mode = "normal"
+        self._claude_session_uuid: Optional[str] = None  # Claude Code 内部的 session UUID
 
         # Turn tracking
         self._turn_counter = 0
@@ -116,8 +117,14 @@ class ClaudeSessionManager:
         permission_mode: str = "normal",
         on_event: str = "notify",
         completion_queue: Optional[queue.Queue] = None,
+        resume_uuid: Optional[str] = None,
     ) -> dict:
-        """Start a Claude Code session in tmux."""
+        """Start a Claude Code session in tmux.
+
+        Args:
+            resume_uuid: 如果提供，用 --resume 恢复指定的 Claude Code 会话。
+                         要求对应的 .jsonl 历史文件存在，否则降级为新建会话。
+        """
         with self._lock:
             if self._session_active and self._tmux and self._tmux.session_exists():
                 return {
@@ -125,11 +132,36 @@ class ClaudeSessionManager:
                     "tmux_session": session_name,
                     "state": self._sm.current_state,
                     "permission_mode": self._permission_mode,
+                    "claude_session_uuid": self._claude_session_uuid,
                     "note": "Session already active",
                 }
 
             if permission_mode not in ("normal", "skip"):
                 return {"error": f"Invalid permission_mode: {permission_mode}"}
+
+            # 生成新的 Claude Code session UUID
+            self._claude_session_uuid = str(uuid.uuid4())
+
+            # 检查 resume_uuid 的历史文件是否存在
+            actually_resuming = False
+            if resume_uuid:
+                jsonl_path = self._find_session_jsonl(workdir, resume_uuid)
+                if jsonl_path:
+                    actually_resuming = True
+                else:
+                    logger.warning(
+                        "resume_uuid=%s 的历史文件不存在，降级为新建会话",
+                        resume_uuid,
+                    )
+
+            # resume 时重置 Hermes 层状态（与 Claude Code 的 JSONL 历史无关）
+            if actually_resuming:
+                self._sm.transition(ClaudeState.DISCONNECTED)
+                self._buf.clear()
+                self._turn_counter = 0
+                self._current_turn = None
+                self._turn_history = []
+                self._wait_state = None
 
             self._session_id = f"cs_{uuid.uuid4().hex[:8]}"
             self._permission_mode = permission_mode
@@ -155,10 +187,13 @@ class ClaudeSessionManager:
                         self._tmux.send_keys(f"export PATH={user_bin}:$PATH", enter=True)
                         time.sleep(0.5)
 
-                    # Start Claude Code
+                    # 构建 Claude Code 启动命令
                     claude_cmd = "claude"
+                    if actually_resuming:
+                        claude_cmd += f" --resume {resume_uuid}"
+                    claude_cmd += f" --session-id {self._claude_session_uuid}"
                     if permission_mode == "skip":
-                        claude_cmd = "claude --permission-mode bypassPermissions"
+                        claude_cmd += " --permission-mode bypassPermissions"
                     if model:
                         claude_cmd += f" --model {model}"
                     self._tmux.send_keys(claude_cmd, enter=True)
@@ -194,12 +229,16 @@ class ClaudeSessionManager:
             if completion_queue:
                 self._on_event = completion_queue
 
-            return {
+            result = {
                 "session_id": self._session_id,
                 "tmux_session": session_name,
                 "state": self._sm.current_state,
                 "permission_mode": self._permission_mode,
+                "claude_session_uuid": self._claude_session_uuid,
             }
+            if actually_resuming:
+                result["resumed_from"] = resume_uuid
+            return result
 
     def stop(self) -> dict:
         """Stop the session and clean up."""
@@ -229,7 +268,11 @@ class ClaudeSessionManager:
             self._session_id = None
             self._sm.transition(ClaudeState.DISCONNECTED)
 
-            return {"stopped": True, "session_id": sid}
+            return {
+                "stopped": True,
+                "session_id": sid,
+                "claude_session_uuid": self._claude_session_uuid,
+            }
 
     # ------------------------------------------------------------------
     # Send operations
@@ -760,6 +803,24 @@ class ClaudeSessionManager:
         else:
             lines = self._buf.read()
         return "\n".join(l.text for l in lines)
+
+    @staticmethod
+    def _find_session_jsonl(workdir: str, session_uuid: str) -> Optional[str]:
+        """查找 Claude Code 会话历史文件。
+
+        在 ~/.claude/projects/<cwd-path>/<uuid>.jsonl 中查找对应的历史文件。
+        workdir 中的路径分隔符会被替换为 - 来构造目录名。
+
+        Returns:
+            .jsonl 文件的完整路径，如果不存在则返回 None。
+        """
+        claude_dir = os.path.expanduser("~/.claude/projects")
+        # Claude Code 用 / 替换为 - 来构造项目目录名（保留前导 -）
+        dir_name = workdir.replace("/", "-")
+        jsonl_path = os.path.join(claude_dir, dir_name, f"{session_uuid}.jsonl")
+        if os.path.exists(jsonl_path):
+            return jsonl_path
+        return None
 
 
 # === wait_for_idle v2 改造完成 ===

@@ -89,6 +89,10 @@ CLAUDE_SESSION_SCHEMA = {
                 "enum": ["notify", "queue", "none"],
                 "description": "Event delivery mode (default: 'notify')",
             },
+            "resume_uuid": {
+                "type": "string",
+                "description": "Claude Code session UUID to resume (optional). If provided, starts with --resume to restore history.",
+            },
             # send / type
             "message": {
                 "type": "string",
@@ -157,6 +161,7 @@ def _handle_claude_session(args, **kw):
             permission_mode=args.get("permission_mode", "normal"),
             on_event=args.get("on_event", "notify"),
             completion_queue=kw.get("completion_queue"),
+            resume_uuid=args.get("resume_uuid"),
         )
         # 仅启动成功时注册到会话表
         if "error" not in result:
