@@ -32,11 +32,26 @@ def _derive_session_name(workdir: str) -> str:
     return f"hermes-{h}"
 
 
-def _get_session(session_id: str = None):
-    """获取指定会话，无 session_id 时返回最近创建的会话。"""
+def _get_session(session_id: str = None, strict: bool = False):
+    """获取指定会话，无 session_id 时返回最近创建的会话。
+
+    Args:
+        session_id: 目标会话 ID。None 时返回最近活跃会话。
+        strict: 为 True 时，指定了 session_id 但找不到则返回 None（不回退），
+                用于 stop/操作类 action 防止操作错误会话。
+    """
     with _sessions_lock:
-        if session_id and session_id in _sessions:
-            return _sessions[session_id]
+        if session_id:
+            if session_id in _sessions:
+                return _sessions[session_id]
+            # session_id 已明确指定但找不到
+            if strict:
+                logger.warning(
+                    "session_id=%s not found in registry (known: %s). "
+                    "Possible gateway restart lost in-memory state.",
+                    session_id, list(_sessions.keys()),
+                )
+                return None
         # 无指定时返回最后添加的（最近创建的）会话
         if _sessions:
             return list(_sessions.values())[-1]
@@ -218,9 +233,14 @@ def _handle_claude_session(args, **kw):
 
     # ── stop：停止并从注册表和 workdir 索引移除 ──
     if action == "stop":
-        mgr = _get_session(args.get("session_id"))
+        specified_id = args.get("session_id")
+        mgr = _get_session(specified_id, strict=bool(specified_id))
         if mgr is None:
-            return tool_error("No active session. Use 'start' first.")
+            return tool_error(
+                f"Session '{specified_id}' not found in registry. "
+                "It may have been lost after a gateway restart. "
+                "Use tmux directly to clean up orphaned sessions."
+            )
         result = mgr.stop()
         if result.get("stopped"):
             with _sessions_lock:
@@ -239,6 +259,15 @@ def _handle_claude_session(args, **kw):
     # ── 其他动作：通过 _get_session 路由到对应实例 ──
     mgr = _get_session(args.get("session_id"))
     if mgr is None:
+        # 只读查询 action：无会话时返回优雅默认值
+        if action == "status":
+            return json.dumps({"state": "DISCONNECTED"}, ensure_ascii=False)
+        if action == "output":
+            return json.dumps({"lines": [], "offset": 0, "total": 0}, ensure_ascii=False)
+        if action == "events":
+            return json.dumps({"events": []}, ensure_ascii=False)
+        if action == "history":
+            return json.dumps({"total_turns": 0, "turns": []}, ensure_ascii=False)
         return tool_error("No active session. Use 'start' first.")
 
     if action == "send":

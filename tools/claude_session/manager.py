@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -172,9 +173,64 @@ class ClaudeSessionManager:
             self._tmux = TmuxInterface(session_name)
 
             try:
-                if not self._tmux.session_exists():
-                    self._tmux.create_session(workdir=workdir)
+                # ── Phase 1: 确保 tmux session 存在且属于当前 workdir ──
+                _needs_init = False  # 是否需要启动新的 Claude Code 进程
 
+                if not self._tmux.session_exists():
+                    # 全新创建
+                    self._tmux.create_session(workdir=workdir)
+                    _needs_init = True
+                else:
+                    # tmux session 已存在 — 验证是否属于当前 workdir
+                    # 防止 gateway 重启后 _sessions 丢失，旧 tmux session 被错误复用
+                    pane = self._tmux.capture_pane(lines=50)
+                    pane_lower = pane.lower()
+
+                    # 检查 tmux session 的当前工作目录
+                    cwd_check = subprocess.run(
+                        ["tmux", "display-message", "-t", session_name,
+                         "-p", "#{pane_current_path}"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    tmux_cwd = cwd_check.stdout.strip() if cwd_check.returncode == 0 else ""
+
+                    # workdir 不匹配，或者有其他 Claude Code 在运行 → 杀掉重建
+                    needs_rebuild = False
+                    reason = ""
+                    if tmux_cwd and workdir not in tmux_cwd and tmux_cwd not in workdir:
+                        needs_rebuild = True
+                        reason = f"workdir mismatch (tmux={tmux_cwd}, expected={workdir})"
+                    elif "claude code" in pane_lower or "claude-" in pane_lower:
+                        # 有 Claude Code 在运行，可能是别的项目的
+                        if workdir.lower() not in pane_lower:
+                            needs_rebuild = True
+                            reason = "existing Claude Code belongs to different project"
+
+                    if needs_rebuild:
+                        logger.warning(
+                            "tmux session %s exists but %s. Killing and recreating.",
+                            session_name, reason,
+                        )
+                        self._tmux.kill_session()
+                        time.sleep(0.5)
+                        self._tmux.create_session(workdir=workdir)
+                        _needs_init = True
+                    else:
+                        # tmux session 存在且 workdir 匹配，检查 Claude Code 是否还在运行
+                        has_claude = "claude code" in pane_lower or "❯" in pane[-200:]
+                        if not has_claude:
+                            logger.info(
+                                "tmux session %s exists but no Claude Code running. Recreating.",
+                                session_name,
+                            )
+                            self._tmux.kill_session()
+                            time.sleep(0.5)
+                            self._tmux.create_session(workdir=workdir)
+                            _needs_init = True
+                        # else: Claude Code 正在运行且 workdir 匹配，复用
+
+                # ── Phase 2: 如果需要，启动 Claude Code 进程 ──
+                if _needs_init:
                     # If running as root, switch to non-root user first
                     # Claude Code refuses --permission-mode bypassPermissions when run as root
                     current_uid = os.getuid()
@@ -266,8 +322,8 @@ class ClaudeSessionManager:
             if self._tmux:
                 try:
                     self._tmux.kill_session()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to kill tmux session: %s", e)
 
             sid = self._session_id
             uuid_to_return = self._claude_session_uuid
