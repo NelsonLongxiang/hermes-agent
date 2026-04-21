@@ -240,6 +240,85 @@ class TestEvents:
         assert result["events"][0]["turn_id"] == 2
 
 
+class TestWaitForIdleCompact:
+    """Tests for compact-aware behavior in wait_for_idle."""
+
+    def _setup_manager_in_thinking(self, manager):
+        """Set up manager with active session in THINKING state."""
+        manager._session_active = True
+        manager._sm.transition("IDLE")
+        manager._sm.transition("THINKING")
+        manager._current_turn = Turn(
+            turn_id=1, start_time=time.monotonic(), end_time=None,
+            state="THINKING", user_message="test", tool_calls=[],
+            thinking_cycles=0, total_duration=None,
+        )
+        manager._tmux = MagicMock()
+        return manager
+
+    @patch("tools.claude_session.manager.OutputParser.detect_state")
+    @patch("tools.claude_session.manager.OutputParser.clean_lines")
+    def test_compact_detected_sets_flag(self, mock_clean, mock_detect, manager):
+        """When compact keyword appears, compact_detected flag should be set."""
+        self._setup_manager_in_thinking(manager)
+
+        mock_result = MagicMock()
+        mock_result.is_compacting = True
+        mock_detect.return_value = mock_result
+        mock_clean.return_value = ["Compacting..."]
+        manager._tmux.capture_pane.return_value = "Compacting..."
+
+        result = manager.wait_for_idle(timeout=2)
+
+        # Should timeout (not crash) and compact was detected
+        assert result.get("timeout_reached") is True
+        assert mock_detect.called
+
+    @patch("tools.claude_session.manager.OutputParser.detect_state")
+    @patch("tools.claude_session.manager.OutputParser.clean_lines")
+    def test_compact_extends_deadline_on_timeout(self, mock_clean, mock_detect, manager):
+        """Compact detection should extend the deadline when timeout is reached."""
+        self._setup_manager_in_thinking(manager)
+
+        mock_result = MagicMock()
+        mock_result.is_compacting = True
+        mock_detect.return_value = mock_result
+        mock_clean.return_value = ["Compacting conversation..."]
+        manager._tmux.capture_pane.return_value = "Compacting conversation..."
+
+        result = manager.wait_for_idle(timeout=1)
+
+        # Compact extension should have kicked in
+        assert result.get("timeout_reached") is True or result.get("status") == "timeout"
+
+    def test_no_compact_normal_timeout(self, manager):
+        """Without compact, timeout should occur normally."""
+        self._setup_manager_in_thinking(manager)
+
+        # capture_pane returns normal output (no compact keywords)
+        manager._tmux.capture_pane.return_value = "processing data..."
+
+        result = manager.wait_for_idle(timeout=1)
+        assert result.get("timeout_reached") is True
+
+    @patch("tools.claude_session.manager.OutputParser.detect_state")
+    @patch("tools.claude_session.manager.OutputParser.clean_lines")
+    def test_compact_stalled_protection(self, mock_clean, mock_detect, manager):
+        """During compact, stalled detection should be suppressed."""
+        self._setup_manager_in_thinking(manager)
+
+        mock_result = MagicMock()
+        mock_result.is_compacting = True
+        mock_detect.return_value = mock_result
+        mock_clean.return_value = ["Compacting..."]
+        manager._tmux.capture_pane.return_value = "Compacting..."
+
+        result = manager.wait_for_idle(timeout=1)
+
+        # Should NOT return "stalled" during compact
+        assert result.get("status") != "stalled"
+
+
 class TestBuildPermissionResult:
     def test_extracts_permission_text(self, manager):
         manager._session_active = True

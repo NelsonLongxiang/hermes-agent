@@ -117,6 +117,98 @@ class TestDetectState:
         assert result.state != "PERMISSION"
 
 
+class TestCompactDetection:
+    """Tests for compact operation detection in output_parser."""
+
+    def test_compact_keyword_compacting(self):
+        lines = ["some output", "Compacting conversation history..."]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_compressing(self):
+        lines = ["✻ Thinking...", "compressing conversation to save tokens"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_context_compression(self):
+        lines = ["performing context compression"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_condensing(self):
+        lines = ["condensing the conversation history"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_summarizing(self):
+        lines = ["summarizing conversation for context window"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_checkmark(self):
+        lines = ["✓ compact completed"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_concise_summary(self):
+        lines = ["creating concise summary of history"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_compact_keyword_compact_history(self):
+        lines = ["compact history to reduce token usage"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+    def test_no_compact_normal_thinking(self):
+        """Normal thinking output should NOT trigger compact detection."""
+        lines = ["some output", "processing data..."]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is False
+
+    def test_no_compact_with_tool_call(self):
+        """Tool call has higher priority than compact."""
+        lines = ["Compacting conversation...", "● Edit file.py"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "TOOL_CALL"
+        assert result.is_compacting is False
+
+    def test_no_compact_with_idle_prompt(self):
+        """IDLE prompt has higher priority than compact."""
+        lines = ["Compacting done", "❯ "]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+        assert result.is_compacting is False
+
+    def test_no_compact_with_error(self):
+        """ERROR has highest priority, no compact flag."""
+        lines = ["Compacting conversation", "Error: compact failed"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "ERROR"
+        assert result.is_compacting is False
+
+    def test_compact_result_field_default(self):
+        """Default ParseResult should have is_compacting=False."""
+        pr = ParseResult(state="THINKING")
+        assert pr.is_compacting is False
+
+    def test_compact_case_insensitive(self):
+        """Compact detection should be case-insensitive."""
+        lines = ["COMPACTING CONVERSATION HISTORY"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "THINKING"
+        assert result.is_compacting is True
+
+
 class TestExtractToolCalls:
     def test_single_tool_call(self):
         lines = ["● Edit src/auth.py", "  editing file...", "● Read tests/test_auth.py"]

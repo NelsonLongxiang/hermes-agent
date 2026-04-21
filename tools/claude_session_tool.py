@@ -144,7 +144,7 @@ CLAUDE_SESSION_SCHEMA = {
             # wait_for_idle / wait_for_state
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to wait (default: 600 for wait_for_idle, 60 for wait_for_state)",
+                "description": "Max seconds to wait (default: 900 for wait_for_idle, 60 for wait_for_state). Claude Code tasks typically take 3-30 minutes. Use 900 for normal tasks, 1800 for heavy analysis.",
                 "minimum": 1,
             },
             "target_state": {
@@ -302,7 +302,7 @@ def _handle_claude_session(args, **kw):
     elif action == "status":
         result = mgr.status()
     elif action == "wait_for_idle":
-        result = mgr.wait_for_idle(timeout=args.get("timeout", 600))
+        result = mgr.wait_for_idle(timeout=args.get("timeout", 900))
     elif action == "wait_for_state":
         target = args.get("target_state")
         if not target:

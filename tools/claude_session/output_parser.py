@@ -13,6 +13,7 @@ class ParseResult:
     tool_target: Optional[str] = None
     permission_text: Optional[str] = None
     error_text: Optional[str] = None
+    is_compacting: bool = False
 
 
 # Regex patterns
@@ -33,6 +34,12 @@ _STATUS_BAR_RE = re.compile(
     re.IGNORECASE,
 )
 _ERROR_RE = re.compile(r"(Error:.*|Failed:.*|error:.*)", re.IGNORECASE)
+_COMPACT_RE = re.compile(
+    r"(Compacting|compressing\s+conversation|context\s+compression|"
+    r"condensing|summarizing\s+conversation|✓.*compact|"
+    r"concise.*summary|compact.*history)",
+    re.IGNORECASE,
+)
 
 
 class OutputParser:
@@ -109,6 +116,10 @@ class OutputParser:
                     tool_name=tool_info["tool_name"],
                     tool_target=tool_info["target"],
                 )
+
+        # Check COMPACT — compact 操作期间状态通常是 THINKING
+        if _COMPACT_RE.search(all_text):
+            return ParseResult(state="THINKING", is_compacting=True)
 
         # Default: THINKING
         return ParseResult(state="THINKING")

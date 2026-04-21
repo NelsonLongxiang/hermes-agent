@@ -432,7 +432,7 @@ class ClaudeSessionManager:
 
         return result
 
-    def wait_for_idle(self, timeout: int = 300) -> dict:
+    def wait_for_idle(self, timeout: int = 900) -> dict:
         """自适应轮询等待 Claude 回到 IDLE 状态。
 
         相比固定轮询的改进：
@@ -459,6 +459,8 @@ class ClaudeSessionManager:
         ACTIVE_INTERVAL = 5.0        # 正常工作时的轮询间隔
         STALL_SLOW_INTERVAL = 10.0   # 停滞时放慢轮询间隔
         STALL_THRESHOLD = 30.0       # 30s 无 token 增长视为停滞
+        COMPACT_MIN_WAIT = 300       # compact 最少等 5 分钟
+        COMPACT_MAX_WAIT = 900       # compact 最多等 15 分钟
 
         # ── 初始化或恢复进度追踪（跨调用持久化） ──
         now = time.monotonic()
@@ -474,6 +476,8 @@ class ClaudeSessionManager:
                 "last_growth_time": now,
                 "last_check_tokens": current_tokens,
                 "stalled_patrols": 0,
+                "compact_detected": False,
+                "compact_start_time": None,
             }
 
         deadline = time.monotonic() + timeout
@@ -505,6 +509,16 @@ class ClaudeSessionManager:
             now = time.monotonic()
             current_tokens = self._buf.total_count()
 
+            # ── 检测 compact 操作（通过 output_parser 的 is_compacting 标志） ──
+            _pane_text = self._tmux.capture_pane()
+            _lines = OutputParser.clean_lines(_pane_text)
+            _parse_result = OutputParser.detect_state(_lines)
+            if getattr(_parse_result, 'is_compacting', False) and not self._wait_state["compact_detected"]:
+                self._wait_state["compact_detected"] = True
+                self._wait_state["compact_start_time"] = now
+                logger.info("Compact operation detected, extending wait time (min=%ds, max=%ds)",
+                            COMPACT_MIN_WAIT, COMPACT_MAX_WAIT)
+
             # ── 更新 token 增长追踪 ──
             if current_tokens > self._wait_state["last_check_tokens"]:
                 self._wait_state["last_growth_time"] = now
@@ -524,8 +538,13 @@ class ClaudeSessionManager:
                 self._wait_state["last_patrol_time"] = now
                 self._wait_state["last_patrol_tokens"] = current_tokens
 
-                # 连续无进展 → stalled
-                if self._wait_state["stalled_patrols"] >= MAX_STALLED_PATROLS:
+                # 连续无进展 → stalled（compact 期间不判定 stalled）
+                _compact_active = (
+                    self._wait_state["compact_detected"]
+                    and self._wait_state["compact_start_time"] is not None
+                    and (now - self._wait_state["compact_start_time"]) < COMPACT_MAX_WAIT
+                )
+                if self._wait_state["stalled_patrols"] >= MAX_STALLED_PATROLS and not _compact_active:
                     result = {
                         "status": "stalled",
                         "state": state,
@@ -551,15 +570,30 @@ class ClaudeSessionManager:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # compact 期间延长 deadline，最多等 COMPACT_MAX_WAIT
+                if (self._wait_state["compact_detected"]
+                        and self._wait_state["compact_start_time"] is not None
+                        and (time.monotonic() - self._wait_state["compact_start_time"]) < COMPACT_MAX_WAIT):
+                    deadline = time.monotonic() + COMPACT_MIN_WAIT
+                    logger.info("Compact in progress, extending deadline by %ds", COMPACT_MIN_WAIT)
+                    continue
                 break
             self._state_event.clear()
             self._state_event.wait(timeout=min(interval, remaining))
 
         # ── 超时 ──
+        # 返回信息要冷静客观，不要传递焦虑感
+        elapsed = time.monotonic() - self._wait_state["start_time"]
         result = {
             "status": "timeout",
             "state": self._sm.current_state,
             "timeout_reached": True,
+            "elapsed_seconds": round(elapsed, 1),
+            "hint": (
+                "Timeout is normal for long tasks. Claude Code may still be working. "
+                "Simply call wait_for_idle again with a larger timeout (e.g. 600-900). "
+                "Do NOT cancel or restart the session."
+            ),
             "progress_info": self._check_progress(),
         }
         if self._current_turn:
