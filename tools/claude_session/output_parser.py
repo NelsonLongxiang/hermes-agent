@@ -1,0 +1,189 @@
+"""tools/claude_session/output_parser.py — Parse Claude Code TUI output."""
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class ParseResult:
+    """Result of parsing captured tmux output."""
+    state: str
+    tool_name: Optional[str] = None
+    tool_target: Optional[str] = None
+    permission_text: Optional[str] = None
+    error_text: Optional[str] = None
+    is_compacting: bool = False
+
+
+# Regex patterns
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?m")
+_TOOL_CALL_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
+_TOOL_CALL_PAREN_RE = re.compile(r"^●\s+(\w+)\((.+)\)$")
+_PROMPT_RE = re.compile(r"^❯")
+_PERMISSION_RE = re.compile(
+    r"(Allow\s+.*\?"
+    r"|.*permission\s+to.*"
+    r"|❯\s*(Allow|Yes)\b"
+    r"|❯\s*\d+\.\s*(Yes|Allow|Deny|No)\b"
+    r"|Do you want to proceed\?"
+    r"|.*Yes.*No\b)",
+    re.IGNORECASE,
+)
+# Bottom status bar patterns — these are NOT real permission prompts
+_DECORATION_RE = re.compile(r"^[─━]{5,}$")  # thin or thick separator lines
+_STATUS_BAR_RE = re.compile(
+    r"(bypass permissions (on|off)|shift\+tab to cycle|esc to interrupt|"
+    r"⏵⏵|/model|/mcp|/ide for Visual Studio Code|"
+    r"[─━]{5,})",  # horizontal separator lines (thin ─ or thick ━)
+    re.IGNORECASE,
+)
+_ERROR_RE = re.compile(r"(Error:.*|Failed:.*|error:.*)", re.IGNORECASE)
+# Claude Code completion time indicator: "✻ Churned for 2m 57s", "✻ Sautéed for 6m 28s"
+_DONE_TIME_RE = re.compile(r"^✻\s+\S+.*\bfor\s+\d+[hms]", re.IGNORECASE)
+_COMPACT_RE = re.compile(
+    r"(Compacting|compressing\s+conversation|context\s+compression|"
+    r"condensing|summarizing\s+conversation|✓.*compact|"
+    r"concise.*summary|compact.*history)",
+    re.IGNORECASE,
+)
+
+
+class OutputParser:
+    """Static methods for parsing Claude Code TUI output from tmux capture-pane."""
+
+    @staticmethod
+    def strip_ansi(text: str) -> str:
+        """Remove all ANSI escape sequences from text."""
+        return _ANSI_RE.sub("", text)
+
+    @staticmethod
+    def clean_lines(raw_output: str) -> list:
+        """Split raw tmux output into cleaned, non-empty lines."""
+        text = OutputParser.strip_ansi(raw_output)
+        return [line for line in text.splitlines() if line.strip()]
+
+    @staticmethod
+    def detect_state(lines: list) -> ParseResult:
+        """Detect the current Claude Code state from cleaned output lines.
+
+        Priority order: ERROR > PERMISSION > TOOL_CALL > IDLE > THINKING
+
+        Key insight: Claude Code's permission UI uses ❯ as a selector arrow
+        (e.g. "❯ Allow"), which must not be confused with the IDLE prompt ❯.
+        We detect permission prompts BEFORE checking for IDLE to avoid this.
+        """
+        if not lines:
+            return ParseResult(state="THINKING")
+
+        last_lines = lines[-5:] if len(lines) >= 5 else lines
+        all_text = "\n".join(last_lines)
+
+        # Check ERROR first (highest priority)
+        error_match = _ERROR_RE.search(all_text)
+        if error_match:
+            return ParseResult(state="ERROR", error_text=error_match.group(0))
+
+        # Check PERMISSION — exclude bottom status bar lines
+        # Status bar contains "bypass permissions on" etc. which falsely match
+        non_status_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
+        if non_status_lines:
+            non_status_text = "\n".join(non_status_lines)
+            perm_match = _PERMISSION_RE.search(non_status_text)
+            if perm_match:
+                return ParseResult(state="PERMISSION", permission_text=perm_match.group(0))
+
+        # Check TOOL_CALL first (scan recent lines — last 10)
+        # Must check BEFORE IDLE because Claude Code TUI renders a phantom ❯
+        # at the bottom of the pane while still executing tool calls.
+        recent_lines = lines[-10:] if len(lines) >= 10 else lines
+        for line in reversed(recent_lines):
+            tool_info = OutputParser._parse_tool_line(line)
+            if tool_info:
+                return ParseResult(
+                    state="TOOL_CALL",
+                    tool_name=tool_info["tool_name"],
+                    tool_target=tool_info["target"],
+                )
+
+        # Check IDLE — but ONLY if the ❯ appears on a line by itself
+        # (the bare prompt) or followed only by whitespace.
+        # Claude Code's permission selector uses "❯ Allow" or "❯ 1. Yes"
+        # which are NOT idle prompts.
+        #
+        # IMPORTANT: Also check that ❯ is NOT sandwiched between separator
+        # lines (────). Claude Code TUI renders a phantom ❯ at the bottom
+        # of the pane while actively working (thinking/tool_call). The real
+        # idle prompt appears WITHOUT surrounding separator lines.
+        idle_check_lines = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
+        for line in reversed(idle_check_lines):
+            stripped = line.strip()
+            # IDLE prompt is "❯" alone or "❯ " followed by typed user text,
+            # but NOT "❯ Allow" or "❯ 1. Yes" (permission selector).
+            if _PROMPT_RE.search(line):
+                # Exclude permission-selector patterns
+                if re.match(r"^❯\s*(Allow|Yes|Deny|No|\d+\.)", stripped, re.IGNORECASE):
+                    continue  # This is a permission selector, not IDLE
+
+                # Check if ❯ is surrounded by separator lines (phantom prompt)
+                # The TUI bottom area looks like:
+                #   ────────
+                #   ❯
+                #   ────────
+                #   ⏵⏵ bypass permissions on...
+                # If separator lines appear within 3 lines of ❯, it's phantom.
+                prompt_idx = None
+                for i, raw_line in enumerate(last_lines):
+                    if _PROMPT_RE.search(raw_line):
+                        prompt_idx = i
+                        break
+                if prompt_idx is not None:
+                    # Check 1-2 lines above and below for separator lines
+                    nearby_separators = 0
+                    for j in range(max(0, prompt_idx - 2), min(len(last_lines), prompt_idx + 3)):
+                        if j == prompt_idx:
+                            continue
+                        if _DECORATION_RE.search(last_lines[j].strip()):
+                            nearby_separators += 1
+                    if nearby_separators >= 2:
+                        # Possible phantom — but check for completion time indicator
+                        # above the separators. "✻ ... for Xm Xs" means Claude
+                        # finished its response and the ❯ is a real idle prompt.
+                        has_done_marker = any(
+                            _DONE_TIME_RE.search(l)
+                            for l in last_lines[:prompt_idx]
+                        )
+                        if not has_done_marker:
+                            continue
+
+                return ParseResult(state="IDLE")
+
+        # Check COMPACT — compact 操作期间状态通常是 THINKING
+        if _COMPACT_RE.search(all_text):
+            return ParseResult(state="THINKING", is_compacting=True)
+
+        # Default: THINKING
+        return ParseResult(state="THINKING")
+
+    @staticmethod
+    def _parse_tool_line(line: str) -> Optional[dict]:
+        """Parse a single tool call line like '● Edit src/auth.py'."""
+        # Try parenthesized form: ● Bash(cmd)
+        m = _TOOL_CALL_PAREN_RE.match(line.strip())
+        if m:
+            return {"tool_name": m.group(1), "target": m.group(2)}
+        # Try standard form: ● Edit file
+        m = _TOOL_CALL_RE.match(line.strip())
+        if m:
+            return {"tool_name": m.group(1), "target": m.group(2) or ""}
+        return None
+
+    @staticmethod
+    def extract_tool_calls(lines: list) -> list:
+        """Extract all tool call entries from output lines."""
+        calls = []
+        for line in lines:
+            info = OutputParser._parse_tool_line(line)
+            if info:
+                calls.append(info)
+        return calls

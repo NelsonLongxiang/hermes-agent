@@ -141,17 +141,32 @@ fi
 
 echo -e "${CYAN}→${NC} Setting up virtual environment..."
 
-if [ -d "venv" ]; then
-    echo -e "${CYAN}→${NC} Removing old venv..."
-    rm -rf venv
-fi
+_VENV_REUSED=false
 
-if is_termux; then
-    "$PYTHON_PATH" -m venv venv
-    echo -e "${GREEN}✓${NC} venv created with stdlib venv"
+if [ -d "venv" ]; then
+    # Verify the existing venv uses the correct Python version
+    _venv_python="$(./venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    if [ "$_venv_python" = "$PYTHON_VERSION" ]; then
+        echo -e "${GREEN}✓${NC} venv already exists (Python $_venv_python)"
+        _VENV_REUSED=true
+    else
+        echo -e "${YELLOW}⚠${NC} venv uses Python $_venv_python (need $PYTHON_VERSION) — recreating..."
+        rm -rf venv
+        if is_termux; then
+            "$PYTHON_PATH" -m venv venv
+        else
+            $UV_CMD venv venv --python "$PYTHON_VERSION"
+        fi
+        echo -e "${GREEN}✓${NC} venv recreated (Python $PYTHON_VERSION)"
+    fi
 else
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
-    echo -e "${GREEN}✓${NC} venv created (Python $PYTHON_VERSION)"
+    if is_termux; then
+        "$PYTHON_PATH" -m venv venv
+        echo -e "${GREEN}✓${NC} venv created with stdlib venv"
+    else
+        $UV_CMD venv venv --python "$PYTHON_VERSION"
+        echo -e "${GREEN}✓${NC} venv created (Python $PYTHON_VERSION)"
+    fi
 fi
 
 export VIRTUAL_ENV="$SCRIPT_DIR/venv"
@@ -161,35 +176,39 @@ SETUP_PYTHON="$SCRIPT_DIR/venv/bin/python"
 # Dependencies
 # ============================================================================
 
-echo -e "${CYAN}→${NC} Installing dependencies..."
-
-if is_termux; then
-    export ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || printf '%s' "${ANDROID_API_LEVEL:-}")"
-    echo -e "${CYAN}→${NC} Termux detected — installing the tested Android bundle"
-    "$SETUP_PYTHON" -m pip install --upgrade pip setuptools wheel
-    if [ -f "constraints-termux.txt" ]; then
-        "$SETUP_PYTHON" -m pip install -e ".[termux]" -c constraints-termux.txt || {
-            echo -e "${YELLOW}⚠${NC} Termux bundle install failed, falling back to base install..."
-            "$SETUP_PYTHON" -m pip install -e "." -c constraints-termux.txt
-        }
-    else
-        "$SETUP_PYTHON" -m pip install -e ".[termux]" || "$SETUP_PYTHON" -m pip install -e "."
-    fi
-    echo -e "${GREEN}✓${NC} Dependencies installed"
+if [ "$_VENV_REUSED" = true ]; then
+    echo -e "${GREEN}✓${NC} Skipping dependency install (venv reused)"
 else
-    # Prefer uv sync with lockfile (hash-verified installs) when available,
-    # fall back to pip install for compatibility or when lockfile is stale.
-    if [ -f "uv.lock" ]; then
-        echo -e "${CYAN}→${NC} Using uv.lock for hash-verified installation..."
-        UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --all-extras --locked 2>/dev/null && \
-            echo -e "${GREEN}✓${NC} Dependencies installed (lockfile verified)" || {
-            echo -e "${YELLOW}⚠${NC} Lockfile install failed (may be outdated), falling back to pip install..."
+    echo -e "${CYAN}→${NC} Installing dependencies..."
+
+    if is_termux; then
+        export ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || printf '%s' "${ANDROID_API_LEVEL:-}")"
+        echo -e "${CYAN}→${NC} Termux detected — installing the tested Android bundle"
+        "$SETUP_PYTHON" -m pip install --upgrade pip setuptools wheel
+        if [ -f "constraints-termux.txt" ]; then
+            "$SETUP_PYTHON" -m pip install -e ".[termux]" -c constraints-termux.txt || {
+                echo -e "${YELLOW}⚠${NC} Termux bundle install failed, falling back to base install..."
+                "$SETUP_PYTHON" -m pip install -e "." -c constraints-termux.txt
+            }
+        else
+            "$SETUP_PYTHON" -m pip install -e ".[termux]" || "$SETUP_PYTHON" -m pip install -e "."
+        fi
+        echo -e "${GREEN}✓${NC} Dependencies installed"
+    else
+        # Prefer uv sync with lockfile (hash-verified installs) when available,
+        # fall back to pip install for compatibility or when lockfile is stale.
+        if [ -f "uv.lock" ]; then
+            echo -e "${CYAN}→${NC} Using uv.lock for hash-verified installation..."
+            UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --all-extras --locked 2>/dev/null && \
+                echo -e "${GREEN}✓${NC} Dependencies installed (lockfile verified)" || {
+                echo -e "${YELLOW}⚠${NC} Lockfile install failed (may be outdated), falling back to pip install..."
+                $UV_CMD pip install -e ".[all]" || $UV_CMD pip install -e "."
+                echo -e "${GREEN}✓${NC} Dependencies installed"
+            }
+        else
             $UV_CMD pip install -e ".[all]" || $UV_CMD pip install -e "."
             echo -e "${GREEN}✓${NC} Dependencies installed"
-        }
-    else
-        $UV_CMD pip install -e ".[all]" || $UV_CMD pip install -e "."
-        echo -e "${GREEN}✓${NC} Dependencies installed"
+        fi
     fi
 fi
 
