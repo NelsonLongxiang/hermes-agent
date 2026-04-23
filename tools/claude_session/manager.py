@@ -640,16 +640,35 @@ class ClaudeSessionManager:
     # ------------------------------------------------------------------
 
     def respond_permission(self, response: str) -> dict:
-        """Respond to a permission request."""
-        if self._sm.current_state != ClaudeState.PERMISSION:
-            return {"error": "Not in PERMISSION state"}
+        """Respond to a permission request.
 
-        if response == "allow":
-            self._tmux.send_keys("y", enter=True)
-        elif response == "deny":
-            self._tmux.send_keys("n", enter=True)
-        else:
-            return {"error": f"Invalid response: {response}"}
+        Supports two Claude Code permission UI formats:
+        - Old: "Allow Bash command?" → send 'y'/'n' + Enter
+        - New (numbered selector): "Do you want to proceed?" with "❯ 1. Yes"
+          → Enter to accept default (Yes), or type deny option number + Enter
+        """
+        with self._lock:
+            if self._sm.current_state != ClaudeState.PERMISSION:
+                return {"error": "Not in PERMISSION state"}
+
+            is_numbered = self._detect_numbered_selector()
+
+            if response == "allow":
+                if is_numbered:
+                    self._tmux.send_special_key("Enter")
+                else:
+                    self._tmux.send_keys("y", enter=True)
+            elif response == "deny":
+                if is_numbered:
+                    deny_num = self._find_deny_option_number()
+                    if deny_num:
+                        self._tmux.send_keys(str(deny_num), enter=True)
+                    else:
+                        self._tmux.send_special_key("Enter")
+                else:
+                    self._tmux.send_keys("n", enter=True)
+            else:
+                return {"error": f"Invalid response: {response}"}
 
         if self._poller:
             self._poller.poll_now()
@@ -756,8 +775,9 @@ class ClaudeSessionManager:
         """Auto-approve a permission request when in skip mode.
 
         First checks if this is a real permission prompt (not the bottom
-        status bar "bypass permissions on" line). For real prompts, sends
-        'y' + Enter. Runs in the poller background thread.
+        status bar "bypass permissions on" line). Detects old vs numbered
+        selector UI format and sends the appropriate approval keystroke.
+        Runs in the poller background thread.
         """
         max_retries = 3
         for attempt in range(max_retries):
@@ -779,10 +799,14 @@ class ClaudeSessionManager:
                 non_status = [l for l in last_lines if not _STATUS_BAR_RE.search(l)]
                 non_status_text = "\n".join(non_status)
 
-                # Check for real permission keywords (Allow?, Yes/No, etc.)
+                # Check for real permission keywords (Allow?, Yes/No, proceed, etc.)
                 # but NOT status bar "bypass permissions on"
                 has_real_prompt = bool(
-                    re.search(r"(Allow\?|Yes.*No|permission to|wants to)", non_status_text, re.IGNORECASE)
+                    re.search(
+                        r"(Allow\?|Yes.*No|permission to|wants to|proceed\?|❯\s*\d+\.\s*(Yes|Allow))",
+                        non_status_text,
+                        re.IGNORECASE,
+                    )
                 )
 
                 if not has_real_prompt:
@@ -793,12 +817,16 @@ class ClaudeSessionManager:
             except Exception as e:
                 logger.warning("Auto-approve pane check failed: %s", e)
 
-            # Send 'y' + Enter to approve the real permission
+            # Detect UI format and send appropriate approval keystroke
+            is_numbered = self._detect_numbered_selector(pane_text=pane)
             logger.info(
-                "Auto-approving permission (skip mode, attempt %d/%d)",
-                attempt + 1, max_retries,
+                "Auto-approving permission (skip mode, attempt %d/%d, format=%s)",
+                attempt + 1, max_retries, "numbered" if is_numbered else "classic",
             )
-            self._tmux.send_keys("y", enter=True)
+            if is_numbered:
+                self._tmux.send_special_key("Enter")
+            else:
+                self._tmux.send_keys("y", enter=True)
 
             # Wait for state to change (up to 2 seconds)
             for _ in range(10):
@@ -842,12 +870,53 @@ class ClaudeSessionManager:
         all_lines = self._buf.read()
         last_lines = all_lines[-10:] if len(all_lines) > 10 else all_lines
         for line in reversed(last_lines):
-            if "allow" in line.text.lower() or "permission" in line.text.lower():
+            lower = line.text.lower()
+            if "allow" in lower or "permission" in lower or "proceed?" in lower:
                 result["permission_request"] = line.text
                 break
         if self._current_turn:
             result["turn"] = self._current_turn.to_dict()
         return result
+
+    def _detect_numbered_selector(self, pane_text: Optional[str] = None) -> bool:
+        """Check if current permission UI uses numbered selector format.
+
+        Numbered selector: "❯ 1. Yes" / "2. ..." / "3. No"
+        Old format: "Allow ... ?" / "❯ Allow" / "❯ Deny"
+
+        Args:
+            pane_text: Pre-captured pane content to avoid redundant capture.
+                       If None, captures from tmux.
+        """
+        try:
+            if pane_text is None:
+                pane_text = self._tmux.capture_pane()
+            lines = OutputParser.clean_lines(pane_text)
+            last_lines = lines[-8:] if len(lines) >= 8 else lines
+            for line in last_lines:
+                if re.match(r"\s*❯\s*\d+\.", line):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _find_deny_option_number(self) -> Optional[int]:
+        """Find the option number for deny/no in a numbered selector UI.
+
+        Scans the pane for lines like "3. No" or "2. Deny" and returns
+        the corresponding number. Returns None if not found.
+        """
+        try:
+            pane = self._tmux.capture_pane()
+            lines = OutputParser.clean_lines(pane)
+            last_lines = lines[-8:] if len(lines) >= 8 else lines
+            for line in last_lines:
+                m = re.match(r"\s*(?:❯\s*)?(\d+)\.\s*(No|Deny)\b", line, re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        return None
 
     def _build_error_result(self) -> dict:
         """Build result for wait_for_idle when state is ERROR."""

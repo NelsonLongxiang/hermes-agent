@@ -54,6 +54,82 @@ logger = logging.getLogger(__name__)
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
 _stale_base_url_warned = False
 
+# ── Provider circuit breaker ───────────────────────────────────────
+# Tracks consecutive connection errors per provider.  After
+# _CIRCUIT_MAX_FAILURES the provider is "tripped" and skipped for
+# _CIRCUIT_COOLDOWN_SECONDS.  Only applies to auto resolution —
+# explicit provider choices bypass the breaker.
+_CIRCUIT_MAX_FAILURES = 2
+_CIRCUIT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+_circuit_lock = threading.Lock()
+# provider_label -> (consecutive_failures, cooldown_until_monotonic)
+_provider_circuit: dict[str, tuple[int, float]] = {}
+
+
+def _circuit_record_failure(provider_label: str) -> None:
+    """Record a connection error for the provider."""
+    if not provider_label:
+        return
+    with _circuit_lock:
+        failures, _ = _provider_circuit.get(provider_label, (0, 0.0))
+        failures += 1
+        if failures >= _CIRCUIT_MAX_FAILURES:
+            cooldown_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
+            _provider_circuit[provider_label] = (failures, cooldown_until)
+            logger.info(
+                "Circuit breaker tripped for provider '%s' after %d failures. "
+                "Skipping for %ds.",
+                provider_label, failures, _CIRCUIT_COOLDOWN_SECONDS,
+            )
+        else:
+            _provider_circuit[provider_label] = (failures, 0.0)
+
+
+def _circuit_record_success(provider_label: str) -> None:
+    """Reset failure count on a successful call."""
+    if not provider_label:
+        return
+    with _circuit_lock:
+        _provider_circuit.pop(provider_label, None)
+
+
+def _circuit_is_open(provider_label: str) -> bool:
+    """Return True if the provider is in cooldown (breaker tripped)."""
+    if not provider_label:
+        return False
+    with _circuit_lock:
+        failures, cooldown_until = _provider_circuit.get(provider_label, (0, 0.0))
+        if failures < _CIRCUIT_MAX_FAILURES:
+            return False
+        if time.monotonic() < cooldown_until:
+            return True
+        # Cooldown expired — half-open: preserve one failure count so a
+        # single probe failure re-trips without needing a second call.
+        _provider_circuit[provider_label] = (1, 0.0)
+        return False
+
+
+# Map known base_url substrings to provider labels for circuit breaker tracking.
+_BASE_URL_PROVIDER_HINTS: list[tuple[str, str]] = [
+    ("open.bigmodel.cn", "zai"),
+    ("openrouter.ai", "openrouter"),
+    ("api.nousportal.com", "nous"),
+    ("chatgpt.com", "openai-codex"),
+    ("api.anthropic.com", "anthropic"),
+    ("api.moonshot.cn", "kimi-coding"),
+    ("api.minimax.chat", "minimax"),
+]
+
+
+def _infer_provider_from_client(client: Any, fallback: str) -> str:
+    """Best-effort infer provider label from client's base_url."""
+    base = str(getattr(client, "base_url", "") or "")
+    for needle, label in _BASE_URL_PROVIDER_HINTS:
+        if needle in base:
+            return label
+    return fallback
+
 _PROVIDER_ALIASES = {
     "google": "gemini",
     "google-gemini": "gemini",
@@ -1265,6 +1341,9 @@ def _try_payment_fallback(
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
             continue
+        if _circuit_is_open(label):
+            tried.append(f"{label} [breaker]")
+            continue
         client, model = try_fn()
         if client is not None:
             logger.info(
@@ -1341,21 +1420,28 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
             resolved_provider = "custom"
             explicit_base_url = runtime_base_url
             explicit_api_key = runtime_api_key or None
-        client, resolved = resolve_provider_client(
-            resolved_provider,
-            main_model,
-            explicit_base_url=explicit_base_url,
-            explicit_api_key=explicit_api_key,
-            api_mode=runtime_api_mode or None,
-        )
-        if client is not None:
-            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
-                        main_provider, resolved or main_model)
-            return client, resolved or main_model
+        if _circuit_is_open(resolved_provider):
+            logger.info("Auxiliary auto-detect: skipping main provider %s (circuit breaker)",
+                        resolved_provider)
+        else:
+            client, resolved = resolve_provider_client(
+                resolved_provider,
+                main_model,
+                explicit_base_url=explicit_base_url,
+                explicit_api_key=explicit_api_key,
+                api_mode=runtime_api_mode or None,
+            )
+            if client is not None:
+                logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+                            main_provider, resolved or main_model)
+                return client, resolved or main_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
+        if _circuit_is_open(label):
+            tried.append(f"{label} [breaker]")
+            continue
         client, model = try_fn()
         if client is not None:
             if tried:
@@ -2563,6 +2649,12 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    # Resolve the actual provider label for circuit breaker tracking.
+    # When resolved_provider is "auto", the real provider was picked by
+    # _resolve_auto — infer it from the client's base_url.
+    if resolved_provider in ("auto", "", None):
+        resolved_provider = _infer_provider_from_client(client, resolved_provider)
+
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 
     # Log what we're about to do — makes auxiliary operations visible
@@ -2585,8 +2677,10 @@ def call_llm(
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
-        return _validate_llm_response(
+        result = _validate_llm_response(
             client.chat.completions.create(**kwargs), task)
+        _circuit_record_success(resolved_provider)
+        return result
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
@@ -2619,6 +2713,8 @@ def call_llm(
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
+        if _is_connection_error(first_err) and is_auto:
+            _circuit_record_failure(resolved_provider)
         if should_fallback and is_auto:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -2763,6 +2859,10 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    # Resolve actual provider label for circuit breaker (same as sync path).
+    if resolved_provider in ("auto", "", None):
+        resolved_provider = _infer_provider_from_client(client, resolved_provider)
+
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 
     kwargs = _build_call_kwargs(
@@ -2777,8 +2877,10 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
-        return _validate_llm_response(
+        result = _validate_llm_response(
             await client.chat.completions.create(**kwargs), task)
+        _circuit_record_success(resolved_provider)
+        return result
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
@@ -2797,6 +2899,8 @@ async def async_call_llm(
         # ── Payment / connection fallback (mirrors sync call_llm) ─────
         should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
         is_auto = resolved_provider in ("auto", "", None)
+        if _is_connection_error(first_err) and is_auto:
+            _circuit_record_failure(resolved_provider)
         if should_fallback and is_auto:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",

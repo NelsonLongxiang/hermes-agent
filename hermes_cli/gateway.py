@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1480,13 +1481,103 @@ def systemd_uninstall(system: bool = False):
     print(f"✓ {_service_scope_label(system).capitalize()} service uninstalled")
 
 
+def _cleanup_orphan_gateway_pids(system: bool = False) -> list[int]:
+    """Kill gateway processes that aren't managed by the systemd service.
+
+    Orphan processes (manual foreground runs, processes from a different venv)
+    conflict with the service because ``gateway run --replace`` may fail to
+    replace them, leaving the service dead while the orphan keeps running.
+    """
+    service_pids = _get_service_pids()
+    # Exclude self and ancestors — the ``hermes gateway start`` command itself
+    # matches the gateway process scan and would be killed otherwise.
+    exclude = service_pids | {os.getpid()}
+    all_pids = find_gateway_pids(exclude_pids=exclude)
+    orphan_pids = [p for p in all_pids if p not in service_pids]
+
+    if not orphan_pids:
+        return []
+
+    pid_list = ", ".join(str(p) for p in orphan_pids)
+    print(f"⚠ Found orphan gateway process(es): PID(s) {pid_list}")
+    print("  These are not managed by the service and will be terminated before starting.")
+
+    for pid in orphan_pids:
+        try:
+            terminate_pid(pid, force=False)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    # Wait up to 10 s for graceful exit
+    remaining = list(orphan_pids)
+    for _ in range(20):
+        still_alive = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                still_alive.append(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if not still_alive:
+            remaining = []
+            break
+        remaining = still_alive
+        time.sleep(0.5)
+
+    # Force-kill anything still alive
+    for pid in remaining:
+        try:
+            terminate_pid(pid, force=True)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    time.sleep(0.3)
+
+    print(f"✓ Orphan process(es) terminated")
+    return orphan_pids
+
+
 def systemd_start(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("start")
     refresh_systemd_unit_if_needed(system=system)
+
+    # Kill orphan gateway processes before starting — they prevent the
+    # new service instance from taking over cleanly via --replace.
+    _cleanup_orphan_gateway_pids(system=system)
+
     _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
-    print(f"✓ {_service_scope_label(system).capitalize()} service started")
+
+    # Verify the service actually started and stayed running.
+    scope = _service_scope_label(system).capitalize()
+    for _ in range(10):
+        result = _run_systemctl(
+            ["is-active", get_service_name()],
+            system=system,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.stdout.strip() == "active":
+            print(f"✓ {scope} service started")
+            return
+        time.sleep(0.5)
+
+    # Service didn't stay running — show why
+    print(f"⚠ {scope} service was started but is not active")
+    try:
+        journal = _run_systemctl(
+            ["status", get_service_name()],
+            system=system,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in journal.stdout.strip().splitlines()[-5:]:
+            print(f"  {line}")
+    except Exception:
+        pass
+    print(f"  Check logs: {('journalctl' if system else 'journalctl --user')} -u {get_service_name()} -n 30")
 
 
 
