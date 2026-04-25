@@ -188,7 +188,13 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "the task, use them instead of telling the user what you would do.\n"
     "Every response should either (a) contain tool calls that make progress, or "
     "(b) deliver a final result to the user. Responses that only describe intentions "
-    "without acting are not acceptable."
+    "without acting are not acceptable.\n\n"
+    "<tool_priority>\n"
+    "When delegating coding tasks to Claude Code:\n"
+    "- Use claude_session tool (interactive, state-aware) — NOT delegate_task or terminal.\n"
+    "- delegate_task is for spawning generic subagents, not for Claude Code CLI interaction.\n"
+    "- terminal + 'claude -p' is a last resort for simple one-shot tasks only.\n"
+    "</tool_priority>"
 )
 
 # Model name substrings that trigger tool-use enforcement guidance.
