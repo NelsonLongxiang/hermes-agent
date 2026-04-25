@@ -75,17 +75,20 @@ def _get_session_by_workdir(workdir: str):
 CLAUDE_SESSION_SCHEMA = {
     "name": "claude_session",
     "description": (
-        "Manage an interactive Claude Code session via tmux. "
-        "Provides real-time state awareness, turn-level tracking, and atomic send. "
-        "Actions: 'start' (launch session), 'send' (send message atomically), "
-        "'type' (type without sending), 'submit' (press Enter), "
-        "'cancel_input' (Ctrl+C), 'status' (query state), "
-        "'wait_for_idle' (block until Claude finishes), "
-        "'wait_for_state' (block until specific state), "
-        "'output' (get output with pagination), "
-        "'respond_permission' (handle permission dialog), "
-        "'stop' (terminate session), 'history' (turn history), "
-        "'events' (get queued events), 'diagnose' (check dependencies)."
+        "Interactive Claude Code session via tmux — PREFERRED way to delegate coding tasks to Claude Code.\n"
+        "Actions: start|send|type|submit|status|wait_for_idle|output|respond_permission|stop|history|events|diagnose|... (see parameters for full list)\n\n"
+        "WHEN TO USE claude_session (preferred over delegate_task/terminal for Claude Code):\n"
+        "- Complex multi-file coding tasks (refactoring, feature implementation)\n"
+        "- Tasks requiring real-time monitoring and mid-task intervention\n"
+        "- Long-running Claude Code sessions with state tracking\n"
+        "- Any task where you need to see and control Claude's progress\n\n"
+        "WHEN NOT TO USE:\n"
+        "- Simple shell commands -> use terminal\n"
+        "- Non-Claude reasoning tasks -> use delegate_task\n"
+        "- One-shot quick questions -> use terminal with 'claude -p'\n\n"
+        "Provides real-time state awareness (IDLE/THINKING/TOOL_CALL/PERMISSION), "
+        "turn-level tracking, atomic send, and permission handling.\n"
+        "Load 'claude-session' skill for detailed workflows and troubleshooting."
     ),
     "parameters": {
         "type": "object",

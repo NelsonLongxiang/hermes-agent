@@ -1,6 +1,6 @@
 ---
 name: claude-session
-description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux
+description: "MANDATORY before delegating any coding task to Claude Code via tmux — contains workflows, pitfalls, and state management rules"
 version: 2.0
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
