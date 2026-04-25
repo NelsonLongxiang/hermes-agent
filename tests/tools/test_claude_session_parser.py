@@ -385,3 +385,45 @@ class TestDetectUserPrompt:
         lines = []
         result = OutputParser.detect_user_prompt(lines, "IDLE")
         assert result is None
+
+    def test_ask_user_in_permission_state(self):
+        """Numbered options detected as ask_user even in PERMISSION state."""
+        lines = [
+            "Which approach?",
+            "❯ 1. Use existing library",
+            "  2. Write from scratch",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "PERMISSION")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        assert result.selected_index == 0
+
+    def test_ask_user_takes_priority_over_permission(self):
+        """'Allow Bash?' with numbered options = ask_user (not permission)."""
+        lines = [
+            "Allow Bash?",
+            "❯ 1. Yes, allow this time",
+            "  2. Yes, and don't ask again",
+            "  3. No",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "PERMISSION")
+        assert result is not None
+        # ask_user runs first and matches numbered options
+        assert result.prompt_type == "ask_user"
+
+    def test_raw_context_includes_surrounding_lines(self):
+        """Verify raw_context includes surrounding lines."""
+        lines = [
+            "Previous output line",
+            "Pick an option:",
+            "❯ 1. Option A",
+            "  2. Option B",
+            "Following output line",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        # raw_context should include lines around the options
+        assert "Pick an option:" in result.raw_context
+        assert "Option A" in result.raw_context
+        assert "Option B" in result.raw_context
