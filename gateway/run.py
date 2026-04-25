@@ -9665,6 +9665,39 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
+        # Bridge Claude Session status → Telegram status message.
+        # Only set up for platforms that support message editing (skip webhook).
+        _claude_status_msg = None
+        _last_claude_status = [None]  # track last status for completion summary
+        if _status_adapter and source.platform != Platform.WEBHOOK:
+            try:
+                from gateway.status_message import StatusMessageManager
+                from tools.claude_session_tool import register_status_observer
+
+                _claude_status_msg = StatusMessageManager(
+                    adapter=_status_adapter,
+                    chat_id=_status_chat_id,
+                    metadata=_status_thread_metadata,
+                )
+
+                def _claude_session_status_bridge(
+                    session_id: str, status_info: dict,
+                ) -> None:
+                    if not _run_still_current():
+                        return
+                    _last_claude_status[0] = status_info
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _claude_status_msg.update(status_info),
+                            _loop_for_step,
+                        )
+                    except Exception as _e:
+                        logger.debug("claude session status bridge error: %s", _e)
+
+                register_status_observer(_claude_session_status_bridge)
+            except Exception as _e:
+                logger.debug("Could not set up claude session status bridge: %s", _e)
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -10819,6 +10852,24 @@ class GatewayRunner:
                 progress_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+
+            # Clean up claude session status observer and finalize message
+            try:
+                from tools.claude_session_tool import unregister_status_observer
+                unregister_status_observer()
+            except Exception:
+                pass
+            if _claude_status_msg:
+                try:
+                    if _last_claude_status[0] and not _inactivity_timeout:
+                        summary = _claude_status_msg.format_summary(
+                            _last_claude_status[0],
+                        )
+                        await _claude_status_msg.finish(summary)
+                    else:
+                        await _claude_status_msg.cancel()
+                except Exception:
+                    pass
 
             # Wait for stream consumer to finish its final edit
             if stream_task:

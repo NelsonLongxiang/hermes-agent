@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import os
 import shutil
 import threading
 import uuid
@@ -13,30 +14,70 @@ from tools.registry import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Session Registry（支持并行运行多个独立会话 + workdir 隔离）
+# Session Registry（支持并行运行多个独立会话 + gateway session 隔离）
 # ---------------------------------------------------------------------------
 _sessions: dict = {}   # session_id → ClaudeSessionManager 实例
-_workdir_index: dict = {}  # workdir(绝对路径) → session_id 反向索引
+_workdir_index: dict = {}  # (gateway_key, workdir) → session_id 反向索引
 _sessions_lock = threading.Lock()
 
+# Global status observer — set by gateway to bridge session status to Telegram
+_status_observer = None  # Optional[Callable[[str, dict], None]]
 
-def _derive_session_name(workdir: str) -> str:
-    """基于 workdir 绝对路径生成确定性 tmux session 名。
 
-    同一 workdir 永远映射到同一 tmux session，防止重复创建。
+def register_status_observer(callback):
+    """Register a global status observer for all claude sessions.
+
+    Called by gateway/run.py to bridge ClaudeSessionManager status updates
+    to Telegram status messages. The callback receives (session_id, status_info).
+    """
+    global _status_observer
+    _status_observer = callback
+
+
+def unregister_status_observer():
+    """Remove the global status observer."""
+    global _status_observer
+    _status_observer = None
+
+
+def _get_gateway_session_key() -> str:
+    """读取当前 gateway session_key（并发安全）。
+
+    优先从 contextvars 读取（gateway 模式，每个 Telegram 群聊独立），
+    回退到 os.environ（CLI/cron 模式），都为空则返回空串（无隔离）。
+    """
+    try:
+        from gateway.session_context import get_session_env
+        key = get_session_env("HERMES_SESSION_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("HERMES_SESSION_KEY", "")
+
+
+def _derive_session_name(workdir: str, gateway_session_key: str = "") -> str:
+    """基于 workdir + gateway session_key 生成确定性 tmux session 名。
+
+    gateway 模式下，同一 workdir 的不同 Telegram 群聊会得到不同的 tmux 名。
+    CLI/cron 模式下（gateway_session_key 为空），退化为纯 workdir 哈希。
     格式：hermes-{sha256前8位}
     """
-    import os
     abs_path = os.path.abspath(workdir)
-    h = hashlib.sha256(abs_path.encode()).hexdigest()[:8]
+    if gateway_session_key:
+        combined = f"{abs_path}:{gateway_session_key}"
+    else:
+        combined = abs_path
+    h = hashlib.sha256(combined.encode()).hexdigest()[:8]
     return f"hermes-{h}"
 
 
-def _get_session(session_id: str = None, strict: bool = False):
-    """获取指定会话，无 session_id 时返回最近创建的会话。
+def _get_session(session_id: str = None, gateway_session_key: str = "", strict: bool = False):
+    """获取指定会话，无 session_id 时返回当前 gateway session 的最近会话。
 
     Args:
-        session_id: 目标会话 ID。None 时返回最近活跃会话。
+        session_id: 目标会话 ID。None 时按 gateway_session_key 过滤后返回最近的会话。
+        gateway_session_key: 当前 gateway session key，用于隔离不同 Telegram 群聊。
         strict: 为 True 时，指定了 session_id 但找不到则返回 None（不回退），
                 用于 stop/操作类 action 防止操作错误会话。
     """
@@ -52,17 +93,28 @@ def _get_session(session_id: str = None, strict: bool = False):
                     session_id, list(_sessions.keys()),
                 )
                 return None
-        # 无指定时返回最后添加的（最近创建的）会话
+        # 按 gateway session_key 过滤，返回该 gateway 下最近创建的会话
+        if gateway_session_key:
+            sessions_for_gateway = [
+                mgr for mgr in _sessions.values()
+                if getattr(mgr, "_gateway_session_key", "") == gateway_session_key
+            ]
+            if sessions_for_gateway:
+                return sessions_for_gateway[-1]
+        # CLI/cron 模式（无 gateway session_key）返回全局最后一个
         if _sessions:
             return list(_sessions.values())[-1]
     return None
 
 
-def _get_session_by_workdir(workdir: str):
-    """通过 workdir 查找已注册的会话（无锁，调用方需持有 _sessions_lock）。"""
-    import os
+def _get_session_by_workdir(workdir: str, gateway_session_key: str = ""):
+    """通过 (gateway_session_key, workdir) 查找已注册的会话。
+
+    无锁，调用方需持有 _sessions_lock。
+    """
     abs_path = os.path.abspath(workdir)
-    sid = _workdir_index.get(abs_path)
+    idx_key = (gateway_session_key, abs_path)
+    sid = _workdir_index.get(idx_key)
     if sid and sid != "__starting__" and sid in _sessions:
         return _sessions[sid]
     return None
@@ -186,25 +238,26 @@ CLAUDE_SESSION_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _handle_claude_session(args, **kw):
-    """Dispatch claude_session tool calls (支持多会话路由)."""
+    """Dispatch claude_session tool calls (支持多会话路由 + gateway session 隔离)."""
     action = args.get("action", "")
+    gw_key = _get_gateway_session_key()
 
-    # ── start：创建新实例并注册（workdir 隔离：同 workdir 复用已有会话）──
+    # ── start：创建新实例并注册（gateway session + workdir 联合隔离）──
     if action == "start":
         from tools.claude_session.manager import ClaudeSessionManager
-        import os
 
         workdir = args.get("workdir", ".")
         abs_workdir = os.path.abspath(workdir)
+        idx_key = (gw_key, abs_workdir)
 
-        # 基于 workdir 生成确定性 tmux session 名（除非显式指定）
+        # 基于 (gateway_session_key, workdir) 生成确定性 tmux session 名（除非显式指定）
         sn = args.get("session_name")
         if not sn:
-            sn = _derive_session_name(abs_workdir)
+            sn = _derive_session_name(abs_workdir, gw_key)
 
         with _sessions_lock:
-            # 检查 workdir 索引：已有活跃会话则复用
-            existing = _get_session_by_workdir(abs_workdir)
+            # 检查 (gateway_key, workdir) 索引：同一 gateway session 下已有活跃会话则复用
+            existing = _get_session_by_workdir(abs_workdir, gw_key)
             if existing and existing._session_active:
                 return json.dumps({
                     "session_id": existing._session_id,
@@ -215,12 +268,12 @@ def _handle_claude_session(args, **kw):
                     "note": "Session already active for this workdir",
                 }, ensure_ascii=False)
 
-            # 预占 workdir 槽位，防止并发 start 同一 workdir 时双重创建
-            # 使用占位标记（值为 None），注册完成后替换
-            _workdir_index[abs_workdir] = "__starting__"
+            # 预占槽位，防止并发 start 时双重创建
+            _workdir_index[idx_key] = "__starting__"
 
         try:
             mgr = ClaudeSessionManager()
+            mgr._gateway_session_key = gw_key
             result = mgr.start(
                 workdir=abs_workdir,
                 session_name=sn,
@@ -233,26 +286,31 @@ def _handle_claude_session(args, **kw):
         except Exception as e:
             # 启动异常时清理占位
             with _sessions_lock:
-                _workdir_index.pop(abs_workdir, None)
+                _workdir_index.pop(idx_key, None)
             return json.dumps({"error": f"Failed to create session: {e}"}, ensure_ascii=False)
 
-        # 仅启动成功时注册到会话表和 workdir 索引
+        # 仅启动成功时注册到会话表和索引
         if "error" not in result:
             sid = result.get("session_id")
             if sid:
                 with _sessions_lock:
                     _sessions[sid] = mgr
-                    _workdir_index[abs_workdir] = sid
+                    _workdir_index[idx_key] = sid
+                # Attach status observer if registered
+                if _status_observer:
+                    mgr._status_callback = (
+                        lambda info, _sid=sid: _status_observer(_sid, info) if _status_observer else None
+                    )
         else:
             # 启动失败时清理占位
             with _sessions_lock:
-                _workdir_index.pop(abs_workdir, None)
+                _workdir_index.pop(idx_key, None)
         return json.dumps(result, ensure_ascii=False)
 
-    # ── stop：停止并从注册表和 workdir 索引移除 ──
+    # ── stop：停止并从注册表和索引移除 ──
     if action == "stop":
         specified_id = args.get("session_id")
-        mgr = _get_session(specified_id, strict=bool(specified_id))
+        mgr = _get_session(specified_id, gateway_session_key=gw_key, strict=bool(specified_id))
         if mgr is None:
             return tool_error(
                 f"Session '{specified_id}' not found in registry. "
@@ -263,7 +321,7 @@ def _handle_claude_session(args, **kw):
         if result.get("stopped"):
             with _sessions_lock:
                 _sessions.pop(result.get("session_id"), None)
-                # 清理 workdir 索引
+                # 清理索引
                 stale_keys = [k for k, v in _workdir_index.items() if v == result.get("session_id")]
                 for k in stale_keys:
                     _workdir_index.pop(k, None)
@@ -274,8 +332,8 @@ def _handle_claude_session(args, **kw):
         result = _diagnose_claude_session()
         return json.dumps(result, ensure_ascii=False)
 
-    # ── 其他动作：通过 _get_session 路由到对应实例 ──
-    mgr = _get_session(args.get("session_id"))
+    # ── 其他动作：通过 _get_session 路由到对应实例（按 gateway session 隔离）──
+    mgr = _get_session(args.get("session_id"), gateway_session_key=gw_key)
     if mgr is None:
         # 只读查询 action：无会话时返回优雅默认值
         if action == "status":

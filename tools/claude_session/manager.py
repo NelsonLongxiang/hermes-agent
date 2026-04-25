@@ -111,6 +111,12 @@ class ClaudeSessionManager:
         self._auto_responder: Optional[AutoResponder] = None
         self._conversation_context: dict = {}
 
+        # Gateway session isolation (set by claude_session_tool.py)
+        self._gateway_session_key: str = ""
+
+        # Status callback for gateway status bridge
+        self._status_callback = None  # Optional[Callable[[dict], None]]
+
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
@@ -791,6 +797,12 @@ class ClaudeSessionManager:
                 "to_state": transition.to_state,
             })
 
+            # Build status info inside lock to capture accurate state
+            # (especially for IDLE transitions where _current_turn gets set to None)
+            _status_info = None
+            if self._status_callback:
+                _status_info = self._build_status_info()
+
         # Signal waiters outside lock
         self._state_event.set()
 
@@ -804,6 +816,16 @@ class ClaudeSessionManager:
         # AutoResponder routing
         if prompt_info and self._auto_responder:
             self._auto_responder.handle_prompt(prompt_info, self._conversation_context)
+
+        # Fire status callback outside lock to avoid holding lock during I/O
+        if _status_info is not None:
+            try:
+                _status_info["state"] = transition.to_state
+                _status_info["tool_name"] = getattr(transition, "tool_name", None)
+                _status_info["tool_target"] = getattr(transition, "tool_target", None)
+                self._status_callback(_status_info)
+            except Exception as e:
+                logger.debug("Status callback error: %s", e)
 
     def _auto_approve_permission(self) -> None:
         """Auto-approve a permission request when in skip mode.
@@ -886,6 +908,26 @@ class ClaudeSessionManager:
                 self._on_event.put(evt)
             except Exception:
                 pass
+
+    def _build_status_info(self) -> dict:
+        """Build status info dict for the status callback."""
+        now = time.monotonic()
+        tool_calls_dicts = []
+        if self._current_turn:
+            tool_calls_dicts = [tc.to_dict() for tc in self._current_turn.tool_calls]
+
+        return {
+            "state": self._sm.current_state,
+            "tool_name": None,
+            "tool_target": None,
+            "turn_id": self._current_turn.turn_id if self._current_turn else None,
+            "elapsed_seconds": (
+                (now - self._current_turn.start_time)
+                if self._current_turn else 0
+            ),
+            "tool_calls": tool_calls_dicts,
+            "recent_output": self._buf.last_n_chars(200),
+        }
 
     def _build_idle_result(self) -> dict:
         """Build result for wait_for_idle when state is IDLE."""
