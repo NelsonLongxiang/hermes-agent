@@ -22,7 +22,8 @@ _sessions_lock = threading.Lock()
 
 # Per-gateway-session status observers — bridges session status to Telegram.
 # Keyed by gateway_session_key so concurrent sessions route to the correct chat.
-_status_observers: dict[str, callable] = {}  # gw_key → callback(session_id, info)
+from typing import Callable
+_status_observers: dict[str, Callable[[str, dict], None]] = {}  # gw_key → callback(session_id, info)
 _status_observers_lock = threading.Lock()
 
 
@@ -60,6 +61,29 @@ def _get_gateway_session_key() -> str:
     except Exception:
         pass
     return os.environ.get("HERMES_SESSION_KEY", "")
+
+
+def _safe_call_observer(observer: Callable[[str, dict], None], session_id: str, status_info: dict) -> None:
+    """Safely call an observer with exception handling.
+
+    Wraps observer callbacks to prevent crashes when the underlying resources
+    (e.g., gateway session, event loop) have been cleaned up. Silently logs
+    errors rather than propagating them to the Claude Code session manager.
+
+    Args:
+        observer: The observer callback to call
+        session_id: Claude session ID
+        status_info: Status information dictionary
+    """
+    try:
+        observer(session_id, status_info)
+    except Exception as e:
+        logger.debug(
+            "Observer callback error (session=%s, gateway_key=%s): %s",
+            session_id,
+            _get_gateway_session_key(),
+            e,
+        )
 
 
 def _derive_session_name(workdir: str, gateway_session_key: str = "") -> str:
@@ -305,10 +329,12 @@ def _handle_claude_session(args, **kw):
                 # Attach status observer for this gateway session (per-key isolation).
                 # Bind the observer via default parameter so the lambda captures the
                 # correct callback at creation time — NOT the global dict at call time.
-                _observer = _status_observers.get(gw_key)
+                # Hold lock during observer read to prevent TOCTOU race.
+                with _status_observers_lock:
+                    _observer = _status_observers.get(gw_key)
                 if _observer:
                     mgr._status_callback = (
-                        lambda info, _sid=sid, _obs=_observer: _obs(_sid, info)
+                        lambda info, _sid=sid, _obs=_observer: _safe_call_observer(_obs, _sid, info)
                     )
         else:
             # 启动失败时清理占位
