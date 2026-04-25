@@ -20,24 +20,30 @@ _sessions: dict = {}   # session_id → ClaudeSessionManager 实例
 _workdir_index: dict = {}  # (gateway_key, workdir) → session_id 反向索引
 _sessions_lock = threading.Lock()
 
-# Global status observer — set by gateway to bridge session status to Telegram
-_status_observer = None  # Optional[Callable[[str, dict], None]]
+# Per-gateway-session status observers — bridges session status to Telegram.
+# Keyed by gateway_session_key so concurrent sessions route to the correct chat.
+_status_observers: dict[str, callable] = {}  # gw_key → callback(session_id, info)
+_status_observers_lock = threading.Lock()
 
 
-def register_status_observer(callback):
-    """Register a global status observer for all claude sessions.
+def register_status_observer(callback, gateway_session_key: str = ""):
+    """Register a status observer for a specific gateway session.
 
     Called by gateway/run.py to bridge ClaudeSessionManager status updates
     to Telegram status messages. The callback receives (session_id, status_info).
+
+    Uses per-gateway-session-key isolation so concurrent sessions (e.g. a DM
+    and a group chat running in parallel) each route status updates to the
+    correct chat instead of overwriting each other.
     """
-    global _status_observer
-    _status_observer = callback
+    with _status_observers_lock:
+        _status_observers[gateway_session_key] = callback
 
 
-def unregister_status_observer():
-    """Remove the global status observer."""
-    global _status_observer
-    _status_observer = None
+def unregister_status_observer(gateway_session_key: str = ""):
+    """Remove the status observer for a specific gateway session."""
+    with _status_observers_lock:
+        _status_observers.pop(gateway_session_key, None)
 
 
 def _get_gateway_session_key() -> str:
@@ -296,10 +302,13 @@ def _handle_claude_session(args, **kw):
                 with _sessions_lock:
                     _sessions[sid] = mgr
                     _workdir_index[idx_key] = sid
-                # Attach status observer if registered
-                if _status_observer:
+                # Attach status observer for this gateway session (per-key isolation).
+                # Bind the observer via default parameter so the lambda captures the
+                # correct callback at creation time — NOT the global dict at call time.
+                _observer = _status_observers.get(gw_key)
+                if _observer:
                     mgr._status_callback = (
-                        lambda info, _sid=sid: _status_observer(_sid, info) if _status_observer else None
+                        lambda info, _sid=sid, _obs=_observer: _obs(_sid, info)
                     )
         else:
             # 启动失败时清理占位

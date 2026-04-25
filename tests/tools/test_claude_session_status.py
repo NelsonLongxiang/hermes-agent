@@ -96,40 +96,45 @@ import tools.claude_session_tool as _cst
 
 
 def test_register_status_observer():
-    """register_status_observer sets the global observer."""
+    """register_status_observer sets the global observer for a gateway session."""
     callback = MagicMock()
+    gw_key = "test-gw-key"
     try:
-        _cst.register_status_observer(callback)
-        assert _cst._status_observer is callback
+        _cst.register_status_observer(callback, gateway_session_key=gw_key)
+        assert _cst._status_observers.get(gw_key) is callback
     finally:
-        _cst.unregister_status_observer()
+        _cst.unregister_status_observer(gateway_session_key=gw_key)
 
 
 def test_unregister_status_observer():
-    """unregister_status_observer clears the global observer."""
+    """unregister_status_observer clears the global observer for a gateway session."""
     callback = MagicMock()
-    _cst.register_status_observer(callback)
-    _cst.unregister_status_observer()
-    assert _cst._status_observer is None
+    gw_key = "test-gw-key"
+    _cst.register_status_observer(callback, gateway_session_key=gw_key)
+    _cst.unregister_status_observer(gateway_session_key=gw_key)
+    assert gw_key not in _cst._status_observers
 
 
 def test_observer_auto_binding():
     """When observer is registered, start action wires callback to manager.
 
     Simulates the binding code in _handle_claude_session 'start' action
-    (lines 299-303 of claude_session_tool.py).
+    (lines 308-312 of claude_session_tool.py).
     """
     callback = MagicMock()
-    _cst.register_status_observer(callback)
+    gw_key = "test-gw-key"
+    _cst.register_status_observer(callback, gateway_session_key=gw_key)
 
     try:
         mgr = MagicMock()
         sid = "test-session-42"
 
-        # Replicate the binding logic from start action
-        if _cst._status_observer:
+        # Replicate binding logic from start action
+        # Use default parameter to bind observer at creation time
+        _observer = _cst._status_observers.get(gw_key)
+        if _observer:
             mgr._status_callback = (
-                lambda info, _sid=sid: _cst._status_observer(_sid, info)
+                lambda info, _sid=sid, _obs=_observer: _obs(_sid, info)
             )
 
         # Trigger callback as manager would on state change
@@ -137,29 +142,66 @@ def test_observer_auto_binding():
 
         callback.assert_called_once_with("test-session-42", {"state": "THINKING", "turn_id": 3})
     finally:
-        _cst.unregister_status_observer()
+        _cst.unregister_status_observer(gateway_session_key=gw_key)
 
 
 def test_register_replaces_previous_observer():
-    """Re-registering replaces the previous observer (single-slot design)."""
+    """Re-registering replaces observer for the same gateway session key."""
+    gw_key = "test-gw-key"
     callback1 = MagicMock()
     callback2 = MagicMock()
 
-    _cst.register_status_observer(callback1)
-    _cst.register_status_observer(callback2)
+    _cst.register_status_observer(callback1, gateway_session_key=gw_key)
+    _cst.register_status_observer(callback2, gateway_session_key=gw_key)
 
     try:
-        assert _cst._status_observer is callback2
-        assert _cst._status_observer is not callback1
+        # callback2 should replace callback1 for the same gw_key
+        assert _cst._status_observers.get(gw_key) is callback2
+        assert _cst._status_observers.get(gw_key) is not callback1
 
-        # Only callback2 should receive calls
-        if _cst._status_observer:
-            _cst._status_observer("sid-1", {"state": "IDLE"})
+        # Only callback2 should receive calls for this gw_key
+        _observer = _cst._status_observers.get(gw_key)
+        if _observer:
+            _observer("sid-1", {"state": "IDLE"})
 
         callback1.assert_not_called()
         callback2.assert_called_once_with("sid-1", {"state": "IDLE"})
     finally:
-        _cst.unregister_status_observer()
+        _cst.unregister_status_observer(gateway_session_key=gw_key)
+
+
+def test_concurrent_sessions_isolated():
+    """Different gateway sessions have independent observers (no cross-talk)."""
+    gw_key1 = "group-chat-key"
+    gw_key2 = "dm-chat-key"
+    callback1 = MagicMock()
+    callback2 = MagicMock()
+
+    _cst.register_status_observer(callback1, gateway_session_key=gw_key1)
+    _cst.register_status_observer(callback2, gateway_session_key=gw_key2)
+
+    try:
+        # Both observers should be registered independently
+        assert _cst._status_observers.get(gw_key1) is callback1
+        assert _cst._status_observers.get(gw_key2) is callback2
+
+        # Trigger each observer independently
+        obs1 = _cst._status_observers.get(gw_key1)
+        obs2 = _cst._status_observers.get(gw_key2)
+        if obs1 and obs2:
+            obs1("sid-group", {"state": "THINKING"})
+            obs2("sid-dm", {"state": "TOOL_CALL"})
+
+        # Each callback should receive its own call only
+        callback1.assert_called_once_with("sid-group", {"state": "THINKING"})
+        callback2.assert_called_once_with("sid-dm", {"state": "TOOL_CALL"})
+
+        # No cross-talk
+        assert len(callback1.call_args_list) == 1
+        assert len(callback2.call_args_list) == 1
+    finally:
+        _cst.unregister_status_observer(gateway_session_key=gw_key1)
+        _cst.unregister_status_observer(gateway_session_key=gw_key2)
 
 
 # ---------------------------------------------------------------------------
