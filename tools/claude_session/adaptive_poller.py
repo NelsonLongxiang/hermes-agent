@@ -1,5 +1,6 @@
 """tools/claude_session/adaptive_poller.py — Adaptive polling engine."""
 
+import inspect
 import logging
 import threading
 import time
@@ -9,7 +10,7 @@ from tools.claude_session.state_machine import (
     ClaudeState, StateMachine, StateTransition,
 )
 from tools.claude_session.output_buffer import OutputBuffer
-from tools.claude_session.output_parser import OutputParser
+from tools.claude_session.output_parser import OutputParser, UserPromptInfo
 from tools.claude_session.tmux_interface import TmuxInterface
 
 logger = logging.getLogger(__name__)
@@ -71,11 +72,19 @@ class AdaptivePoller:
             self._stop_event.wait(timeout=interval)
 
     def _poll_once(self) -> None:
-        """Perform a single poll cycle."""
+        """Perform a single poll cycle.
+
+        After detecting state, also detects user-input prompts when the state
+        is IDLE or PERMISSION. Fires the callback with both the transition
+        (if any) and the prompt_info (if detected).
+
+        If no state transition occurred but a prompt was detected, a synthetic
+        StateTransition is created so the callback still fires.
+        """
         if not self._tmux.session_exists():
             transition = self._sm.transition(ClaudeState.DISCONNECTED)
-            if transition and self._on_state_change:
-                self._on_state_change(transition)
+            if transition:
+                self._fire_callback(transition, None)
             return
 
         raw = self._tmux.capture_pane()
@@ -88,9 +97,45 @@ class AdaptivePoller:
         # Detect and update state
         result = OutputParser.detect_state(lines)
         transition = self._sm.transition(result.state)
-        if transition and self._on_state_change:
+
+        # Detect user-input prompt when in IDLE or PERMISSION state
+        prompt_info: Optional[UserPromptInfo] = None
+        if result.state in ("IDLE", "PERMISSION"):
+            prompt_info = OutputParser.detect_user_prompt(lines, result.state)
+
+        if transition:
             transition.tool_name = result.tool_name
             transition.tool_target = result.tool_target
+            self._fire_callback(transition, prompt_info)
+        elif prompt_info:
+            # No state transition, but prompt detected — fire synthetic callback
+            synthetic = StateTransition(
+                from_state=self._sm.current_state,
+                to_state=self._sm.current_state,
+                timestamp=time.monotonic(),
+            )
+            self._fire_callback(synthetic, prompt_info)
+
+    def _fire_callback(
+        self,
+        transition: StateTransition,
+        prompt_info: Optional[UserPromptInfo],
+    ) -> None:
+        """Fire the state-change callback with backward compatibility.
+
+        Uses inspect.signature to detect whether the callback accepts 1 or 2
+        parameters, calling it appropriately so old callbacks still work.
+        """
+        if not self._on_state_change:
+            return
+        try:
+            sig = inspect.signature(self._on_state_change)
+            param_count = len(sig.parameters)
+        except (ValueError, TypeError):
+            param_count = 1
+        if param_count >= 2:
+            self._on_state_change(transition, prompt_info)
+        else:
             self._on_state_change(transition)
 
     def _current_interval(self) -> float:
