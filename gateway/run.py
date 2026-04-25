@@ -9672,7 +9672,10 @@ class GatewayRunner:
         if _status_adapter and source.platform != Platform.WEBHOOK:
             try:
                 from gateway.status_message import StatusMessageManager
-                from tools.claude_session_tool import register_status_observer
+                from tools.claude_session_tool import (
+                    register_status_observer,
+                    _get_gateway_session_key,
+                )
 
                 _claude_status_msg = StatusMessageManager(
                     adapter=_status_adapter,
@@ -9694,7 +9697,10 @@ class GatewayRunner:
                     except Exception as _e:
                         logger.debug("claude session status bridge error: %s", _e)
 
-                register_status_observer(_claude_session_status_bridge)
+                register_status_observer(
+                    _claude_session_status_bridge,
+                    gateway_session_key=_get_gateway_session_key(),
+                )
             except Exception as _e:
                 logger.debug("Could not set up claude session status bridge: %s", _e)
 
@@ -10855,8 +10861,13 @@ class GatewayRunner:
 
             # Clean up claude session status observer and finalize message
             try:
-                from tools.claude_session_tool import unregister_status_observer
-                unregister_status_observer()
+                from tools.claude_session_tool import (
+                    unregister_status_observer,
+                    _get_gateway_session_key,
+                )
+                unregister_status_observer(
+                    gateway_session_key=_get_gateway_session_key(),
+                )
             except Exception:
                 pass
             if _claude_status_msg:
