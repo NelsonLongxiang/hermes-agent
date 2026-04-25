@@ -358,12 +358,120 @@ class OutputParser:
 
     @staticmethod
     def _detect_confirmation(lines: list) -> Optional["UserPromptInfo"]:
-        """Detect confirmation prompt (Yes/No questions)."""
-        # Placeholder — implemented in Task 4
+        """Detect confirmation prompt (Yes/No questions).
+
+        Looks for question ending with ? containing confirmation keywords,
+        followed by Yes/No options (may include ❯ selector).
+        """
+        _CONFIRM_KEYWORDS = re.compile(
+            r"(do you want|are you sure|proceed\?|confirm|continue\?)",
+            re.IGNORECASE,
+        )
+
+        # Find question lines ending with ?
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if _QUESTION_END_RE.search(stripped) and _CONFIRM_KEYWORDS.search(stripped):
+                # Look for Yes/No options below
+                options = []
+                selected_index = -1
+                for j in range(i + 1, min(len(lines), i + 6)):
+                    opt_stripped = lines[j].strip()
+                    if not opt_stripped:
+                        continue
+                    # Selected: "❯ Yes", "❯ No"
+                    if opt_stripped.startswith("❯"):
+                        label = opt_stripped.lstrip("❯").strip()
+                        if label:
+                            first_word = label.split()[0].lower()
+                            if first_word in ("yes", "no"):
+                                selected_index = len(options)
+                                options.append(label)
+                                continue
+                    # Unselected: "Yes", "No"
+                    first_word = opt_stripped.split()[0].lower() if opt_stripped else ""
+                    if first_word in ("yes", "no"):
+                        options.append(opt_stripped)
+
+                if len(options) >= 2:
+                    ctx_start = max(0, i - 1)
+                    ctx_end = min(len(lines), i + len(options) + 2)
+                    raw_context = "\n".join(lines[ctx_start:ctx_end])
+                    return UserPromptInfo(
+                        prompt_type="confirmation",
+                        question=stripped,
+                        options=options,
+                        selected_index=selected_index,
+                        has_other=False,
+                        raw_context=raw_context,
+                    )
         return None
 
     @staticmethod
     def _detect_free_text(lines: list) -> Optional["UserPromptInfo"]:
-        """Detect free-text input prompt."""
-        # Placeholder — implemented in Task 4
-        return None
+        """Detect free-text input prompt.
+
+        Must have empty ❯ or ❯ (with optional whitespace) in last 3 lines.
+        Search backwards for a question ending with ? or ？.
+        Conservative: require done marker (✻ ...) OR question within 5 lines of ❯.
+        """
+        if not lines:
+            return None
+
+        # Find empty ❯ or ❯ with only whitespace in last 3 lines
+        prompt_idx = None
+        check_range = lines[-3:] if len(lines) >= 3 else lines
+        for k, line in enumerate(check_range):
+            stripped = line.strip()
+            if stripped == "❯" or stripped == "❯ ":
+                prompt_idx = len(lines) - len(check_range) + k
+                break
+        if prompt_idx is None:
+            return None
+
+        # Search backwards for question ending with ?
+        question = ""
+        question_idx = None
+        for j in range(prompt_idx - 1, -1, -1):
+            stripped = lines[j].strip()
+            # Skip status bar, decoration, done-time lines
+            if _STATUS_BAR_RE.search(stripped):
+                continue
+            if _DECORATION_RE.search(stripped):
+                continue
+            if _DONE_TIME_RE.search(stripped):
+                continue
+            if not stripped:
+                continue
+            if _QUESTION_END_RE.search(stripped):
+                question = stripped
+                question_idx = j
+                break
+            # Stop if we hit a non-question line that isn't skippable
+            # (only look at immediate nearby lines for close questions)
+            break
+
+        if not question:
+            return None
+
+        # Conservative: require done marker OR question within 5 lines of ❯
+        has_done_marker = any(
+            _DONE_TIME_RE.search(lines[j])
+            for j in range(0, prompt_idx)
+        )
+        distance = prompt_idx - question_idx if question_idx is not None else 999
+        if not has_done_marker and distance > 5:
+            return None
+
+        ctx_start = max(0, question_idx - 1 if question_idx is not None else prompt_idx - 2)
+        ctx_end = min(len(lines), prompt_idx + 2)
+        raw_context = "\n".join(lines[ctx_start:ctx_end])
+
+        return UserPromptInfo(
+            prompt_type="free_text",
+            question=question,
+            options=[],
+            selected_index=-1,
+            has_other=False,
+            raw_context=raw_context,
+        )

@@ -321,3 +321,67 @@ class TestDetectUserPrompt:
         assert result.prompt_type == "ask_user"
         assert len(result.options) == 3
         assert result.selected_index == 0
+
+    def test_confirmation_yes_no(self):
+        """'Do you want to proceed?' with Yes/No options."""
+        lines = [
+            "Do you want to proceed?",
+            "❯ Yes",
+            "  No",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "confirmation"
+        assert "Yes" in result.options
+        assert "No" in result.options
+        assert result.selected_index == 0
+
+    def test_free_text_with_done_marker(self):
+        """Question + done marker + empty ❯."""
+        lines = [
+            "What would you like me to do next?",
+            "✻ Crunched for 6m 36s",
+            "❯ ",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "free_text"
+        assert "What would you like" in result.question
+        assert result.options == []
+        assert result.selected_index == -1
+
+    def test_free_text_without_done_marker(self):
+        """Question close to ❯ (within 5 lines)."""
+        lines = [
+            "How should I handle this?",
+            "❯ ",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "free_text"
+        assert "How should" in result.question
+
+    def test_no_prompt_thinking_state(self):
+        """THINKING state returns None."""
+        lines = [
+            "Which option?",
+            "❯ 1. First",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "THINKING")
+        assert result is None
+
+    def test_no_prompt_normal_idle(self):
+        """No question returns None."""
+        lines = [
+            "some output",
+            "❯ ",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        # No question mark found near the prompt — should not detect
+        assert result is None
+
+    def test_no_prompt_empty_lines(self):
+        """Empty lines return None."""
+        lines = []
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is None
