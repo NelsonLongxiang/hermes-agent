@@ -1,7 +1,7 @@
 """Tests for tools/claude_session/output_parser.py"""
 
 import pytest
-from tools.claude_session.output_parser import OutputParser, ParseResult
+from tools.claude_session.output_parser import OutputParser, ParseResult, UserPromptInfo
 
 
 class TestAnsiStrip:

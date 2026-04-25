@@ -16,6 +16,17 @@ class ParseResult:
     is_compacting: bool = False
 
 
+@dataclass
+class UserPromptInfo:
+    """Detected user-input prompt from Claude Code TUI output."""
+    prompt_type: str       # "ask_user" | "permission" | "confirmation" | "free_text"
+    question: str          # Question text presented to user
+    options: list          # Option labels
+    selected_index: int    # Current ❯ selected index (0-based), -1 if unknown
+    has_other: bool        # Whether last option is "Type something." / "Other"
+    raw_context: str       # Raw TUI text around the prompt
+
+
 # Regex patterns
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?m")
 _TOOL_CALL_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
