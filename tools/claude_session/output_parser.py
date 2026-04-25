@@ -58,6 +58,11 @@ _COMPACT_RE = re.compile(
     r"concise.*summary|compact.*history)",
     re.IGNORECASE,
 )
+# User prompt detection patterns
+_SELECTED_OPTION_RE = re.compile(r"^❯\s*(\d+)\.\s*(.+)$")
+_UNSELECTED_OPTION_RE = re.compile(r"^\s*(\d+)\.\s+(.+)$")
+_TYPE_SOMETHING_RE = re.compile(r"Type something", re.IGNORECASE)
+_QUESTION_END_RE = re.compile(r"[?？]$")
 
 
 class OutputParser:
@@ -198,3 +203,115 @@ class OutputParser:
             if info:
                 calls.append(info)
         return calls
+
+    @staticmethod
+    def detect_user_prompt(
+        lines: list, current_state: str
+    ) -> Optional["UserPromptInfo"]:
+        """Detect user-input prompt from TUI output lines.
+
+        Only processes IDLE and PERMISSION states — other states return None.
+        Tries detectors in order: ask_user, permission, confirmation, free_text.
+        """
+        if current_state not in ("IDLE", "PERMISSION"):
+            return None
+        if not lines:
+            return None
+
+        result = OutputParser._detect_ask_user(lines)
+        if result:
+            return result
+        result = OutputParser._detect_permission_prompt(lines)
+        if result:
+            return result
+        result = OutputParser._detect_confirmation(lines)
+        if result:
+            return result
+        result = OutputParser._detect_free_text(lines)
+        if result:
+            return result
+        return None
+
+    @staticmethod
+    def _detect_ask_user(lines: list) -> Optional["UserPromptInfo"]:
+        """Detect AskUserQuestion-style numbered options with ❯ selector."""
+        # Find all selected (❯) and unselected option lines
+        selected_indices = []  # (line_index, option_number, label)
+        unselected = []  # (line_index, option_number, label)
+        for i, line in enumerate(lines):
+            m = _SELECTED_OPTION_RE.match(line.strip())
+            if m:
+                selected_indices.append((i, int(m.group(1)), m.group(2)))
+                continue
+            m = _UNSELECTED_OPTION_RE.match(line.strip())
+            if m:
+                unselected.append((i, int(m.group(1)), m.group(2)))
+
+        if not selected_indices:
+            return None
+
+        # Must have exactly one selected option
+        if len(selected_indices) != 1:
+            return None
+
+        sel_line_idx, sel_num, sel_label = selected_indices[0]
+
+        # Collect all options (selected + unselected), sorted by line index
+        all_options_raw = selected_indices + unselected
+        all_options_raw.sort(key=lambda x: x[0])
+
+        # Verify options have consecutive numbers
+        nums = [opt[1] for opt in all_options_raw]
+        expected = list(range(nums[0], nums[0] + len(nums)))
+        if nums != expected:
+            return None
+
+        # Extract labels in order
+        options = [opt[2] for opt in all_options_raw]
+
+        # Determine selected_index (0-based position in the ordered list)
+        selected_index = nums.index(sel_num)
+
+        # Check if last option is "Type something."
+        has_other = bool(options and _TYPE_SOMETHING_RE.search(options[-1]))
+
+        # Find question text from lines above the first option
+        first_opt_line = all_options_raw[0][0]
+        question = ""
+        for j in range(first_opt_line - 1, -1, -1):
+            text = lines[j].strip()
+            if text:
+                question = text
+                break
+
+        # Build raw_context from surrounding lines
+        ctx_start = max(0, first_opt_line - 2)
+        ctx_end = min(len(lines), all_options_raw[-1][0] + 2)
+        raw_context = "\n".join(lines[ctx_start:ctx_end])
+
+        return UserPromptInfo(
+            prompt_type="ask_user",
+            question=question,
+            options=options,
+            selected_index=selected_index,
+            has_other=has_other,
+            raw_context=raw_context,
+        )
+
+    @staticmethod
+    def _detect_permission_prompt(lines: list) -> Optional["UserPromptInfo"]:
+        """Detect permission prompt (Allow/Deny, Yes/No)."""
+        # Placeholder — implemented in Task 3
+        return None
+
+    @staticmethod
+    def _detect_confirmation(lines: list) -> Optional["UserPromptInfo"]:
+        """Detect confirmation prompt (Yes/No questions)."""
+        # Placeholder — implemented in Task 4
+        return None
+
+    @staticmethod
+    def _detect_free_text(lines: list) -> Optional["UserPromptInfo"]:
+        """Detect free-text input prompt."""
+        # Placeholder — implemented in Task 4
+        return None

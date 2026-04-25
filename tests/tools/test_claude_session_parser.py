@@ -229,3 +229,66 @@ class TestExtractToolCalls:
         lines = ["just regular output", "no tools here"]
         calls = OutputParser.extract_tool_calls(lines)
         assert len(calls) == 0
+
+
+class TestDetectUserPrompt:
+    """Tests for detect_user_prompt() scene detection."""
+
+    def test_ask_user_basic(self):
+        """Numbered options with ❯ on option 2."""
+        lines = [
+            "Which file should I modify?",
+            "❯ 2. src/auth.py",
+            "  3. src/utils.py",
+            "  4. src/main.py",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        assert result.selected_index == 0  # 0-based, first option is selected
+        assert "src/auth.py" in result.options
+        assert "src/utils.py" in result.options
+        assert "src/main.py" in result.options
+        assert result.has_other is False
+
+    def test_ask_user_with_type_something(self):
+        """4 options, last is 'Type something.'."""
+        lines = [
+            "How would you like to proceed?",
+            "  1. Refactor the code",
+            "  2. Add tests",
+            "❯ 3. Update documentation",
+            "  4. Type something.",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        assert len(result.options) == 4
+        assert result.has_other is True
+        assert result.selected_index == 2  # option 3 selected (0-based)
+
+    def test_ask_user_selector_at_top(self):
+        """❯ on first option."""
+        lines = [
+            "Pick a framework:",
+            "❯ 1. React",
+            "  2. Vue",
+            "  3. Svelte",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        assert result.selected_index == 0
+        assert result.options == ["React", "Vue", "Svelte"]
+
+    def test_ask_user_single_option(self):
+        """Just 1 option."""
+        lines = [
+            "Continue?",
+            "❯ 1. Yes",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "IDLE")
+        assert result is not None
+        assert result.prompt_type == "ask_user"
+        assert result.selected_index == 0
+        assert result.options == ["Yes"]
