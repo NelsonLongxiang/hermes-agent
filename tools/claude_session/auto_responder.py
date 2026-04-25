@@ -59,6 +59,7 @@ class AutoResponder:
         self._response_log: list[AutoResponseLog] = []
         self._response_count: int = 0
         self._last_response_time: float = 0.0
+        self._last_prompt_fingerprint: str = ""
 
     @property
     def response_log(self) -> list[AutoResponseLog]:
@@ -66,8 +67,9 @@ class AutoResponder:
         return list(self._response_log)
 
     def reset_turn(self) -> None:
-        """Reset the per-turn response counter."""
+        """Reset the per-turn response counter and prompt fingerprint."""
         self._response_count = 0
+        self._last_prompt_fingerprint = ""
 
     def handle_prompt(self, prompt: UserPromptInfo, context: dict) -> None:
         """Main entry point: decide and execute a response to a user-input prompt.
@@ -97,6 +99,12 @@ class AutoResponder:
                 self._config.cooldown_seconds - elapsed,
             )
             return
+
+        # Guard: duplicate prompt (same question + options across polls)
+        fingerprint = f"{prompt.prompt_type}:{prompt.question}:{prompt.options}"
+        if fingerprint == self._last_prompt_fingerprint:
+            return
+        self._last_prompt_fingerprint = fingerprint
 
         # Ask the decision engine
         decision = self._engine.decide(prompt, context)
@@ -129,6 +137,7 @@ class AutoResponder:
         self._response_log.append(entry)
 
         if executed:
+            self._last_prompt_fingerprint = ""
             logger.info(
                 "AutoResponder: executed %s (reason: %s)",
                 decision.action,
@@ -143,8 +152,8 @@ class AutoResponder:
             prompt: The original prompt (needed for navigation offset).
         """
         if decision.action == "select":
-            # Decision value is 1-based index from LLM; convert to 0-based
-            target = int(decision.value) - 1
+            # Decision value is 1-based index from LLM; convert to 0-based with bounds
+            target = max(0, min(int(decision.value) - 1, len(prompt.options) - 1))
             self._navigate_and_confirm(prompt.selected_index, target)
 
         elif decision.action == "select_and_type":

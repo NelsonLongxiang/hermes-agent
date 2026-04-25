@@ -382,6 +382,9 @@ class ClaudeSessionManager:
             if self._auto_responder:
                 self._auto_responder.reset_turn()
             self._conversation_context["current_message"] = message
+            self._conversation_context["history"] = [
+                t.to_dict() for t in self._turn_history[-5:]
+            ]
 
             # Atomic send
             self._tmux.send_keys(message, enter=True)
