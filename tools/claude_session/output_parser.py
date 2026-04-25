@@ -300,9 +300,61 @@ class OutputParser:
 
     @staticmethod
     def _detect_permission_prompt(lines: list) -> Optional["UserPromptInfo"]:
-        """Detect permission prompt (Allow/Deny, Yes/No)."""
-        # Placeholder — implemented in Task 3
-        return None
+        """Detect permission prompt (Allow/Deny, Yes/No).
+
+        Handles unnumbered options like '❯ Allow' / 'Deny'.
+        Numbered options are handled by _detect_ask_user (which runs first).
+        """
+        # Find permission question line via _PERMISSION_RE
+        perm_line_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Look for "Allow ... ?" pattern (the question part)
+            if re.match(r"^Allow\s+.*\?$", stripped, re.IGNORECASE):
+                perm_line_idx = i
+                break
+        if perm_line_idx is None:
+            return None
+
+        # Look for unnumbered options below the question
+        options = []
+        selected_index = -1
+        for i in range(perm_line_idx + 1, min(len(lines), perm_line_idx + 6)):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            # Check for selected option: "❯ Allow", "❯ Deny", "❯ Yes", "❯ No"
+            if stripped.startswith("❯"):
+                label = stripped.lstrip("❯").strip()
+                if label:
+                    first_word = label.split()[0].lower()
+                    if first_word in ("allow", "deny", "yes", "no"):
+                        selected_index = len(options)
+                        options.append(label)
+                        continue
+            # Check for unselected option: "Allow", "Deny", "Yes", "No"
+            first_word = stripped.split()[0].lower() if stripped else ""
+            if first_word in ("allow", "deny", "yes", "no"):
+                options.append(stripped)
+
+        if len(options) < 2:
+            return None
+        if len(options) > 5:
+            return None
+
+        question = lines[perm_line_idx].strip()
+        ctx_start = max(0, perm_line_idx - 1)
+        ctx_end = min(len(lines), perm_line_idx + len(options) + 2)
+        raw_context = "\n".join(lines[ctx_start:ctx_end])
+
+        return UserPromptInfo(
+            prompt_type="permission",
+            question=question,
+            options=options,
+            selected_index=selected_index,
+            has_other=False,
+            raw_context=raw_context,
+        )
 
     @staticmethod
     def _detect_confirmation(lines: list) -> Optional["UserPromptInfo"]:

@@ -292,3 +292,32 @@ class TestDetectUserPrompt:
         assert result.prompt_type == "ask_user"
         assert result.selected_index == 0
         assert result.options == ["Yes"]
+
+    def test_permission_with_allow_deny(self):
+        """'❯ Allow' / 'Deny' pattern."""
+        lines = [
+            "Allow Edit to src/auth.py?",
+            "❯ Allow",
+            "  Deny",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "PERMISSION")
+        assert result is not None
+        assert result.prompt_type == "permission"
+        assert "Allow" in result.options
+        assert "Deny" in result.options
+        assert result.selected_index == 0
+
+    def test_permission_with_numbered_options(self):
+        """Numbered permission options detected by ask_user (runs first)."""
+        lines = [
+            "Allow Bash?",
+            "❯ 1. Yes, allow this time",
+            "  2. Yes, and don't ask again",
+            "  3. No",
+        ]
+        result = OutputParser.detect_user_prompt(lines, "PERMISSION")
+        assert result is not None
+        # Numbered options match ask_user detector first
+        assert result.prompt_type == "ask_user"
+        assert len(result.options) == 3
+        assert result.selected_index == 0
