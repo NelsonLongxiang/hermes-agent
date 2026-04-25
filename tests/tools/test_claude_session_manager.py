@@ -5,6 +5,8 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
 from tools.claude_session.manager import ClaudeSessionManager, Turn, ToolCall
+from tools.claude_session.output_parser import UserPromptInfo
+from tools.claude_session.state_machine import StateTransition
 
 
 @pytest.fixture
@@ -80,6 +82,9 @@ class TestWaitForIdle:
             state="THINKING", user_message="test", tool_calls=[],
             thinking_cycles=0, total_duration=None,
         )
+        # wait_for_idle needs tmux for compact detection
+        manager._tmux = MagicMock()
+        manager._tmux.capture_pane.return_value = "processing..."
         result = manager.wait_for_idle(timeout=1)
         assert result.get("timeout_reached") is True
 
@@ -350,3 +355,111 @@ class TestBuildErrorResult:
         assert result["state"] == "ERROR"
         assert "error_output" in result
         assert "something broke" in result["error_output"]
+
+
+class TestAutoResponderIntegration:
+    """Tests for AutoResponder integration in ClaudeSessionManager."""
+
+    def test_auto_responder_disabled_by_default(self, manager):
+        """_auto_responder should be None on a fresh manager."""
+        assert manager._auto_responder is None
+
+    @patch("tools.claude_session.manager.TmuxInterface")
+    def test_auto_responder_created_on_start(self, MockTmux, manager):
+        """start(auto_responder=True) should create an AutoResponder instance."""
+        mock_tmux = MagicMock()
+        mock_tmux.session_exists.return_value = False
+        MockTmux.return_value = mock_tmux
+
+        result = manager.start(workdir="/tmp/test", auto_responder=True)
+        assert "session_id" in result
+        assert manager._auto_responder is not None
+
+    @patch("tools.claude_session.manager.TmuxInterface")
+    def test_auto_responder_not_created_without_flag(self, MockTmux, manager):
+        """start() without auto_responder flag should NOT create AutoResponder."""
+        mock_tmux = MagicMock()
+        mock_tmux.session_exists.return_value = False
+        MockTmux.return_value = mock_tmux
+
+        result = manager.start(workdir="/tmp/test")
+        assert "session_id" in result
+        assert manager._auto_responder is None
+
+    @patch("tools.claude_session.manager.TmuxInterface")
+    def test_send_resets_auto_responder_turn(self, MockTmux, manager):
+        """send() should call reset_turn() on AutoResponder when active."""
+        mock_tmux = MagicMock()
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.capture_pane.return_value = "❯ "
+        MockTmux.return_value = mock_tmux
+
+        manager.start(workdir="/tmp/test", auto_responder=True)
+        manager._sm.transition("IDLE")
+
+        # Spy on reset_turn
+        manager._auto_responder.reset_turn = MagicMock()
+        result = manager.send("hello")
+        assert result["sent"] is True
+        manager._auto_responder.reset_turn.assert_called_once()
+
+    @patch("tools.claude_session.manager.TmuxInterface")
+    def test_stop_clears_auto_responder(self, MockTmux, manager):
+        """stop() should set _auto_responder to None."""
+        mock_tmux = MagicMock()
+        mock_tmux.session_exists.return_value = True
+        MockTmux.return_value = mock_tmux
+
+        manager.start(workdir="/tmp/test", auto_responder=True)
+        assert manager._auto_responder is not None
+
+        manager.stop()
+        assert manager._auto_responder is None
+
+    def test_state_change_callback_routes_to_auto_responder(self, manager):
+        """_handle_state_change(transition, prompt_info) should call handle_prompt()."""
+        manager._session_active = True
+        manager._sm.transition("IDLE")
+
+        # Create mock AutoResponder
+        mock_ar = MagicMock()
+        manager._auto_responder = mock_ar
+        manager._conversation_context = {"current_message": "test"}
+
+        # Create a transition and prompt_info
+        transition = StateTransition(
+            from_state="IDLE", to_state="PERMISSION",
+            timestamp=time.monotonic(),
+        )
+        prompt_info = UserPromptInfo(
+            prompt_type="ask_user",
+            question="Which option?",
+            options=["A", "B"],
+            selected_index=0,
+            has_other=False,
+            raw_context="test",
+        )
+
+        manager._handle_state_change(transition, prompt_info=prompt_info)
+
+        mock_ar.handle_prompt.assert_called_once_with(
+            prompt_info, manager._conversation_context,
+        )
+
+    def test_state_change_callback_ignores_none_prompt(self, manager):
+        """_handle_state_change(transition, None) should NOT call handle_prompt()."""
+        manager._session_active = True
+        manager._sm.transition("IDLE")
+
+        # Create mock AutoResponder
+        mock_ar = MagicMock()
+        manager._auto_responder = mock_ar
+
+        transition = StateTransition(
+            from_state="IDLE", to_state="THINKING",
+            timestamp=time.monotonic(),
+        )
+
+        manager._handle_state_change(transition, prompt_info=None)
+
+        mock_ar.handle_prompt.assert_not_called()

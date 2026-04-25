@@ -16,6 +16,7 @@ from tools.claude_session.output_buffer import OutputBuffer
 from tools.claude_session.output_parser import OutputParser
 from tools.claude_session.tmux_interface import TmuxInterface
 from tools.claude_session.adaptive_poller import AdaptivePoller
+from tools.claude_session.auto_responder import AutoResponder, AutoResponderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class ClaudeSessionManager:
         # wait_for_idle 自适应轮询追踪状态（跨调用持久化，send 时重置）
         self._wait_state: Optional[dict] = None
 
+        # AutoResponder
+        self._auto_responder: Optional[AutoResponder] = None
+        self._conversation_context: dict = {}
+
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
@@ -119,6 +124,8 @@ class ClaudeSessionManager:
         on_event: str = "notify",
         completion_queue: Optional[queue.Queue] = None,
         resume_uuid: Optional[str] = None,
+        auto_responder: bool = False,
+        auto_responder_config: Optional[dict] = None,
     ) -> dict:
         """Start a Claude Code session in tmux.
 
@@ -285,6 +292,15 @@ class ClaudeSessionManager:
             self._poller.start()
             self._session_active = True
 
+            # AutoResponder
+            if auto_responder:
+                from tools.claude_session.decision_engine import DecisionEngine
+                self._auto_responder = AutoResponder(
+                    decision_engine=DecisionEngine(),
+                    tmux=self._tmux, state_machine=self._sm,
+                    config=AutoResponderConfig(**(auto_responder_config or {})),
+                )
+
             # Store completion_queue for event injection
             if completion_queue:
                 self._on_event = completion_queue
@@ -327,6 +343,7 @@ class ClaudeSessionManager:
 
             sid = self._session_id
             uuid_to_return = self._claude_session_uuid
+            self._auto_responder = None
             self._session_active = False
             self._session_id = None
             self._claude_session_uuid = None
@@ -362,6 +379,9 @@ class ClaudeSessionManager:
             self._current_turn = turn
             # 新 Turn 开始，重置等待进度追踪
             self._wait_state = None
+            if self._auto_responder:
+                self._auto_responder.reset_turn()
+            self._conversation_context["current_message"] = message
 
             # Atomic send
             self._tmux.send_keys(message, enter=True)
@@ -429,6 +449,13 @@ class ClaudeSessionManager:
 
         if self._current_turn:
             result["current_turn"] = self._current_turn.to_dict()
+
+        if self._auto_responder:
+            result["auto_responder"] = {
+                "enabled": True,
+                "response_count": self._auto_responder._response_count,
+                "response_log_count": len(self._auto_responder.response_log),
+            }
 
         return result
 
@@ -721,7 +748,7 @@ class ClaudeSessionManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _handle_state_change(self, transition: StateTransition) -> None:
+    def _handle_state_change(self, transition: StateTransition, prompt_info=None) -> None:
         """Called by poller on state changes. Updates turns and fires events.
 
         Runs in the poller background thread. All shared state mutations
@@ -770,6 +797,10 @@ class ClaudeSessionManager:
             and self._permission_mode == "skip"
         ):
             self._auto_approve_permission()
+
+        # AutoResponder routing
+        if prompt_info and self._auto_responder:
+            self._auto_responder.handle_prompt(prompt_info, self._conversation_context)
 
     def _auto_approve_permission(self) -> None:
         """Auto-approve a permission request when in skip mode.
