@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 from tools.claude_session_tool import (
     CLAUDE_SESSION_SCHEMA, _handle_claude_session,
     _check_claude_session, _diagnose_claude_session,
+    _extract_mcp_failure_count, _get_active_sessions_output,
 )
 
 
@@ -23,7 +24,7 @@ class TestSchema:
             "start", "send", "type", "submit", "cancel_input",
             "status", "wait_for_idle", "wait_for_state",
             "output", "respond_permission", "stop", "history", "events",
-            "diagnose",
+            "diagnose", "doctor_fix",
         ]
         assert set(actions) == set(expected)
 
@@ -143,7 +144,7 @@ class TestDiagnose:
                 mock_run.return_value = MagicMock(stdout="tmux 3.4")
                 result = _diagnose_claude_session()
             assert result["status"] == "ready"
-            assert len(result["checks"]) == 5
+            assert len(result["checks"]) == 6
 
     def test_diagnose_function_missing_deps(self):
         with patch("tools.claude_session_tool.shutil.which") as mock_which, \
@@ -204,3 +205,173 @@ class TestDiagnose:
                 if check["status"] == "missing":
                     assert check.get("hint") is not None
                     assert len(check["hint"]) > 0
+
+
+class TestExtractMcpFailureCount:
+    """Tests for _extract_mcp_failure_count pure function."""
+
+    def test_single_server_failure(self):
+        text = "2 MCP servers failed · /mcp"
+        assert _extract_mcp_failure_count(text) == 2
+
+    def test_single_server_singular(self):
+        text = "1 MCP server failed · /mcp"
+        assert _extract_mcp_failure_count(text) == 1
+
+    def test_no_failure(self):
+        text = "All systems operational"
+        assert _extract_mcp_failure_count(text) == 0
+
+    def test_empty_string(self):
+        assert _extract_mcp_failure_count("") == 0
+
+    def test_large_count(self):
+        text = "15 MCP servers failed · /mcp"
+        assert _extract_mcp_failure_count(text) == 15
+
+
+class TestSessionDiagnoseChecks:
+    """Tests for session-level diagnose checks (THINKING, bypass, MCP)."""
+
+    def _mock_session(self, state, duration, output_tail=""):
+        """Build a mock session info dict for _get_active_sessions_output."""
+        return [{
+            "session_id": "abcd1234efgh5678",
+            "state": state,
+            "state_duration_seconds": duration,
+            "output_tail": output_tail,
+        }]
+
+    def test_thinking_critical(self):
+        """THINKING >300s → status='session_issues' with critical check."""
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("THINKING", 350.0)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+            assert result["status"] == "session_issues"
+            thinking_checks = [c for c in result["checks"]
+                               if "THINKING duration" in c.get("dependency", "")]
+            assert len(thinking_checks) == 1
+            assert thinking_checks[0]["status"] == "critical"
+
+    def test_thinking_warning(self):
+        """THINKING >120s but <300s → status='ready' with warning check."""
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("THINKING", 150.0)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+            assert result["status"] == "ready"
+            thinking_checks = [c for c in result["checks"]
+                               if "THINKING duration" in c.get("dependency", "")]
+            assert len(thinking_checks) == 1
+            assert thinking_checks[0]["status"] == "warning"
+
+    def test_bypass_permissions_hang(self):
+        """3+ 'bypass permissions on' → critical startup hang."""
+        bypass_text = (
+            "bypass permissions on (shift+tab to cycle)\n"
+            "bypass permissions on (shift+tab to cycle)\n"
+            "bypass permissions on (shift+tab to cycle)\n"
+        )
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("READY", 5.0, bypass_text)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+            assert result["status"] == "session_issues"
+            hang_checks = [c for c in result["checks"]
+                           if "startup hang" in c.get("dependency", "")]
+            assert len(hang_checks) == 1
+            assert hang_checks[0]["status"] == "critical"
+
+    def test_mcp_failure(self):
+        """MCP server failure text → warning check."""
+        mcp_text = "Some output\n2 MCP servers failed · /mcp\nMore output"
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("READY", 5.0, mcp_text)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+            mcp_checks = [c for c in result["checks"]
+                          if "MCP servers" in c.get("dependency", "")]
+            assert len(mcp_checks) == 1
+            assert mcp_checks[0]["status"] == "warning"
+
+    def test_no_sessions_ready_status(self):
+        """No active sessions → status='ready' (no session-level checks)."""
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = []
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+            assert result["status"] == "ready"
+
+    def test_cli_migration_prompt(self):
+        """CLI migration prompt → info check."""
+        migration_text = "switched from npm to native installer\nSome other output"
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("READY", 5.0, migration_text)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+        cli_checks = [c for c in result["checks"]
+                      if "CLI migration" in c.get("dependency", "")]
+        assert len(cli_checks) == 1
+        assert cli_checks[0]["status"] == "info"
+
+    def test_tmux_focus_events_off(self):
+        """tmux focus-events off → info check."""
+        tmux_text = "tmux focus-events off · add 'set -g focus-events on'\nSome output"
+        with patch("tools.claude_session_tool._get_active_sessions_output") as mock_sessions, \
+             patch("tools.claude_session_tool.shutil.which") as mock_which, \
+             patch.dict(os.environ, {"HERMES_STREAM_STALE_TIMEOUT": "300"}):
+            mock_which.side_effect = lambda cmd: {
+                "tmux": "/usr/bin/tmux",
+                "claude": "/usr/local/bin/claude",
+            }.get(cmd)
+            mock_sessions.return_value = self._mock_session("READY", 5.0, tmux_text)
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(stdout="tmux 3.4")
+                result = _diagnose_claude_session()
+        tmux_checks = [c for c in result["checks"]
+                       if "tmux config" in c.get("dependency", "")]
+        assert len(tmux_checks) == 1
+        assert tmux_checks[0]["status"] == "info"

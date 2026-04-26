@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -487,14 +488,55 @@ def _check_claude_session():
     return tmux_ok
 
 
+def _get_active_sessions_output() -> list:
+    """Gather output and state info from all active sessions for diagnose.
+
+    Returns a list of dicts, each with session metadata, recent output,
+    and state duration — used by session-level diagnose checks.
+    """
+    # Phase 1: collect references under lock (fast, no nested locks)
+    with _sessions_lock:
+        snapshot = [
+            (sid, mgr) for sid, mgr in _sessions.items()
+            if getattr(mgr, '_session_active', False)
+        ]
+
+    # Phase 2: read state/output outside _sessions_lock
+    # (each mgr has its own internal locks)
+    sessions_info = []
+    for sid, mgr in snapshot:
+        try:
+            state = mgr._sm.current_state
+            duration = mgr._sm.state_duration()
+            output_tail = mgr._buf.last_n_chars(2000)
+            sessions_info.append({
+                "session_id": sid,
+                "state": state,
+                "state_duration_seconds": round(duration, 1),
+                "output_tail": output_tail,
+            })
+        except Exception:
+            logger.warning("Failed to gather session %s info for diagnose", sid[:8], exc_info=True)
+    return sessions_info
+
+
+def _extract_mcp_failure_count(text: str) -> int:
+    """Extract MCP server failure count from output text.
+
+    Matches patterns like "3 MCP servers failed · /mcp".
+    """
+    m = re.search(r"(\d+)\s+MCP\s+servers?\s+failed", text)
+    return int(m.group(1)) if m else 0
+
+
 def _diagnose_claude_session() -> dict:
     """Diagnose claude_session dependencies and configuration.
-    
+
     Returns a structured report of all dependencies, their status,
     and remediation hints. Used by the 'diagnose' action.
     """
     import os
-    
+
     checks = []
     all_ok = True
     
@@ -609,14 +651,110 @@ def _diagnose_claude_session() -> dict:
         except Exception:
             pass
 
+    # ── Session-level checks: detect hung/stuck sessions ──
+
+    active_sessions = _get_active_sessions_output()
+    session_critical = False
+
+    for sinfo in active_sessions:
+        sid_short = sinfo["session_id"][:8]
+        state = sinfo["state"]
+        duration = sinfo["state_duration_seconds"]
+        output_tail = sinfo["output_tail"]
+
+        # P0-1: THINKING state duration check
+        if state == "THINKING":
+            if duration > 300:
+                checks.append({
+                    "dependency": f"session {sid_short} THINKING duration",
+                    "status": "critical",
+                    "value": f"{duration}s (>300s threshold)",
+                    "session_id": sinfo["session_id"],
+                    "hint": "THINKING state too long, likely hung. Try cancel_input or stop+restart.",
+                    "required": False,
+                })
+                session_critical = True
+            elif duration > 120:
+                checks.append({
+                    "dependency": f"session {sid_short} THINKING duration",
+                    "status": "warning",
+                    "value": f"{duration}s (>120s threshold)",
+                    "session_id": sinfo["session_id"],
+                    "hint": "THINKING state running long. Monitor or consider cancel_input.",
+                    "required": False,
+                })
+
+        # P0-2: Repeated permission prompt fingerprint (bypass permissions on)
+        # Match 3+ occurrences of the "bypass permissions on" line
+        perm_matches = re.findall(
+            r"bypass permissions on \(shift\+tab to cycle\)", output_tail
+        )
+        if len(perm_matches) >= 3:
+            checks.append({
+                "dependency": f"session {sid_short} startup hang",
+                "status": "critical",
+                "value": f"'bypass permissions on' repeated {len(perm_matches)} times",
+                "session_id": sinfo["session_id"],
+                "hint": "New version startup hang detected. Try cancel_input to unblock.",
+                "required": False,
+            })
+            session_critical = True
+
+        # P1-3: MCP server failures
+        mcp_count = _extract_mcp_failure_count(output_tail)
+        if mcp_count > 0:
+            checks.append({
+                "dependency": f"session {sid_short} MCP servers",
+                "status": "warning",
+                "value": f"{mcp_count} MCP server(s) failed",
+                "session_id": sinfo["session_id"],
+                "hint": "MCP initialization may block startup. Run /mcp in Claude to check.",
+                "required": False,
+            })
+
+        # P1-4: CLI migration prompt
+        if re.search(r"switched from npm to native installer", output_tail):
+            checks.append({
+                "dependency": f"session {sid_short} CLI migration",
+                "status": "info",
+                "value": "npm → native installer migration detected",
+                "session_id": sinfo["session_id"],
+                "hint": "Run 'claude install' to complete migration.",
+                "required": False,
+            })
+
+        # P1-5: tmux focus-events warning
+        if re.search(r"tmux focus-events off", output_tail):
+            checks.append({
+                "dependency": f"session {sid_short} tmux config",
+                "status": "info",
+                "value": "tmux focus-events is off",
+                "session_id": sinfo["session_id"],
+                "hint": "Add 'set -g focus-events on' to ~/.tmux.conf for better experience.",
+                "required": False,
+            })
+
+    # Build status and summary
+    # Three distinct states: ready / session_issues / missing_deps
+    critical_count = sum(1 for c in checks if c.get("status") == "critical")
+    warning_count = sum(1 for c in checks if c.get("status") == "warning")
+
+    if not all_ok:
+        top_status = "missing_deps"
+        summary = "Missing required dependencies. See hints above."
+    elif session_critical:
+        top_status = "session_issues"
+        summary = f"{critical_count} critical issue(s) in active sessions. See hints above."
+    else:
+        top_status = "ready"
+        summary = "All dependencies met — claude_session is ready to use."
+        if warning_count > 0:
+            summary += f" ({warning_count} warning(s) from active sessions)"
+
     return {
-        "status": "ready" if all_ok else "missing_deps",
+        "status": top_status,
         "checks": checks,
-        "summary": (
-            "All dependencies met — claude_session is ready to use."
-            if all_ok
-            else "Missing required dependencies. See hints above."
-        ),
+        "summary": summary,
     }
 
 
