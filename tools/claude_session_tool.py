@@ -1,12 +1,15 @@
 """tools/claude_session_tool.py — Hermes tool for Claude Code session management."""
 
+import filecmp
 import hashlib
 import json
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from tools.registry import registry, tool_error, tool_result
@@ -187,7 +190,7 @@ CLAUDE_SESSION_SCHEMA = {
                     "start", "send", "type", "submit", "cancel_input",
                     "status", "wait_for_idle", "wait_for_state",
                     "output", "respond_permission", "stop", "history", "events",
-                    "diagnose",
+                    "diagnose", "doctor_fix",
                 ],
                 "description": "Action to perform on the Claude session",
             },
@@ -375,6 +378,11 @@ def _handle_claude_session(args, **kw):
         result = _diagnose_claude_session()
         return json.dumps(result, ensure_ascii=False)
 
+    # ── doctor_fix：诊断并修复技能文件同步 ──
+    if action == "doctor_fix":
+        result = _doctor_fix_skills()
+        return json.dumps(result, ensure_ascii=False)
+
     # ── 其他动作：通过 _get_session 路由到对应实例（按 gateway session 隔离）──
     mgr = _get_session(args.get("session_id"), gateway_session_key=gw_key)
     if mgr is None:
@@ -431,7 +439,7 @@ def _handle_claude_session(args, **kw):
             f"Unknown action: {action}. "
             "Valid: start, send, type, submit, cancel_input, status, "
             "wait_for_idle, wait_for_state, output, respond_permission, "
-            "stop, history, events, diagnose"
+            "stop, history, events, diagnose, doctor_fix"
         )
 
     return json.dumps(result, ensure_ascii=False)
@@ -597,6 +605,369 @@ def _diagnose_claude_session() -> dict:
             else "Missing required dependencies. See hints above."
         ),
     }
+
+
+def _doctor_fix_skills() -> dict:
+    """诊断并修复 claude-session 技能文件同步问题。
+
+    检查用户目录（~/.hermes/skills/claude-session）与项目目录
+    （<project>/skills/claude-session）的同步状态，智能决定修复策略。
+
+    策略：
+      - 用户目录不存在 → 创建软链接
+      - 软链接指向错误 → 修复指向
+      - 硬拷贝完全一致 → 替换为软链接
+      - 硬拷贝有差异、项目更新 → 备份后创建软链接
+      - 硬拷贝有差异、用户更新 → 提示同步到项目（需用户确认）
+      - 硬拷贝双向差异 → 提示手动处理
+    """
+    # 定位两个目录
+    user_skill_dir = os.path.expanduser("~/.hermes/skills/claude-session")
+    # 项目目录：基于当前文件位置推导
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(_this_dir)  # tools/ → project root
+    project_skill_dir = os.path.join(project_root, "skills", "claude-session")
+
+    report = {
+        "user_dir": user_skill_dir,
+        "project_dir": project_skill_dir,
+        "steps": [],
+        "actions_taken": [],
+        "status": "ok",
+    }
+
+    # ── Step 1: 项目目录必须存在 ──
+    if not os.path.isdir(project_skill_dir):
+        report["status"] = "error"
+        report["steps"].append({
+            "step": "check_project_dir",
+            "result": "missing",
+            "message": f"Project skill directory not found: {project_skill_dir}",
+        })
+        logger.error("doctor_fix: project skill dir missing: %s", project_skill_dir)
+        return report
+
+    report["steps"].append({
+        "step": "check_project_dir",
+        "result": "ok",
+        "path": project_skill_dir,
+        "files": _list_skill_files(project_skill_dir),
+    })
+
+    # ── Step 2: 用户目录状态检测 ──
+    if not os.path.exists(user_skill_dir):
+        # 情况 A：不存在 → 创建软链接
+        report["steps"].append({
+            "step": "check_user_dir",
+            "result": "missing",
+        })
+        action_result = _create_symlink(user_skill_dir, project_skill_dir)
+        report["actions_taken"].append(action_result)
+        report["status"] = "fixed" if action_result["success"] else "error"
+        logger.info("doctor_fix: created symlink %s -> %s", user_skill_dir, project_skill_dir)
+        return report
+
+    # 用户目录存在，判断类型
+    is_link = os.path.islink(user_skill_dir)
+    if is_link:
+        link_target = os.readlink(user_skill_dir)
+        resolved = os.path.realpath(user_skill_dir)
+        project_resolved = os.path.realpath(project_skill_dir)
+
+        # 检查目标是否存在（断链检测）
+        if not os.path.exists(resolved):
+            report["steps"].append({
+                "step": "check_user_dir",
+                "result": "symlink_broken",
+                "target": link_target,
+                "resolved": resolved,
+            })
+            logger.warning(
+                "Broken symlink: %s -> %s (target missing). Recreating.",
+                user_skill_dir, link_target,
+            )
+            try:
+                os.remove(user_skill_dir)
+            except OSError as e:
+                report["actions_taken"].append({
+                    "action": "remove_broken_symlink",
+                    "success": False,
+                    "error": str(e),
+                })
+                report["status"] = "error"
+                return report
+
+            action_result = _create_symlink(user_skill_dir, project_skill_dir)
+            action_result["action"] = "fix_broken_symlink"
+            report["actions_taken"].append(action_result)
+            report["status"] = "fixed" if action_result["success"] else "error"
+            return report
+
+        if resolved == project_resolved:
+            # 情况 B：软链接正确
+            report["steps"].append({
+                "step": "check_user_dir",
+                "result": "symlink_ok",
+                "target": link_target,
+                "resolved": resolved,
+            })
+            report["status"] = "ok"
+            return report
+        else:
+            # 情况 C：软链接指向错误
+            report["steps"].append({
+                "step": "check_user_dir",
+                "result": "symlink_wrong",
+                "current_target": link_target,
+                "resolved": resolved,
+                "expected": project_resolved,
+            })
+            # 删除错误链接，创建正确的
+            try:
+                os.remove(user_skill_dir)
+            except OSError as e:
+                report["actions_taken"].append({
+                    "action": "remove_wrong_symlink",
+                    "success": False,
+                    "error": str(e),
+                })
+                report["status"] = "error"
+                return report
+
+            action_result = _create_symlink(user_skill_dir, project_skill_dir)
+            action_result["action"] = "fix_symlink"
+            report["actions_taken"].append(action_result)
+            report["status"] = "fixed" if action_result["success"] else "error"
+            return report
+
+    # ── Step 3: 硬拷贝 — 比较差异 ──
+    report["steps"].append({
+        "step": "check_user_dir",
+        "result": "hardcopy",
+    })
+
+    diff_result = _compare_skill_dirs(user_skill_dir, project_skill_dir)
+    report["steps"].append({
+        "step": "compare_content",
+        "result": diff_result["summary"],
+        "details": diff_result["details"],
+    })
+
+    if diff_result["identical"]:
+        # 情况 D：完全一致 → 替换为软链接
+        try:
+            shutil.rmtree(user_skill_dir)
+        except OSError as e:
+            report["actions_taken"].append({
+                "action": "remove_hardcopy",
+                "success": False,
+                "error": str(e),
+            })
+            report["status"] = "error"
+            return report
+
+        action_result = _create_symlink(user_skill_dir, project_skill_dir)
+        action_result["action"] = "replace_hardcopy_with_symlink"
+        action_result["reason"] = "files_identical"
+        report["actions_taken"].append(action_result)
+        report["status"] = "fixed" if action_result["success"] else "error"
+        logger.info("doctor_fix: replaced identical hardcopy with symlink: %s", user_skill_dir)
+        return report
+
+    # 有差异 → 判断哪边更新
+    report["status"] = _classify_diff_status(diff_result["details"])
+
+    if report["status"] == "project_newer":
+        # 情况 E：项目目录更新 → 备份用户目录，创建软链接
+        backup_dir = user_skill_dir + f".bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            os.rename(user_skill_dir, backup_dir)
+        except OSError as e:
+            report["actions_taken"].append({
+                "action": "backup_user_dir",
+                "success": False,
+                "error": str(e),
+            })
+            report["status"] = "error"
+            return report
+
+        report["actions_taken"].append({
+            "action": "backup_user_dir",
+            "success": True,
+            "backup_path": backup_dir,
+        })
+
+        action_result = _create_symlink(user_skill_dir, project_skill_dir)
+        action_result["action"] = "replace_with_symlink_after_backup"
+        report["actions_taken"].append(action_result)
+        report["status"] = "fixed" if action_result["success"] else "error"
+        logger.info("doctor_fix: backed up to %s, created symlink", backup_dir)
+        return report
+
+    # 情况 F/G：用户更新 / 双向差异 → 提示用户处理
+    report["status"] = "needs_user_decision"
+    _diff_class = _classify_diff_status(diff_result["details"])
+    logger.warning(
+        "doctor_fix: user skill files differ (class=%s), needs user decision",
+        _diff_class,
+    )
+    report["hint"] = (
+        "User skill files have local modifications. "
+        "Review the diff details above. Options:\n"
+        "1. To keep project version: backup user dir, create symlink\n"
+        "2. To sync user changes to project: copy files manually\n"
+        "3. To merge: edit files in project dir, then replace user dir with symlink"
+    )
+    if _diff_class == "user_newer":
+        report["hint"] += (
+            "\nUser directory appears newer — consider syncing user changes "
+            "to project first."
+        )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# doctor_fix helpers
+# ---------------------------------------------------------------------------
+
+def _list_skill_files(directory: str) -> list:
+    """列出技能目录中的所有文件（相对路径）。"""
+    files = []
+    for root, _dirs, filenames in os.walk(directory):
+        for fn in filenames:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, directory)
+            files.append(rel)
+    return sorted(files)
+
+
+def _create_symlink(link_path: str, target_path: str) -> dict:
+    """创建软链接，确保父目录存在。"""
+    parent = os.path.dirname(link_path)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        os.symlink(target_path, link_path)
+        return {
+            "action": "create_symlink",
+            "success": True,
+            "link": link_path,
+            "target": target_path,
+        }
+    except OSError as e:
+        return {
+            "action": "create_symlink",
+            "success": False,
+            "error": str(e),
+        }
+
+
+def _compare_skill_dirs(user_dir: str, project_dir: str) -> dict:
+    """比较两个技能目录的内容差异。
+
+    Returns:
+        dict with keys:
+            identical: bool
+            summary: str  ("identical" | "project_newer" | "user_newer" | "both_modified")
+            details: list of per-file comparison dicts
+    """
+    user_files = set(_list_skill_files(user_dir))
+    project_files = set(_list_skill_files(project_dir))
+
+    all_files = sorted(user_files | project_files)
+    details = []
+    project_newer_count = 0
+    user_newer_count = 0
+    both_modified_count = 0
+
+    for rel in all_files:
+        user_path = os.path.join(user_dir, rel)
+        proj_path = os.path.join(project_dir, rel)
+
+        entry = {"file": rel}
+
+        if not os.path.exists(user_path):
+            entry["status"] = "missing_in_user"
+            project_newer_count += 1
+        elif not os.path.exists(proj_path):
+            entry["status"] = "missing_in_project"
+            user_newer_count += 1
+        else:
+            # 比较内容
+            if filecmp.cmp(user_path, proj_path, shallow=False):
+                entry["status"] = "identical"
+            else:
+                user_mtime = os.path.getmtime(user_path)
+                proj_mtime = os.path.getmtime(proj_path)
+                entry["user_mtime"] = datetime.fromtimestamp(user_mtime).isoformat()
+                entry["project_mtime"] = datetime.fromtimestamp(proj_mtime).isoformat()
+
+                if proj_mtime > user_mtime:
+                    entry["status"] = "project_newer"
+                    project_newer_count += 1
+                elif user_mtime > proj_mtime:
+                    entry["status"] = "user_newer"
+                    user_newer_count += 1
+                else:
+                    # 同一秒修改但内容不同
+                    entry["status"] = "both_modified"
+                    both_modified_count += 1
+
+                # 生成 diff 摘要
+                entry["diff_summary"] = _diff_summary(user_path, proj_path)
+
+        if entry["status"] != "identical":
+            details.append(entry)
+
+    identical = len(details) == 0
+    if identical:
+        summary = "identical"
+    elif both_modified_count > 0 or (user_newer_count > 0 and project_newer_count > 0):
+        summary = "both_modified"
+    elif user_newer_count == 0 and project_newer_count > 0:
+        summary = "project_newer"
+    elif project_newer_count == 0 and user_newer_count > 0:
+        summary = "user_newer"
+    else:
+        summary = "both_modified"
+
+    return {"identical": identical, "summary": summary, "details": details}
+
+
+def _classify_diff_status(details: list) -> str:
+    """根据差异详情分类状态。"""
+    has_user_newer = any(
+        d["status"] in ("user_newer", "missing_in_project") for d in details
+    )
+    has_project_newer = any(
+        d["status"] in ("project_newer", "missing_in_user") for d in details
+    )
+    has_both_modified = any(d["status"] == "both_modified" for d in details)
+
+    if has_both_modified or (has_user_newer and has_project_newer):
+        return "both_modified"
+    if has_project_newer:
+        return "project_newer"
+    if has_user_newer:
+        return "user_newer"
+    return "identical"
+
+
+def _diff_summary(file_a: str, file_b: str) -> str:
+    """生成两个文件的简要 diff 摘要。"""
+    if not shutil.which("diff"):
+        return "files differ (diff not available)"
+
+    try:
+        result_stat = subprocess.run(
+            ["diff", file_a, file_b],
+            capture_output=True, text=True, timeout=5,
+        )
+        diff_lines = [l for l in result_stat.stdout.splitlines()
+                      if l.startswith(("<", ">"))]
+        return f"{len(diff_lines)} lines differ"
+    except (subprocess.TimeoutExpired, FileNotFoundError,
+            subprocess.SubprocessError):
+        return "files differ"
 
 
 # ---------------------------------------------------------------------------
