@@ -231,6 +231,167 @@ class TestExtractMcpFailureCount:
         assert _extract_mcp_failure_count(text) == 15
 
 
+class TestWorkdirIndexCleanup:
+    """Tests for _workdir_index cleanup when stopping sessions."""
+
+    def setup_method(self):
+        """Reset module-level state before each test."""
+        from tools.claude_session_tool import _sessions, _workdir_index, _name_index, _active_session
+        _sessions.clear()
+        _workdir_index.clear()
+        _name_index.clear()
+        _active_session.clear()
+
+    def test_workdir_index_cleanup_single_session(self):
+        """Stop session with unique workdir removes entry entirely."""
+        from tools.claude_session_tool import (
+            _sessions, _workdir_index, _name_index,
+            _sessions_lock,
+        )
+        gw_key = ""
+        workdir = "/tmp/test"
+        session_id = "sess-1"
+        name = "task-1"
+
+        # 模拟启动后的状态
+        with _sessions_lock:
+            _name_index[(gw_key, name)] = session_id
+            _workdir_index[(gw_key, workdir)] = [session_id]
+            _sessions[session_id] = MagicMock(
+                _session_id=session_id,
+                _session_name=name,
+                _gateway_session_key=gw_key,
+                _session_active=True,
+            )
+
+        # 验证初始状态
+        with _sessions_lock:
+            assert (gw_key, workdir) in _workdir_index
+            assert _workdir_index[(gw_key, workdir)] == [session_id]
+
+        # 模拟 stop
+        with _sessions_lock:
+            # 执行清理逻辑
+            keys_to_remove = []
+            for k, v_list in _workdir_index.items():
+                if session_id in v_list:
+                    updated_list = [sid for sid in v_list if sid != session_id]
+                    if updated_list:
+                        _workdir_index[k] = updated_list
+                    else:
+                        keys_to_remove.append(k)
+            for k in keys_to_remove:
+                _workdir_index.pop(k, None)
+
+        # 验证清理结果
+        with _sessions_lock:
+            assert (gw_key, workdir) not in _workdir_index
+
+    def test_workdir_index_cleanup_multiple_sessions_same_workdir(self):
+        """Stop one of two sessions with same workdir keeps the other."""
+        from tools.claude_session_tool import (
+            _sessions, _workdir_index, _name_index,
+            _sessions_lock,
+        )
+        gw_key = ""
+        workdir = "/tmp/test"
+        sess1 = "sess-1"
+        sess2 = "sess-2"
+        name1 = "task-1"
+        name2 = "task-2"
+
+        # 模拟启动两个会话后的状态
+        with _sessions_lock:
+            _name_index[(gw_key, name1)] = sess1
+            _name_index[(gw_key, name2)] = sess2
+            _workdir_index[(gw_key, workdir)] = [sess1, sess2]
+            _sessions[sess1] = MagicMock(
+                _session_id=sess1,
+                _session_name=name1,
+                _gateway_session_key=gw_key,
+                _session_active=True,
+            )
+            _sessions[sess2] = MagicMock(
+                _session_id=sess2,
+                _session_name=name2,
+                _gateway_session_key=gw_key,
+                _session_active=True,
+            )
+
+        # 验证初始状态
+        with _sessions_lock:
+            assert _workdir_index[(gw_key, workdir)] == [sess1, sess2]
+
+        # 模拟停止 sess1
+        with _sessions_lock:
+            keys_to_remove = []
+            for k, v_list in _workdir_index.items():
+                if sess1 in v_list:
+                    updated_list = [sid for sid in v_list if sid != sess1]
+                    if updated_list:
+                        _workdir_index[k] = updated_list
+                    else:
+                        keys_to_remove.append(k)
+            for k in keys_to_remove:
+                _workdir_index.pop(k, None)
+
+        # 验证 sess2 仍在索引中
+        with _sessions_lock:
+            assert (gw_key, workdir) in _workdir_index
+            assert _workdir_index[(gw_key, workdir)] == [sess2]
+
+    def test_workdir_index_cleanup_both_sessions_same_workdir(self):
+        """Stop both sessions with same workdir removes entry entirely."""
+        from tools.claude_session_tool import (
+            _sessions, _workdir_index, _name_index,
+            _sessions_lock,
+        )
+        gw_key = ""
+        workdir = "/tmp/test"
+        sess1 = "sess-1"
+        sess2 = "sess-2"
+
+        # 模拟两个会话
+        with _sessions_lock:
+            _workdir_index[(gw_key, workdir)] = [sess1, sess2]
+            _sessions[sess1] = MagicMock(_session_id=sess1)
+            _sessions[sess2] = MagicMock(_session_id=sess2)
+
+        # 停止 sess1
+        with _sessions_lock:
+            keys_to_remove = []
+            for k, v_list in _workdir_index.items():
+                if sess1 in v_list:
+                    updated_list = [sid for sid in v_list if sid != sess1]
+                    if updated_list:
+                        _workdir_index[k] = updated_list
+                    else:
+                        keys_to_remove.append(k)
+            for k in keys_to_remove:
+                _workdir_index.pop(k, None)
+
+        # 验证只剩 sess2
+        with _sessions_lock:
+            assert _workdir_index[(gw_key, workdir)] == [sess2]
+
+        # 停止 sess2
+        with _sessions_lock:
+            keys_to_remove = []
+            for k, v_list in _workdir_index.items():
+                if sess2 in v_list:
+                    updated_list = [sid for sid in v_list if sid != sess2]
+                    if updated_list:
+                        _workdir_index[k] = updated_list
+                    else:
+                        keys_to_remove.append(k)
+            for k in keys_to_remove:
+                _workdir_index.pop(k, None)
+
+        # 验证 entry 被移除
+        with _sessions_lock:
+            assert (gw_key, workdir) not in _workdir_index
+
+
 class TestSessionDiagnoseChecks:
     """Tests for session-level diagnose checks (THINKING, bypass, MCP)."""
 

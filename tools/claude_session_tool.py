@@ -519,7 +519,14 @@ def _handle_claude_session(args, **kw):
         else:
             # 启动失败时清理占位
             with _sessions_lock:
-                _workdir_index.pop(idx_key, None)
+                workdir_idx_key = (gw_key, abs_workdir)
+                session_list = _workdir_index.get(workdir_idx_key, [])
+                if "__starting__" in session_list:
+                    updated_list = [sid for sid in session_list if sid != "__starting__"]
+                    if updated_list:
+                        _workdir_index[workdir_idx_key] = updated_list
+                    else:
+                        _workdir_index.pop(workdir_idx_key, None)
         return json.dumps(result, ensure_ascii=False)
 
     # ── list：列出当前 gateway 下的所有会话 ──
@@ -561,9 +568,16 @@ def _handle_claude_session(args, **kw):
             stopped_id = result.get("session_id")
             with _sessions_lock:
                 _sessions.pop(stopped_id, None)
-                # 清理 _workdir_index
-                stale_keys = [k for k, v in _workdir_index.items() if v == stopped_id]
-                for k in stale_keys:
+                # 清理 _workdir_index（值是列表，需要从列表中移除 session_id）
+                keys_to_remove = []
+                for k, v_list in _workdir_index.items():
+                    if stopped_id in v_list:
+                        updated_list = [sid for sid in v_list if sid != stopped_id]
+                        if updated_list:
+                            _workdir_index[k] = updated_list
+                        else:
+                            keys_to_remove.append(k)
+                for k in keys_to_remove:
                     _workdir_index.pop(k, None)
                 # 清理 _name_index
                 name_keys = [k for k, v in _name_index.items() if v == stopped_id]
