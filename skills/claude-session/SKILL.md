@@ -742,3 +742,43 @@ claude_session(action="events", since_turn=2)
 ```
 claude_session(action="stop")
 ```
+
+### diagnose
+```
+claude_session(action="diagnose")
+```
+检查 tmux、Claude CLI、环境变量、残留 session 等依赖状态。
+
+### doctor_fix
+```
+claude_session(action="doctor_fix")
+```
+诊断并修复 claude-session 技能文件同步问题。
+
+技能文件存在于两个位置：
+- **用户目录**: `~/.hermes/skills/claude-session`
+- **项目目录**: `<project>/skills/claude-session`
+
+最佳实践是通过软链接让用户目录指向项目目录，这样项目更新时技能自动同步。
+
+**自动修复策略**：
+| 情况 | 操作 |
+|------|------|
+| 用户目录不存在 | 创建软链接 |
+| 软链接指向错误 | 修复指向 |
+| 硬拷贝完全一致 | 替换为软链接 |
+| 硬拷贝有差异、项目更新 | 备份用户目录 → 创建软链接 |
+| 硬拷贝有差异、用户更新 | 返回 `needs_user_decision`，提示手动处理 |
+| 双向差异 | 返回 `needs_user_decision`，提示手动处理 |
+
+**返回示例**：
+```json
+{
+  "status": "ok",           // ok | fixed | needs_user_decision | error
+  "user_dir": "~/.hermes/skills/claude-session",
+  "project_dir": "/project/skills/claude-session",
+  "steps": [...],
+  "actions_taken": [...],
+  "hint": "..."             // 仅 needs_user_decision 时
+}
+```
