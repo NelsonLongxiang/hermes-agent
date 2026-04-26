@@ -750,35 +750,43 @@ claude_session(action="diagnose")
 检查 tmux、Claude CLI、环境变量、残留 session 等依赖状态。
 
 ### doctor_fix
+
+**两阶段操作**：先分析（默认），再执行修复。
+
 ```
+# 第一步：分析（不执行任何修改）
 claude_session(action="doctor_fix")
+
+# 第二步：根据分析结果执行修复
+claude_session(action="doctor_fix", apply=True)
+claude_session(action="doctor_fix", apply=True, strategy="user")   # 保留用户修改
+claude_session(action="doctor_fix", apply=True, strategy="merge")  # 合并
 ```
-诊断并修复 claude-session 技能文件同步问题。
 
 技能文件存在于两个位置：
 - **用户目录**: `~/.hermes/skills/claude-session`
 - **项目目录**: `<project>/skills/claude-session`
 
-最佳实践是通过软链接让用户目录指向项目目录，这样项目更新时技能自动同步。
+最佳实践是通过软链接让用户目录指向项目目录，项目更新时技能自动同步。
 
-**自动修复策略**：
-| 情况 | 操作 |
-|------|------|
-| 用户目录不存在 | 创建软链接 |
-| 软链接指向错误 | 修复指向 |
-| 硬拷贝完全一致 | 替换为软链接 |
-| 硬拷贝有差异、项目更新 | 备份用户目录 → 创建软链接 |
-| 硬拷贝有差异、用户更新 | 返回 `needs_user_decision`，提示手动处理 |
-| 双向差异 | 返回 `needs_user_decision`，提示手动处理 |
+**参数**：
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `apply` | boolean | false | false=仅分析，true=执行修复 |
+| `strategy` | string | "project" | 合并策略：project/user/merge |
 
-**返回示例**：
-```json
-{
-  "status": "ok",           // ok | fixed | needs_user_decision | error
-  "user_dir": "~/.hermes/skills/claude-session",
-  "project_dir": "/project/skills/claude-session",
-  "steps": [...],
-  "actions_taken": [...],
-  "hint": "..."             // 仅 needs_user_decision 时
-}
-```
+**strategy 说明**：
+| 策略 | 适用场景 | 行为 |
+|------|----------|------|
+| `project` | 项目更新或无差异 | 备份用户目录 → 创建软链接 |
+| `user` | 用户有修改 | 将用户修改复制到项目 → 创建软链接 |
+| `merge` | 双方都有修改 | 项目独有文件从项目复制，其余保留用户版本 → 创建软链接 |
+
+**返回状态**：
+| status | 含义 |
+|--------|------|
+| `ok` | 软链接正确，无需操作 |
+| `needs_fix` | apply=false 检测到问题，查看 actions_available |
+| `needs_user_decision` | 有冲突需选择 strategy，查看 actions_available |
+| `fixed` | apply=true 修复完成 |
+| `error` | 执行失败 |

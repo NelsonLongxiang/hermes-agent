@@ -266,6 +266,16 @@ CLAUDE_SESSION_SCHEMA = {
                 "type": "integer",
                 "description": "Filter events since turn ID for 'events' action",
             },
+            # doctor_fix
+            "apply": {
+                "type": "boolean",
+                "description": "For 'doctor_fix': False=analyze only (default), True=execute fixes",
+            },
+            "strategy": {
+                "type": "string",
+                "enum": ["project", "user", "merge"],
+                "description": "For 'doctor_fix': merge strategy — 'project' (default), 'user', or 'merge'",
+            },
         },
         "required": ["action"],
     },
@@ -380,7 +390,10 @@ def _handle_claude_session(args, **kw):
 
     # ── doctor_fix：诊断并修复技能文件同步 ──
     if action == "doctor_fix":
-        result = _doctor_fix_skills()
+        result = _doctor_fix_skills(
+            apply=args.get("apply", False),
+            strategy=args.get("strategy", "project"),
+        )
         return json.dumps(result, ensure_ascii=False)
 
     # ── 其他动作：通过 _get_session 路由到对应实例（按 gateway session 隔离）──
@@ -607,19 +620,19 @@ def _diagnose_claude_session() -> dict:
     }
 
 
-def _doctor_fix_skills() -> dict:
+def _doctor_fix_skills(apply: bool = False, strategy: str = "project") -> dict:
     """诊断并修复 claude-session 技能文件同步问题。
 
-    检查用户目录（~/.hermes/skills/claude-session）与项目目录
-    （<project>/skills/claude-session）的同步状态，智能决定修复策略。
+    两阶段操作：
+      - apply=False（默认）：仅分析，不执行任何修改
+      - apply=True：根据 strategy 执行修复
 
-    策略：
-      - 用户目录不存在 → 创建软链接
-      - 软链接指向错误 → 修复指向
-      - 硬拷贝完全一致 → 替换为软链接
-      - 硬拷贝有差异、项目更新 → 备份后创建软链接
-      - 硬拷贝有差异、用户更新 → 提示同步到项目（需用户确认）
-      - 硬拷贝双向差异 → 提示手动处理
+    Args:
+        apply: False=仅分析返回报告，True=执行修复操作
+        strategy: 合并策略，仅在 apply=True 且有差异时生效
+            - "project": 优先项目版本（备份用户目录后创建软链接）
+            - "user": 保留用户版本（将用户修改复制到项目目录）
+            - "merge": 逐文件合并，项目独有的文件从项目复制，其余保留用户版本
     """
     # 定位两个目录
     user_skill_dir = os.path.expanduser("~/.hermes/skills/claude-session")
@@ -631,6 +644,8 @@ def _doctor_fix_skills() -> dict:
     report = {
         "user_dir": user_skill_dir,
         "project_dir": project_skill_dir,
+        "apply": apply,
+        "strategy": strategy,
         "steps": [],
         "actions_taken": [],
         "status": "ok",
@@ -656,11 +671,11 @@ def _doctor_fix_skills() -> dict:
 
     # ── Step 2: 用户目录状态检测 ──
     if not os.path.exists(user_skill_dir):
-        # 情况 A：不存在 → 创建软链接
-        report["steps"].append({
-            "step": "check_user_dir",
-            "result": "missing",
-        })
+        report["steps"].append({"step": "check_user_dir", "result": "missing"})
+        if not apply:
+            report["status"] = "needs_fix"
+            report["actions_available"] = [_action_create_symlink()]
+            return report
         action_result = _create_symlink(user_skill_dir, project_skill_dir)
         report["actions_taken"].append(action_result)
         report["status"] = "fixed" if action_result["success"] else "error"
@@ -674,7 +689,7 @@ def _doctor_fix_skills() -> dict:
         resolved = os.path.realpath(user_skill_dir)
         project_resolved = os.path.realpath(project_skill_dir)
 
-        # 检查目标是否存在（断链检测）
+        # 断链检测
         if not os.path.exists(resolved):
             report["steps"].append({
                 "step": "check_user_dir",
@@ -682,29 +697,14 @@ def _doctor_fix_skills() -> dict:
                 "target": link_target,
                 "resolved": resolved,
             })
-            logger.warning(
-                "Broken symlink: %s -> %s (target missing). Recreating.",
-                user_skill_dir, link_target,
-            )
-            try:
-                os.remove(user_skill_dir)
-            except OSError as e:
-                report["actions_taken"].append({
-                    "action": "remove_broken_symlink",
-                    "success": False,
-                    "error": str(e),
-                })
-                report["status"] = "error"
+            logger.warning("Broken symlink: %s -> %s", user_skill_dir, link_target)
+            if not apply:
+                report["status"] = "needs_fix"
+                report["actions_available"] = [_action_fix_broken_symlink(link_target)]
                 return report
-
-            action_result = _create_symlink(user_skill_dir, project_skill_dir)
-            action_result["action"] = "fix_broken_symlink"
-            report["actions_taken"].append(action_result)
-            report["status"] = "fixed" if action_result["success"] else "error"
-            return report
+            return _do_fix_broken_symlink(report, user_skill_dir, project_skill_dir)
 
         if resolved == project_resolved:
-            # 情况 B：软链接正确
             report["steps"].append({
                 "step": "check_user_dir",
                 "result": "symlink_ok",
@@ -714,7 +714,6 @@ def _doctor_fix_skills() -> dict:
             report["status"] = "ok"
             return report
         else:
-            # 情况 C：软链接指向错误
             report["steps"].append({
                 "step": "check_user_dir",
                 "result": "symlink_wrong",
@@ -722,29 +721,14 @@ def _doctor_fix_skills() -> dict:
                 "resolved": resolved,
                 "expected": project_resolved,
             })
-            # 删除错误链接，创建正确的
-            try:
-                os.remove(user_skill_dir)
-            except OSError as e:
-                report["actions_taken"].append({
-                    "action": "remove_wrong_symlink",
-                    "success": False,
-                    "error": str(e),
-                })
-                report["status"] = "error"
+            if not apply:
+                report["status"] = "needs_fix"
+                report["actions_available"] = [_action_fix_wrong_symlink(link_target, project_resolved)]
                 return report
-
-            action_result = _create_symlink(user_skill_dir, project_skill_dir)
-            action_result["action"] = "fix_symlink"
-            report["actions_taken"].append(action_result)
-            report["status"] = "fixed" if action_result["success"] else "error"
-            return report
+            return _do_fix_wrong_symlink(report, user_skill_dir, project_skill_dir)
 
     # ── Step 3: 硬拷贝 — 比较差异 ──
-    report["steps"].append({
-        "step": "check_user_dir",
-        "result": "hardcopy",
-    })
+    report["steps"].append({"step": "check_user_dir", "result": "hardcopy"})
 
     diff_result = _compare_skill_dirs(user_skill_dir, project_skill_dir)
     report["steps"].append({
@@ -754,11 +738,11 @@ def _doctor_fix_skills() -> dict:
         "summary_human": _format_diff_summary_human(diff_result),
     })
 
-    # 顶层 diff_summary，便于外层快速概览差异
+    # 顶层 diff_summary
+    user_files = _list_skill_files(user_skill_dir)
+    project_files = _list_skill_files(project_skill_dir)
     report["diff_summary"] = {
-        "total_files": len(_list_skill_files(user_skill_dir))
-                       + len([f for f in _list_skill_files(project_skill_dir)
-                              if f not in _list_skill_files(user_skill_dir)]),
+        "total_files": len(set(user_files) | set(project_files)),
         "differing_files": len(diff_result["details"]),
         "newer_in_project": [d["file"] for d in diff_result["details"]
                              if d["status"] in ("project_newer", "missing_in_user")],
@@ -767,80 +751,270 @@ def _doctor_fix_skills() -> dict:
     }
 
     if diff_result["identical"]:
-        # 情况 D：完全一致 → 替换为软链接
-        try:
-            shutil.rmtree(user_skill_dir)
-        except OSError as e:
-            report["actions_taken"].append({
-                "action": "remove_hardcopy",
-                "success": False,
-                "error": str(e),
-            })
-            report["status"] = "error"
+        if not apply:
+            report["status"] = "needs_fix"
+            report["actions_available"] = [_action_replace_hardcopy()]
             return report
+        return _do_replace_hardcopy(report, user_skill_dir, project_skill_dir)
 
-        action_result = _create_symlink(user_skill_dir, project_skill_dir)
-        action_result["action"] = "replace_hardcopy_with_symlink"
-        action_result["reason"] = "files_identical"
-        report["actions_taken"].append(action_result)
-        report["status"] = "fixed" if action_result["success"] else "error"
-        logger.info("doctor_fix: replaced identical hardcopy with symlink: %s", user_skill_dir)
-        return report
+    # 有差异 → 根据分类和 strategy 决定
+    diff_class = _classify_diff_status(diff_result["details"])
 
-    # 有差异 → 判断哪边更新
-    report["status"] = _classify_diff_status(diff_result["details"])
-
-    if report["status"] == "project_newer":
-        # 情况 E：项目目录更新 → 备份用户目录，创建软链接
-        backup_dir = user_skill_dir + f".bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        try:
-            os.rename(user_skill_dir, backup_dir)
-        except OSError as e:
-            report["actions_taken"].append({
-                "action": "backup_user_dir",
-                "success": False,
-                "error": str(e),
-            })
-            report["status"] = "error"
+    # project_newer 且 strategy=project → 自动修复（安全操作）
+    if diff_class == "project_newer" and strategy in ("project", "merge"):
+        if not apply:
+            report["status"] = "needs_fix"
+            report["actions_available"] = [_action_backup_and_symlink()]
             return report
+        return _do_backup_and_symlink(report, user_skill_dir, project_skill_dir)
 
-        report["actions_taken"].append({
-            "action": "backup_user_dir",
-            "success": True,
-            "backup_path": backup_dir,
-        })
+    # user_newer 且 strategy=user → 同步用户修改到项目
+    if diff_class == "user_newer" and strategy == "user":
+        if not apply:
+            report["status"] = "needs_fix"
+            report["actions_available"] = [_action_sync_user_to_project(diff_result["details"])]
+            return report
+        return _do_sync_user_to_project(report, user_skill_dir, project_skill_dir, diff_result["details"])
 
-        action_result = _create_symlink(user_skill_dir, project_skill_dir)
-        action_result["action"] = "replace_with_symlink_after_backup"
-        report["actions_taken"].append(action_result)
-        report["status"] = "fixed" if action_result["success"] else "error"
-        logger.info("doctor_fix: backed up to %s, created symlink", backup_dir)
-        return report
+    # merge 策略：逐文件合并
+    if strategy == "merge":
+        if not apply:
+            report["status"] = "needs_fix"
+            report["actions_available"] = [_action_merge_files(diff_result["details"])]
+            return report
+        return _do_merge_files(report, user_skill_dir, project_skill_dir, diff_result["details"])
 
-    # 情况 F/G：用户更新 / 双向差异 → 提示用户处理
+    # 所有其他情况（user_newer+project / both_modified / 策略不匹配）
     report["status"] = "needs_user_decision"
-    _diff_class = _classify_diff_status(diff_result["details"])
-    logger.warning(
-        "doctor_fix: user skill files differ (class=%s), needs user decision",
-        _diff_class,
-    )
-    report["hint"] = (
-        "User skill files have local modifications. "
-        "Review the diff details above. Options:\n"
-        "1. To keep project version: backup user dir, create symlink\n"
-        "2. To sync user changes to project: copy files manually\n"
-        "3. To merge: edit files in project dir, then replace user dir with symlink"
-    )
-    if _diff_class == "user_newer":
-        report["hint"] += (
-            "\nUser directory appears newer — consider syncing user changes "
-            "to project first."
-        )
+    logger.warning("doctor_fix: diff_class=%s, needs user decision", diff_class)
+    report["actions_available"] = _build_actions_for_decision(diff_class, diff_result["details"])
     return report
 
 
 # ---------------------------------------------------------------------------
-# doctor_fix helpers
+# doctor_fix: execute helpers (only run when apply=True)
+# ---------------------------------------------------------------------------
+
+def _do_fix_broken_symlink(report, user_dir, project_dir):
+    try:
+        os.remove(user_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "remove_broken_symlink", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "fix_broken_symlink"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    return report
+
+
+def _do_fix_wrong_symlink(report, user_dir, project_dir):
+    try:
+        os.remove(user_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "remove_wrong_symlink", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "fix_symlink"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    return report
+
+
+def _do_replace_hardcopy(report, user_dir, project_dir):
+    try:
+        shutil.rmtree(user_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "remove_hardcopy", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "replace_hardcopy_with_symlink"
+    r["reason"] = "files_identical"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    logger.info("doctor_fix: replaced identical hardcopy with symlink: %s", user_dir)
+    return report
+
+
+def _do_backup_and_symlink(report, user_dir, project_dir):
+    backup_dir = user_dir + f".bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        os.rename(user_dir, backup_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "backup_user_dir", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    report["actions_taken"].append({"action": "backup_user_dir", "success": True, "backup_path": backup_dir})
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "replace_with_symlink_after_backup"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    logger.info("doctor_fix: backed up to %s, created symlink", backup_dir)
+    return report
+
+
+def _do_sync_user_to_project(report, user_dir, project_dir, details):
+    """将用户修改的文件复制到项目目录，然后替换用户目录为软链接。"""
+    for d in details:
+        if d["status"] in ("user_newer", "missing_in_project"):
+            src = os.path.join(user_dir, d["file"])
+            dst = os.path.join(project_dir, d["file"])
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                report["actions_taken"].append({"action": "sync_file_to_project", "file": d["file"], "success": True})
+            except OSError as e:
+                report["actions_taken"].append({"action": "sync_file_to_project", "file": d["file"], "success": False, "error": str(e)})
+                report["status"] = "error"
+                return report
+    # 同步完成后替换用户目录为软链接
+    try:
+        shutil.rmtree(user_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "remove_user_dir", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "sync_user_to_project_then_symlink"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    logger.info("doctor_fix: synced user changes to project, created symlink")
+    return report
+
+
+def _do_merge_files(report, user_dir, project_dir, details):
+    """逐文件合并：项目独有的从项目复制，其余保留用户版本，然后创建软链接。"""
+    for d in details:
+        if d["status"] in ("missing_in_user",):
+            # 项目独有的文件 → 复制到用户目录
+            src = os.path.join(project_dir, d["file"])
+            dst = os.path.join(user_dir, d["file"])
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                report["actions_taken"].append({"action": "copy_project_file", "file": d["file"], "success": True})
+            except OSError as e:
+                report["actions_taken"].append({"action": "copy_project_file", "file": d["file"], "success": False, "error": str(e)})
+        # user_newer / missing_in_project → 保留用户版本（不动）
+        # project_newer / both_modified → 保留用户版本（用户优先）
+    # 合并完成后替换用户目录为软链接
+    try:
+        shutil.rmtree(user_dir)
+    except OSError as e:
+        report["actions_taken"].append({"action": "remove_user_dir", "success": False, "error": str(e)})
+        report["status"] = "error"
+        return report
+    r = _create_symlink(user_dir, project_dir)
+    r["action"] = "merge_then_symlink"
+    report["actions_taken"].append(r)
+    report["status"] = "fixed" if r["success"] else "error"
+    logger.info("doctor_fix: merged files, created symlink")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# doctor_fix: actions_available builders (for apply=False reports)
+# ---------------------------------------------------------------------------
+
+def _action_create_symlink():
+    return {
+        "action": "create_symlink",
+        "description": "Create symlink to project directory",
+        "command": "claude_session(action='doctor_fix', apply=True)",
+    }
+
+
+def _action_fix_broken_symlink(broken_target):
+    return {
+        "action": "fix_broken_symlink",
+        "description": f"Remove broken symlink (points to {broken_target}) and recreate",
+        "command": "claude_session(action='doctor_fix', apply=True)",
+    }
+
+
+def _action_fix_wrong_symlink(current, expected):
+    return {
+        "action": "fix_wrong_symlink",
+        "description": f"Redirect symlink from {current} to {expected}",
+        "command": "claude_session(action='doctor_fix', apply=True)",
+    }
+
+
+def _action_replace_hardcopy():
+    return {
+        "action": "replace_hardcopy_with_symlink",
+        "description": "User directory is identical to project — replace with symlink",
+        "command": "claude_session(action='doctor_fix', apply=True)",
+    }
+
+
+def _action_backup_and_symlink():
+    return {
+        "action": "backup_and_symlink",
+        "description": "Backup user directory, then create symlink to project version",
+        "command": "claude_session(action='doctor_fix', apply=True)",
+    }
+
+
+def _action_sync_user_to_project(details):
+    files = [d["file"] for d in details if d["status"] in ("user_newer", "missing_in_project")]
+    return {
+        "action": "sync_user_to_project",
+        "description": f"Copy {len(files)} user-modified file(s) to project, then create symlink",
+        "files": files,
+        "command": "claude_session(action='doctor_fix', apply=True, strategy='user')",
+    }
+
+
+def _action_merge_files(details):
+    project_only = [d["file"] for d in details if d["status"] == "missing_in_user"]
+    return {
+        "action": "merge_files",
+        "description": (
+            f"Copy {len(project_only)} project-only file(s) to user dir, "
+            "keep user versions for rest, then create symlink"
+        ),
+        "project_only_files": project_only,
+        "command": "claude_session(action='doctor_fix', apply=True, strategy='merge')",
+    }
+
+
+def _build_actions_for_decision(diff_class, details):
+    """构建 needs_user_decision 状态下的可用操作列表。"""
+    actions = []
+
+    # 始终提供"使用项目版本"选项
+    actions.append({
+        "action": "use_project_version",
+        "description": "Backup user directory and create symlink to project version",
+        "command": "claude_session(action='doctor_fix', apply=True, strategy='project')",
+    })
+
+    # 如果用户有更新，提供"同步用户修改"选项
+    user_files = [d["file"] for d in details if d["status"] in ("user_newer", "missing_in_project")]
+    if user_files:
+        actions.append({
+            "action": "sync_user_changes",
+            "description": f"Sync {len(user_files)} user-modified file(s) to project, then symlink",
+            "files": user_files,
+            "command": "claude_session(action='doctor_fix', apply=True, strategy='user')",
+        })
+
+    # merge 选项
+    actions.append({
+        "action": "merge",
+        "description": "Copy project-only files to user dir, keep user versions for rest, then symlink",
+        "command": "claude_session(action='doctor_fix', apply=True, strategy='merge')",
+    })
+
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# doctor_fix: pure utility helpers
 # ---------------------------------------------------------------------------
 
 def _list_skill_files(directory: str) -> list:
