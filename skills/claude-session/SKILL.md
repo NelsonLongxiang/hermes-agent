@@ -7,7 +7,7 @@ triggers:
   - "coding task"
   - "delegation"
   - "interactive session"
-version: 2.0
+version: 3.0
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
     prompt: "Stream stale timeout (秒，推荐 300)"
@@ -32,6 +32,20 @@ bash ~/.hermes/skills/claude-session/scripts/configure.sh
 
 # Claude Session — Delegating Tasks to Claude Code
 
+## Named Sessions（多会话管理）
+
+v3.0 引入 **Named Sessions**：通过用户友好的名称管理多个并行 Claude Code 会话。
+
+**为什么需要命名会话？**
+- 同一 gateway 下并行运行多个会话（如同时处理前端和后端任务）
+- 用 `name="frontend"` / `name="backend"` 替代不可读的 session_id
+- `switch` 快速切换活跃会话，`list` 查看所有会话状态
+
+**核心概念**：
+- **name**: 1-64 字符，`[a-zA-Z0-9_-]`，同一 gateway 下唯一
+- **active session**: 每个 gateway 记录最近交互的会话，无显式指定时自动路由
+- **路由优先级**: `session_id` > `name` > 活跃会话 > 最近创建的会话
+
 ## When to Use
 
 Use this skill when you need to delegate a coding task to Claude Code:
@@ -42,14 +56,19 @@ Use this skill when you need to delegate a coding task to Claude Code:
 
 ## Quick Start
 
-1. **Start a session**:
+1. **Start a named session**:
    ```
-   claude_session(action="start", workdir="/project", permission_mode="skip")
+   claude_session(action="start", workdir="/project", name="frontend", permission_mode="skip")
    ```
 
 2. **Wait for ready**:
    ```
    claude_session(action="wait_for_idle", timeout=30)
+   ```
+
+2b. **(Optional) Start a second session**:
+   ```
+   claude_session(action="start", workdir="/project", name="backend")
    ```
 
 3. **Configure permissions** (delete protection):
@@ -748,13 +767,24 @@ When `wait_for_idle` returns `PERMISSION` state:
 
 ### start
 ```
-claude_session(action="start", workdir="/path", session_name="claude-work",
+claude_session(action="start", workdir="/path", name="my-task",
+               session_name="claude-work",
                model="sonnet", permission_mode="skip", on_event="notify")
 ```
 
+**name 参数**（v3.0 新增）：
+- 为会话分配一个人类可读的名称，用于后续 `switch`/`stop`/`send` 路由
+- 不指定 name 时，会话仍可正常工作（通过 session_id 或活跃会话路由）
+- name 会纳入 tmux session 名的哈希计算，同 workdir 不同 name 生成不同 tmux 名
+- 规则：1-64 字符，仅 `[a-zA-Z0-9_-]`，同一 gateway 下唯一
+
 ### send (atomic)
 ```
+# 路由到活跃会话（默认）
 claude_session(action="send", message="Fix the auth bug")
+
+# 路由到命名会话
+claude_session(action="send", name="frontend", message="Fix the auth bug")
 ```
 
 ### type + submit (two-phase)
@@ -805,8 +835,73 @@ claude_session(action="events", since_turn=2)
 
 ### stop
 ```
+# 停止活跃会话
 claude_session(action="stop")
+
+# 停止命名会话
+claude_session(action="stop", name="frontend")
+
+# 通过 session_id 停止
+claude_session(action="stop", session_id="abc123...")
 ```
+
+### list（v3.0 新增）
+```
+claude_session(action="list")
+```
+
+列出当前 gateway 下的所有会话。返回：
+```json
+{
+  "sessions": [
+    {
+      "session_id": "abc123...",
+      "name": "frontend",
+      "workdir": "/project",
+      "state": "IDLE",
+      "active": true
+    },
+    {
+      "session_id": "def456...",
+      "name": null,
+      "workdir": "/project",
+      "state": "THINKING",
+      "active": true
+    }
+  ],
+  "active_session_id": "abc123...",
+  "total": 2
+}
+```
+
+### switch（v3.0 新增）
+```
+claude_session(action="switch", name="frontend")
+```
+
+切换活跃会话到指定 name。后续不带 `session_id`/`name` 的操作（send/status/output 等）将路由到切换后的会话。
+
+返回：
+```json
+{
+  "switched_to": "frontend",
+  "session_id": "abc123...",
+  "state": "IDLE"
+}
+```
+
+### 会话路由优先级
+
+所有需要定位会话的 action（send/status/output/wait_for_idle 等）按以下顺序解析目标：
+
+| 优先级 | 参数 | 说明 |
+|--------|------|------|
+| 1（最高） | `session_id` | 精确指定，找不到直接报错 |
+| 2 | `name` | 从 name 索引查找，找不到报错 |
+| 3 | 活跃会话 | 该 gateway 最近交互的会话 |
+| 4（最低） | 最近创建 | 回退到该 gateway 下最后创建的会话 |
+
+**交互类 action**（send/type/submit/respond_permission/cancel_input）会自动更新活跃会话记录。
 
 ### diagnose
 ```
@@ -855,3 +950,112 @@ claude_session(action="doctor_fix", apply=True, strategy="merge")  # 合并
 | `needs_user_decision` | 有冲突需选择 strategy，查看 actions_available |
 | `fixed` | apply=true 修复完成 |
 | `error` | 执行失败 |
+
+## Named Sessions 使用示例
+
+### 场景1：并行处理前端和后端任务
+
+```python
+# 1. 创建两个命名会话
+claude_session(action="start", name="frontend", workdir="/project/web", permission_mode="skip")
+claude_session(action="start", name="backend",  workdir="/project/api", permission_mode="skip")
+
+# 2. 向 frontend 会话发任务
+claude_session(action="send", name="frontend", message="Refactor the login page to use the new auth API")
+claude_session(action="wait_for_idle", name="frontend", timeout=600)
+
+# 3. 同时向 backend 会话发任务
+claude_session(action="send", name="backend", message="Add JWT refresh token endpoint")
+claude_session(action="wait_for_idle", name="backend", timeout=600)
+
+# 4. 检查所有会话状态
+claude_session(action="list")
+
+# 5. 切换到 frontend 查看结果
+claude_session(action="switch", name="frontend")
+claude_session(action="output", limit=50)
+
+# 6. 清理
+claude_session(action="stop", name="frontend")
+claude_session(action="stop", name="backend")
+```
+
+### 场景2：研究 + 实施 分离
+
+```python
+# 研究会话：只读分析
+claude_session(action="start", name="research", workdir="/project")
+claude_session(action="send", name="research", message="Analyze the auth module and list all security issues")
+
+# 实施会话：写代码
+claude_session(action="start", name="impl", workdir="/project", permission_mode="skip")
+
+# 研究完成后，将结果发给实施会话
+claude_session(action="wait_for_idle", name="research", timeout=300)
+research_result = claude_session(action="output", name="research", limit=100)
+
+claude_session(action="send", name="impl",
+    message=f"Based on this analysis, fix all security issues:\n{research_result}")
+```
+
+### 场景3：无 name 的传统用法（完全兼容）
+
+```python
+# 不用 name，行为与 v2.0 完全一致
+claude_session(action="start", workdir="/project")
+claude_session(action="send", message="Fix the bug")
+claude_session(action="wait_for_idle", timeout=300)
+claude_session(action="stop")
+```
+
+## Named Sessions 最佳实践
+
+### 何时使用命名会话
+
+| 场景 | 建议 | 原因 |
+|------|------|------|
+| 单一任务 | 不用 name | 减少复杂度，默认路由够用 |
+| 并行 2+ 任务 | 用 name | 避免路由混淆，明确指定目标 |
+| 研究 + 实施 | 用 name | 职责分离，研究和实施互不干扰 |
+| 长时间多步任务 | 可选 | name 让 debug 更容易（list 能看到有意义的名字） |
+
+### 命名规范
+
+```
+# 推荐：简洁、有语义
+name="frontend"
+name="auth-fix"
+name="refactor"
+name="test-suite"
+
+# 避免：过长、特殊字符、无意义
+name="this-is-my-very-long-session-name-for-frontend-work"  # 太长
+name="frontend work"  # 空格不允许
+name="测试"           # 非 ASCII 不允许
+name="session-1"      # 无语义，不好记
+```
+
+### 避免名称冲突
+
+- name 在同一 gateway 下唯一（不同 Telegram 群聊隔离，不冲突）
+- 如果 name 已被使用，`start` 会返回错误
+- `stop` 后 name 自动释放，可重新使用
+
+### 资源管理
+
+```python
+# 任务完成后及时 stop 释放 tmux 资源
+claude_session(action="stop", name="frontend")
+
+# 批量检查
+result = claude_session(action="list")
+for s in result["sessions"]:
+    if not s["active"]:
+        claude_session(action="stop", session_id=s["session_id"])
+```
+
+### 注意事项
+
+1. **gateway 重启后 name 丢失**：name 索引存储在内存中，gateway 重启后所有 name 需重新分配
+2. **同 workdir 多 name**：同一路径可以创建多个 name 不同的会话（tmux session 名不同）
+3. **name 不是 session_name**：`name` 是路由标识，`session_name` 是 tmux 层面的名称，两者独立

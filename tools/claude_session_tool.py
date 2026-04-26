@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _sessions: dict = {}   # session_id → ClaudeSessionManager 实例
 _workdir_index: dict = {}  # (gateway_key, workdir) → session_id 反向索引
+_name_index: dict[tuple[str, str], str] = {}  # (gateway_key, name) → session_id
+_active_session: dict[str, str] = {}  # gateway_key → session_id (最近活跃)
 _sessions_lock = threading.Lock()
 
 # Per-gateway-session status observers — bridges session status to Telegram.
@@ -96,20 +98,62 @@ def _safe_call_observer(observer: Callable[[str, dict], None], session_id: str, 
         )
 
 
-def _derive_session_name(workdir: str, gateway_session_key: str = "") -> str:
+def _derive_session_name(workdir: str, gateway_session_key: str = "", name: Optional[str] = None) -> str:
     """基于 workdir + gateway session_key 生成确定性 tmux session 名。
 
     gateway 模式下，同一 workdir 的不同 Telegram 群聊会得到不同的 tmux 名。
     CLI/cron 模式下（gateway_session_key 为空），退化为纯 workdir 哈希。
     格式：hermes-{sha256前8位}
+
+    如果提供了 name，将其纳入哈希计算，使同一 workdir 下不同命名的会话
+    得到不同的 tmux session 名。
     """
     abs_path = os.path.abspath(workdir)
+    parts = [abs_path]
     if gateway_session_key:
-        combined = f"{abs_path}:{gateway_session_key}"
-    else:
-        combined = abs_path
+        parts.append(gateway_session_key)
+    if name:
+        parts.append(name)
+    combined = ":".join(parts)
     h = hashlib.sha256(combined.encode()).hexdigest()[:8]
     return f"hermes-{h}"
+
+
+def _validate_session_name(name: str, gw_key: str) -> Optional[str]:
+    """验证 session name，返回错误信息或 None。
+
+    规则：
+      - 非空，1-64 字符
+      - 只允许 [a-zA-Z0-9_-]
+      - 同一 gateway_key 下不能重复
+    """
+    if not name:
+        return "session name cannot be empty"
+    if len(name) > 64:
+        return f"session name too long ({len(name)} > 64)"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        return "session name must contain only letters, digits, underscores, and hyphens"
+    with _sessions_lock:
+        existing_id = _name_index.get((gw_key, name))
+        if existing_id and existing_id in _sessions:
+            return f"name '{name}' already in use by session {existing_id[:8]}"
+    return None
+
+
+def _touch_active(gw_key: str, session_id: str, already_locked: bool = False):
+    """更新活跃 session 记录（gateway_key → 最新 session_id）。
+
+    在 start / send / interact 时调用，确保 _active_session 始终指向
+    该 gateway 下最近交互的会话。
+
+    Args:
+        already_locked: 为 True 时跳过加锁（调用方已持有 _sessions_lock）。
+    """
+    if already_locked:
+        _active_session[gw_key] = session_id
+    else:
+        with _sessions_lock:
+            _active_session[gw_key] = session_id
 
 
 def _get_session(session_id: str = None, gateway_session_key: str = "", strict: bool = False):
@@ -160,6 +204,84 @@ def _get_session_by_workdir(workdir: str, gateway_session_key: str = ""):
     return None
 
 
+def _resolve_target_session(args: dict, gw_key: str):
+    """根据 args 中的 session_id / name 解析目标会话。
+
+    优先级：session_id > name > _active_session[gw_key] > 最近会话。
+    返回 (mgr, error_json) 元组，mgr 为 None 时 error_json 非空。
+    """
+    sid = args.get("session_id")
+    name = args.get("name")
+
+    if sid:
+        mgr = _get_session(sid, gateway_session_key=gw_key, strict=True)
+        if mgr is None:
+            return None, tool_error(f"Session '{sid}' not found in registry.")
+        return mgr, None
+
+    if name:
+        with _sessions_lock:
+            resolved_id = _name_index.get((gw_key, name))
+        if not resolved_id:
+            return None, tool_error(f"No session named '{name}' in current gateway context.")
+        mgr = _get_session(resolved_id, gateway_session_key=gw_key, strict=True)
+        if mgr is None:
+            return None, tool_error(f"Session '{name}' (id={resolved_id[:8]}) no longer exists.")
+        return mgr, None
+
+    # 无指定时回退到 _active_session 或最近会话
+    mgr = _get_session(None, gateway_session_key=gw_key)
+    if mgr is None:
+        return None, tool_error("No active session. Use 'start' first.")
+    return mgr, None
+
+
+def _list_sessions(gateway_key: str) -> dict:
+    """列出当前 gateway 下的所有 session，包含名称、workdir 和状态。"""
+    sessions = []
+    with _sessions_lock:
+        for sid, mgr in _sessions.items():
+            if getattr(mgr, "_gateway_session_key", "") != gateway_key:
+                continue
+            # 优先从 mgr 属性读取 name，回退到 _name_index 反查
+            session_name = getattr(mgr, "_session_name", None)
+            if not session_name:
+                for (gk, n), mapped_sid in _name_index.items():
+                    if gk == gateway_key and mapped_sid == sid:
+                        session_name = n
+                        break
+            sessions.append({
+                "session_id": sid,
+                "name": session_name,
+                "workdir": getattr(mgr, "_workdir", None),
+                "state": mgr._sm.current_state if hasattr(mgr, "_sm") else "UNKNOWN",
+                "active": getattr(mgr, "_session_active", False),
+            })
+        active_id = _active_session.get(gateway_key)
+    return {
+        "sessions": sessions,
+        "active_session_id": active_id,
+        "total": len(sessions),
+    }
+
+
+def _switch_session(name: str, gateway_key: str) -> dict:
+    """切换活跃 session 到指定 name。"""
+    with _sessions_lock:
+        target_id = _name_index.get((gateway_key, name))
+        if not target_id:
+            return {"error": f"No session named '{name}' in current gateway context."}
+        target_mgr = _sessions.get(target_id)
+        if not target_mgr or not getattr(target_mgr, "_session_active", False):
+            return {"error": f"Session '{name}' exists but is not active (may have been stopped)."}
+        _active_session[gateway_key] = target_id
+    return {
+        "switched_to": name,
+        "session_id": target_id,
+        "state": target_mgr._sm.current_state if hasattr(target_mgr, "_sm") else "UNKNOWN",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -191,6 +313,7 @@ CLAUDE_SESSION_SCHEMA = {
                     "start", "send", "type", "submit", "cancel_input",
                     "status", "wait_for_idle", "wait_for_state",
                     "output", "respond_permission", "stop", "history", "events",
+                    "list", "switch",
                     "diagnose", "doctor_fix",
                 ],
                 "description": "Action to perform on the Claude session",
@@ -199,6 +322,10 @@ CLAUDE_SESSION_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": "目标会话ID（可选，默认最近活跃的会话）",
+            },
+            "name": {
+                "type": "string",
+                "description": "Named session identifier — used with start/list/switch/stop for multi-session management. Must be 1-64 chars, [a-zA-Z0-9_-].",
             },
             # start
             "workdir": {
@@ -288,7 +415,7 @@ CLAUDE_SESSION_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _handle_claude_session(args, **kw):
-    """Dispatch claude_session tool calls (支持多会话路由 + gateway session 隔离)."""
+    """Dispatch claude_session tool calls (支持多会话路由 + gateway session 隔离 + named sessions)."""
     action = args.get("action", "")
     gw_key = _get_gateway_session_key()
 
@@ -299,24 +426,39 @@ def _handle_claude_session(args, **kw):
         workdir = args.get("workdir", ".")
         abs_workdir = os.path.abspath(workdir)
         idx_key = (gw_key, abs_workdir)
+        session_name_arg = args.get("name")
 
-        # 基于 (gateway_session_key, workdir) 生成确定性 tmux session 名（除非显式指定）
+        # 验证 name（如果提供）
+        if session_name_arg:
+            err = _validate_session_name(session_name_arg, gw_key)
+            if err:
+                return json.dumps({"error": err}, ensure_ascii=False)
+
+        # 基于 (gateway_session_key, workdir[, name]) 生成确定性 tmux session 名
         sn = args.get("session_name")
         if not sn:
-            sn = _derive_session_name(abs_workdir, gw_key)
+            sn = _derive_session_name(abs_workdir, gw_key, name=session_name_arg)
 
         with _sessions_lock:
             # 检查 (gateway_key, workdir) 索引：同一 gateway session 下已有活跃会话则复用
             existing = _get_session_by_workdir(abs_workdir, gw_key)
             if existing and existing._session_active:
-                return json.dumps({
+                # 如果提供了 name，注册到 _name_index
+                if session_name_arg:
+                    _name_index[(gw_key, session_name_arg)] = existing._session_id
+                    existing._session_name = session_name_arg
+                _touch_active(gw_key, existing._session_id, already_locked=True)
+                resp = {
                     "session_id": existing._session_id,
                     "tmux_session": existing._tmux.session_name if existing._tmux else None,
                     "state": existing._sm.current_state,
                     "permission_mode": existing._permission_mode,
                     "claude_session_uuid": existing._claude_session_uuid,
                     "note": "Session already active for this workdir",
-                }, ensure_ascii=False)
+                }
+                if session_name_arg:
+                    resp["name"] = session_name_arg
+                return json.dumps(resp, ensure_ascii=False)
 
             # 预占槽位，防止并发 start 时双重创建
             _workdir_index[idx_key] = "__starting__"
@@ -324,6 +466,8 @@ def _handle_claude_session(args, **kw):
         try:
             mgr = ClaudeSessionManager()
             mgr._gateway_session_key = gw_key
+            if session_name_arg:
+                mgr._session_name = session_name_arg
             result = mgr.start(
                 workdir=abs_workdir,
                 session_name=sn,
@@ -346,29 +490,54 @@ def _handle_claude_session(args, **kw):
                 with _sessions_lock:
                     _sessions[sid] = mgr
                     _workdir_index[idx_key] = sid
+                    if session_name_arg:
+                        _name_index[(gw_key, session_name_arg)] = sid
+                _touch_active(gw_key, sid)
                 # Attach status observer for this gateway session (per-key isolation).
-                # Bind the observer via default parameter so the lambda captures the
-                # correct callback at creation time — NOT the global dict at call time.
-                # Hold lock during observer read to prevent TOCTOU race.
                 with _status_observers_lock:
                     _observer = _status_observers.get(gw_key)
                 if _observer:
                     mgr._status_callback = (
                         lambda info, _sid=sid, _obs=_observer: _safe_call_observer(_obs, _sid, info)
                     )
+                # 返回结果中附带 name
+                if session_name_arg:
+                    result["name"] = session_name_arg
         else:
             # 启动失败时清理占位
             with _sessions_lock:
                 _workdir_index.pop(idx_key, None)
         return json.dumps(result, ensure_ascii=False)
 
+    # ── list：列出当前 gateway 下的所有会话 ──
+    if action == "list":
+        result = _list_sessions(gw_key)
+        return json.dumps(result, ensure_ascii=False)
+
+    # ── switch：切换活跃会话 ──
+    if action == "switch":
+        name = args.get("name")
+        if not name:
+            return tool_error("name is required for switch action")
+        result = _switch_session(name, gw_key)
+        return json.dumps(result, ensure_ascii=False)
+
     # ── stop：停止并从注册表和索引移除 ──
     if action == "stop":
         specified_id = args.get("session_id")
+        name = args.get("name")
+
+        # name → 解析 session_id
+        if name and not specified_id:
+            with _sessions_lock:
+                specified_id = _name_index.get((gw_key, name))
+            if not specified_id:
+                return tool_error(f"No session named '{name}' in current gateway context.")
+
         mgr = _get_session(specified_id, gateway_session_key=gw_key, strict=bool(specified_id))
         if mgr is None:
             return tool_error(
-                f"Session '{specified_id}' not found in registry. "
+                f"Session '{specified_id or name}' not found in registry. "
                 "It may have been lost after a gateway restart. "
                 "Use tmux directly to clean up orphaned sessions."
             )
@@ -376,12 +545,20 @@ def _handle_claude_session(args, **kw):
         mgr._status_callback = None
         result = mgr.stop()
         if result.get("stopped"):
+            stopped_id = result.get("session_id")
             with _sessions_lock:
-                _sessions.pop(result.get("session_id"), None)
-                # 清理索引
-                stale_keys = [k for k, v in _workdir_index.items() if v == result.get("session_id")]
+                _sessions.pop(stopped_id, None)
+                # 清理 _workdir_index
+                stale_keys = [k for k, v in _workdir_index.items() if v == stopped_id]
                 for k in stale_keys:
                     _workdir_index.pop(k, None)
+                # 清理 _name_index
+                name_keys = [k for k, v in _name_index.items() if v == stopped_id]
+                for k in name_keys:
+                    _name_index.pop(k, None)
+                # 清理 _active_session（如果指向刚停止的会话）
+                if _active_session.get(gw_key) == stopped_id:
+                    _active_session.pop(gw_key, None)
         return json.dumps(result, ensure_ascii=False)
 
     # ── diagnose：不需要会话实例 ──
@@ -397,8 +574,8 @@ def _handle_claude_session(args, **kw):
         )
         return json.dumps(result, ensure_ascii=False)
 
-    # ── 其他动作：通过 _get_session 路由到对应实例（按 gateway session 隔离）──
-    mgr = _get_session(args.get("session_id"), gateway_session_key=gw_key)
+    # ── 其他动作：通过 _resolve_target_session 路由（支持 session_id / name / 活跃回退）──
+    mgr, resolve_err = _resolve_target_session(args, gw_key)
     if mgr is None:
         # 只读查询 action：无会话时返回优雅默认值
         if action == "status":
@@ -409,7 +586,11 @@ def _handle_claude_session(args, **kw):
             return json.dumps({"events": []}, ensure_ascii=False)
         if action == "history":
             return json.dumps({"total_turns": 0, "turns": []}, ensure_ascii=False)
-        return tool_error("No active session. Use 'start' first.")
+        return resolve_err or tool_error("No active session. Use 'start' first.")
+
+    # 交互类 action 更新 _active_session
+    if action in ("send", "type", "submit", "respond_permission", "cancel_input"):
+        _touch_active(gw_key, mgr._session_id)
 
     if action == "send":
         message = args.get("message")
@@ -453,7 +634,7 @@ def _handle_claude_session(args, **kw):
             f"Unknown action: {action}. "
             "Valid: start, send, type, submit, cancel_input, status, "
             "wait_for_idle, wait_for_state, output, respond_permission, "
-            "stop, history, events, diagnose, doctor_fix"
+            "stop, history, events, list, switch, diagnose, doctor_fix"
         )
 
     return json.dumps(result, ensure_ascii=False)

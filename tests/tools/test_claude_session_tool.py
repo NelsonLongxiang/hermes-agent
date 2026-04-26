@@ -24,6 +24,7 @@ class TestSchema:
             "start", "send", "type", "submit", "cancel_input",
             "status", "wait_for_idle", "wait_for_state",
             "output", "respond_permission", "stop", "history", "events",
+            "list", "switch",
             "diagnose", "doctor_fix",
         ]
         assert set(actions) == set(expected)
