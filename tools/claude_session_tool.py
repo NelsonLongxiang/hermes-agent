@@ -550,7 +550,44 @@ def _diagnose_claude_session() -> dict:
         "value": claude_version or "unknown",
         "required": False,
     })
-    
+
+    # 6. 残留 tmux session 检测
+    orphaned_sessions = []
+    if tmux_path:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["tmux", "list-sessions"], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                with _sessions_lock:
+                    known_tmux_names = set()
+                    for mgr in _sessions.values():
+                        if mgr._tmux:
+                            known_tmux_names.add(mgr._tmux.session_name)
+
+                for line in result.stdout.strip().splitlines():
+                    name = line.split(":")[0].strip()
+                    if name.startswith("hermes-") and name not in known_tmux_names:
+                        orphaned_sessions.append(name)
+
+            orphan_count = len(orphaned_sessions)
+            checks.append({
+                "dependency": "orphaned tmux sessions",
+                "status": "ok" if orphan_count == 0 else "warning",
+                "value": f"{orphan_count} orphaned session(s)" if orphan_count else "none",
+                "sessions": orphaned_sessions[:10],  # 最多显示 10 个
+                "hint": (
+                    "Orphaned hermes-* sessions detected. These may cause startup hangs. "
+                    "Clean up with: tmux kill-session -t <name>  "
+                    "or kill all: for s in $(tmux list-sessions 2>/dev/null | grep '^hermes-' | cut -d: -f1); do tmux kill-session -t \"$s\"; done"
+                    if orphan_count > 0 else None
+                ),
+                "required": False,
+            })
+        except Exception:
+            pass
+
     return {
         "status": "ready" if all_ok else "missing_deps",
         "checks": checks,

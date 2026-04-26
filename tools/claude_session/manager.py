@@ -229,18 +229,47 @@ class ClaudeSessionManager:
                         self._tmux.create_session(workdir=workdir)
                         _needs_init = True
                     else:
-                        # tmux session 存在且 workdir 匹配，检查 Claude Code 是否还在运行
-                        has_claude = "claude code" in pane_lower or "❯" in pane[-200:]
-                        if not has_claude:
+                        # tmux session 存在且 workdir 匹配，检查 Claude Code
+                        # 状态是否可以安全复用。
+                        #
+                        # 旧逻辑仅检查 "❯" 是否出现在 pane 中，但 Claude Code
+                        # TUI 在 THINKING/TOOL_CALL 状态时也会在底部渲染
+                        # phantom "❯"，导致误判为 Claude Code 空闲可复用。
+                        # 复用一个卡在 THINKING 的 session 会导致 poller
+                        # 从 DISCONNECTED 开始，状态解析无法匹配，wait_for_idle
+                        # 一直等待直到超时。
+                        #
+                        # 修复：使用 OutputParser.detect_state() 精确检测真实状态，
+                        # 仅 IDLE 状态才安全复用。其他状态（THINKING、TOOL_CALL、
+                        # PERMISSION 等）一律 kill + 重建。
+                        _pane_lines = OutputParser.clean_lines(pane)
+                        _parse_result = OutputParser.detect_state(_pane_lines)
+                        _detected_state = _parse_result.state
+
+                        if _detected_state == "IDLE":
+                            # 真正的 IDLE — 安全复用
                             logger.info(
-                                "tmux session %s exists but no Claude Code running. Recreating.",
+                                "tmux session %s exists, Claude Code in IDLE state. Reusing.",
                                 session_name,
+                            )
+                        else:
+                            # 非 IDLE（THINKING/TOOL_CALL/PERMISSION/DISCONNECTED/ERROR）
+                            # 或者没有 Claude Code 进程（空 pane → 默认 THINKING）
+                            # → 一律 kill + 重建，避免复用卡住的 session
+                            _reason = (
+                                f"non-IDLE state: {_detected_state}"
+                                if _detected_state != "THINKING"
+                                or _pane_lines
+                                else "no Claude Code running"
+                            )
+                            logger.warning(
+                                "tmux session %s exists but %s. Killing and recreating.",
+                                session_name, _reason,
                             )
                             self._tmux.kill_session()
                             time.sleep(0.5)
                             self._tmux.create_session(workdir=workdir)
                             _needs_init = True
-                        # else: Claude Code 正在运行且 workdir 匹配，复用
 
                 # ── Phase 2: 如果需要，启动 Claude Code 进程 ──
                 if _needs_init:
@@ -284,6 +313,31 @@ class ClaudeSessionManager:
                             time.sleep(0.3)
                             self._tmux.send_special_key("Enter")
                             time.sleep(1)
+
+                    # ── 启动健康检查 ──
+                    # Claude Code 启动后等待其进入可用状态（IDLE 或 THINKING）。
+                    # 如果超时未检测到有效状态，说明启动失败（CLI 崩溃、依赖缺失等）。
+                    _STARTUP_HEALTH_TIMEOUT = 30  # 秒
+                    _startup_ok = self._wait_for_claude_startup(
+                        timeout=_STARTUP_HEALTH_TIMEOUT,
+                    )
+                    if not _startup_ok:
+                        logger.error(
+                            "Claude Code failed to start within %ds in session %s. "
+                            "Killing tmux session.",
+                            _STARTUP_HEALTH_TIMEOUT, session_name,
+                        )
+                        try:
+                            self._tmux.kill_session()
+                        except Exception:
+                            pass
+                        return {
+                            "error": (
+                                f"Claude Code did not start within {_STARTUP_HEALTH_TIMEOUT}s. "
+                                "Possible causes: CLI not installed, API key missing, "
+                                "or tmux resource exhaustion. Check tmux session manually."
+                            ),
+                        }
 
             except Exception as e:
                 return {"error": f"Failed to start session: {e}"}
@@ -1002,6 +1056,80 @@ class ClaudeSessionManager:
         if self._current_turn:
             result["turn"] = self._current_turn.to_dict()
         return result
+
+    def _wait_for_claude_startup(self, timeout: int = 30) -> bool:
+        """等待 Claude Code 进程启动并进入可用状态。
+
+        启动后通过 OutputParser 检测 pane 输出，判断 Claude Code 是否
+        成功启动。仅需要检测到 IDLE 或 THINKING 即视为成功。
+
+        在 THINKING 状态时，需要额外验证 pane 中确实有 Claude Code
+        相关的输出（而非空 pane 默认返回 THINKING）。
+
+        Args:
+            timeout: 最大等待秒数。
+
+        Returns:
+            True 表示启动成功，False 表示超时。
+        """
+        deadline = time.monotonic() + timeout
+        _EMPTY_THRESHOLD = 3  # 少于此行数视为空 pane
+
+        while time.monotonic() < deadline:
+            try:
+                pane = self._tmux.capture_pane(lines=100)
+                lines = OutputParser.clean_lines(pane)
+
+                if not lines or len(lines) < _EMPTY_THRESHOLD:
+                    # 空 pane — Claude Code 还没开始输出
+                    time.sleep(1.0)
+                    continue
+
+                result = OutputParser.detect_state(lines)
+
+                if result.state == "IDLE":
+                    logger.info(
+                        "Claude Code startup OK: IDLE detected after %.1fs",
+                        timeout - (deadline - time.monotonic()),
+                    )
+                    return True
+
+                if result.state in ("THINKING", "TOOL_CALL", "PERMISSION"):
+                    # THINKING 可能是空 pane 的默认值，验证是否有 Claude Code 特征
+                    pane_lower = pane.lower()
+                    has_claude_signature = (
+                        "claude" in pane_lower
+                        or "model" in pane_lower
+                        or "thinking" in pane_lower
+                        or "permission" in pane_lower
+                        or "●" in pane
+                        or "❯" in pane
+                    )
+                    if has_claude_signature:
+                        logger.info(
+                            "Claude Code startup OK: %s detected after %.1fs",
+                            result.state,
+                            timeout - (deadline - time.monotonic()),
+                        )
+                        return True
+
+                if result.state == "ERROR":
+                    logger.error(
+                        "Claude Code startup failed: ERROR detected in pane. "
+                        "Output: %s",
+                        pane[-200:],
+                    )
+                    return False
+
+            except Exception as e:
+                logger.debug("Startup health check poll error: %s", e)
+
+            time.sleep(1.0)
+
+        logger.warning(
+            "Claude Code startup health check timed out after %ds", timeout,
+        )
+        return False
 
     def _check_progress(self) -> dict:
         """检测当前 Claude 工作进度。

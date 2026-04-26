@@ -19,7 +19,21 @@ class TestStart:
     def test_start_creates_session(self, MockTmux, manager):
         mock_tmux = MagicMock()
         mock_tmux.session_exists.return_value = False
-        mock_tmux.capture_pane.return_value = "❯ "
+        # 模拟 Claude Code 已启动并显示 IDLE 状态
+        mock_tmux.capture_pane.return_value = """╭─── Claude Code v2.1.107 ─────────────────────────────────────────────────────╮
+│                                  │ Tips for getting started                  │
+│           Welcome back!          │ Run /init to create a CLAUDE.md file wit… │
+│                                  │ ───────────────────────────────────────── │
+│              ▐▛███▜▌             │ Recent activity                           │
+│             ▝▜█████▛▘            │ No recent activity                        │
+│               ▘▘ ▝▝              │                                           │
+│                                  │                                           │
+│    glm-5 · API Usage Billing     │                                           │
+│   /tmp/test                      │                                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+"""
         MockTmux.return_value = mock_tmux
 
         result = manager.start(workdir="/tmp/test")
@@ -102,6 +116,8 @@ class TestStatus:
     def test_status_with_session(self, MockTmux, manager):
         mock_tmux = MagicMock()
         mock_tmux.session_exists.return_value = True
+        # 提供有效的 Claude Code 输出，让 poller 不将状态设为 DISCONNECTED
+        mock_tmux.capture_pane.return_value = "╭─── Claude Code v2.1.107 ───────────────────────────────────╮\n│           Welcome back!          │ Recent activity                │\n╰───────────────────────────────────────────────────────────────────────╯\n❯ "
         MockTmux.return_value = mock_tmux
 
         manager.start(workdir="/tmp/test")
