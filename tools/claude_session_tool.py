@@ -751,7 +751,20 @@ def _doctor_fix_skills() -> dict:
         "step": "compare_content",
         "result": diff_result["summary"],
         "details": diff_result["details"],
+        "summary_human": _format_diff_summary_human(diff_result),
     })
+
+    # 顶层 diff_summary，便于外层快速概览差异
+    report["diff_summary"] = {
+        "total_files": len(_list_skill_files(user_skill_dir))
+                       + len([f for f in _list_skill_files(project_skill_dir)
+                              if f not in _list_skill_files(user_skill_dir)]),
+        "differing_files": len(diff_result["details"]),
+        "newer_in_project": [d["file"] for d in diff_result["details"]
+                             if d["status"] in ("project_newer", "missing_in_user")],
+        "newer_in_user": [d["file"] for d in diff_result["details"]
+                          if d["status"] in ("user_newer", "missing_in_project")],
+    }
 
     if diff_result["identical"]:
         # 情况 D：完全一致 → 替换为软链接
@@ -968,6 +981,25 @@ def _diff_summary(file_a: str, file_b: str) -> str:
     except (subprocess.TimeoutExpired, FileNotFoundError,
             subprocess.SubprocessError):
         return "files differ"
+
+
+def _format_diff_summary_human(diff_result: dict) -> str:
+    """生成人类可读的差异摘要。"""
+    if diff_result["identical"]:
+        return "All files identical"
+
+    parts = []
+    for d in diff_result["details"]:
+        if d["status"] == "project_newer":
+            parts.append(f"[project_newer] {d['file']} ({d['project_mtime']}, {d.get('diff_summary', '')})")
+        elif d["status"] == "user_newer":
+            parts.append(f"[user_newer] {d['file']} ({d['user_mtime']}, {d.get('diff_summary', '')})")
+        elif d["status"] == "missing_in_user":
+            parts.append(f"[project_only] {d['file']}")
+        elif d["status"] == "missing_in_project":
+            parts.append(f"[user_only] {d['file']}")
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
