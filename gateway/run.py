@@ -9697,12 +9697,14 @@ class GatewayRunner:
                     except Exception as _e:
                         logger.debug("claude session status bridge error: %s", _e)
 
+                _saved_gw_key = _get_gateway_session_key()
                 register_status_observer(
                     _claude_session_status_bridge,
-                    gateway_session_key=_get_gateway_session_key(),
+                    gateway_session_key=_saved_gw_key,
                 )
             except Exception as _e:
                 logger.debug("Could not set up claude session status bridge: %s", _e)
+                _saved_gw_key = _get_gateway_session_key()
 
         def run_sync():
             # The conditional re-assignment of `message` further below
@@ -10861,12 +10863,9 @@ class GatewayRunner:
 
             # Clean up claude session status observer and finalize message
             try:
-                from tools.claude_session_tool import (
-                    unregister_status_observer,
-                    _get_gateway_session_key,
-                )
+                from tools.claude_session_tool import unregister_status_observer
                 unregister_status_observer(
-                    gateway_session_key=_get_gateway_session_key(),
+                    gateway_session_key=_saved_gw_key,
                 )
             except Exception:
                 pass

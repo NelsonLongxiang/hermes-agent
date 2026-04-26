@@ -11,6 +11,12 @@ from typing import Optional
 
 from tools.registry import registry, tool_error, tool_result
 
+# Module-level import of gateway session context — avoids repeated import on hot path.
+try:
+    from gateway.session_context import get_session_env
+except ImportError:
+    get_session_env = None
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -53,13 +59,13 @@ def _get_gateway_session_key() -> str:
     优先从 contextvars 读取（gateway 模式，每个 Telegram 群聊独立），
     回退到 os.environ（CLI/cron 模式），都为空则返回空串（无隔离）。
     """
-    try:
-        from gateway.session_context import get_session_env
-        key = get_session_env("HERMES_SESSION_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
+    if get_session_env is not None:
+        try:
+            key = get_session_env("HERMES_SESSION_KEY", "")
+            if key:
+                return key
+        except Exception:
+            pass
     return os.environ.get("HERMES_SESSION_KEY", "")
 
 
@@ -352,6 +358,8 @@ def _handle_claude_session(args, **kw):
                 "It may have been lost after a gateway restart. "
                 "Use tmux directly to clean up orphaned sessions."
             )
+        # Clear callback before stop to prevent late callbacks to cleaned-up resources.
+        mgr._status_callback = None
         result = mgr.stop()
         if result.get("stopped"):
             with _sessions_lock:
