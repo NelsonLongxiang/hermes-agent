@@ -997,18 +997,26 @@ class ClaudeSessionManager:
         """Build status info dict for the status callback."""
         now = time.monotonic()
         tool_calls_dicts = []
+        turn_id = None
+        elapsed_seconds = 0
+
         if self._current_turn:
             tool_calls_dicts = [tc.to_dict() for tc in self._current_turn.tool_calls]
+            turn_id = self._current_turn.turn_id
+            elapsed_seconds = now - self._current_turn.start_time
+        elif self._turn_history:
+            # 会话完成后，从历史记录获取最后一个 turn 的信息
+            last_turn = self._turn_history[-1]
+            turn_id = last_turn.turn_id
+            elapsed_seconds = last_turn.total_duration
+            tool_calls_dicts = [tc.to_dict() for tc in last_turn.tool_calls]
 
         return {
             "state": self._sm.current_state,
             "tool_name": None,
             "tool_target": None,
-            "turn_id": self._current_turn.turn_id if self._current_turn else None,
-            "elapsed_seconds": (
-                (now - self._current_turn.start_time)
-                if self._current_turn else 0
-            ),
+            "turn_id": turn_id,
+            "elapsed_seconds": elapsed_seconds,
             "tool_calls": tool_calls_dicts,
             "recent_output": self._buf.last_n_chars(200),
         }
