@@ -27,6 +27,14 @@ class UserPromptInfo:
     raw_context: str       # Raw TUI text around the prompt
 
 
+@dataclass
+class StartupScene:
+    """Detected startup scene requiring special handling before Claude Code is fully initialized."""
+    scene_type: str   # "workspace_trust" | "bypass_confirm"
+    description: str
+    action: str       # "press_enter" | "press_down_enter"
+
+
 # Regex patterns
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?m")
 _TOOL_CALL_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
@@ -63,6 +71,25 @@ _SELECTED_OPTION_RE = re.compile(r"^❯\s*(\d+)\.\s*(.+)$")
 _UNSELECTED_OPTION_RE = re.compile(r"^\s*(\d+)\.\s+(.+)$")
 _TYPE_SOMETHING_RE = re.compile(r"Type something", re.IGNORECASE)
 _QUESTION_END_RE = re.compile(r"[?？]$")
+
+# Startup scene detection patterns
+# "Quick safety check" is unique to Claude Code's workspace trust prompt.
+_TRUST_WORKSPACE_RE = re.compile(
+    r"quick\s+safety\s+check",
+    re.IGNORECASE,
+)
+_ENTER_TO_CONFIRM_RE = re.compile(
+    r"enter\s+to\s+confirm",
+    re.IGNORECASE,
+)
+
+# Claude Code TUI signature patterns — present when Claude is running
+_CLAUDE_TUI_SIGNATURE_RE = re.compile(
+    r"(claude|thinking|compacting|bypass permissions|"
+    r"shift\+tab to cycle|esc to interrupt|/model|/mcp|"
+    r"⏵⏵|welcome to claude)",
+    re.IGNORECASE,
+)
 
 
 class OutputParser:
@@ -173,6 +200,12 @@ class OutputParser:
                         if not has_done_marker:
                             continue
 
+                # Final check: distinguish shell prompt from Claude IDLE.
+                # If ❯ has NO Claude Code TUI decorations around it, it's a
+                # shell prompt (Claude has exited), not Claude's IDLE prompt.
+                if OutputParser._is_shell_prompt(lines):
+                    return ParseResult(state="EXITED")
+
                 return ParseResult(state="IDLE")
 
         # Check COMPACT — compact 操作期间状态通常是 THINKING
@@ -181,6 +214,48 @@ class OutputParser:
 
         # Default: THINKING
         return ParseResult(state="THINKING")
+
+    @staticmethod
+    def _is_shell_prompt(lines: list) -> bool:
+        """Check if output is a bare shell prompt (Claude Code has exited).
+
+        When Claude Code exits, the tmux pane returns to the shell. If the
+        shell prompt happens to be ❯ (common with zsh/starship themes), it
+        could be confused with Claude's IDLE prompt.
+
+        Key distinction: Claude Code's TUI always renders decorations near
+        the ❯ prompt (separator lines, status bar, tool markers). A bare
+        shell prompt has NONE of these in its immediate vicinity.
+
+        IMPORTANT: Only checks the last ~5 lines, not the entire scrollback.
+        After Claude exits, old TUI output may persist in tmux scrollback
+        history. Checking the entire buffer would produce false negatives.
+        The shell prompt is always at the bottom; if its immediate context
+        has no TUI elements, Claude has exited regardless of old history.
+        """
+        if not lines:
+            return False
+
+        # Only examine recent lines near the ❯ prompt
+        window = lines[-5:] if len(lines) >= 5 else lines
+
+        # Must have ❯ in the recent window
+        if not any("❯" in l for l in window):
+            return False
+
+        window_text = "\n".join(window)
+
+        # Check for Claude Code TUI signatures in the recent window only
+        has_separator = any(_DECORATION_RE.search(l.strip()) for l in window)
+        has_status_bar = any(_STATUS_BAR_RE.search(l) for l in window)
+        has_tool_markers = any("●" in l for l in window)
+        has_done_marker = any(_DONE_TIME_RE.search(l) for l in window)
+        has_claude_signature = bool(_CLAUDE_TUI_SIGNATURE_RE.search(window_text))
+
+        if has_separator or has_status_bar or has_tool_markers or has_done_marker or has_claude_signature:
+            return False
+
+        return True
 
     @staticmethod
     def _parse_tool_line(line: str) -> Optional[dict]:
@@ -476,3 +551,29 @@ class OutputParser:
             has_other=False,
             raw_context=raw_context,
         )
+
+    @staticmethod
+    def detect_startup_scene(lines: list) -> Optional["StartupScene"]:
+        """Detect startup scenes that require special handling.
+
+        Only applies during Claude Code initialization, before the normal
+        IDLE/THINKING states are reached. Detects interactive prompts that
+        block startup, such as workspace trust confirmation.
+
+        Returns None if no startup scene is detected.
+        """
+        if not lines:
+            return None
+
+        all_text = "\n".join(lines)
+
+        # Workspace trust prompt: "Quick safety check" + "Enter to confirm"
+        if _TRUST_WORKSPACE_RE.search(all_text):
+            if _ENTER_TO_CONFIRM_RE.search(all_text):
+                return StartupScene(
+                    scene_type="workspace_trust",
+                    description="Workspace trust confirmation prompt",
+                    action="press_enter",
+                )
+
+        return None

@@ -11,7 +11,7 @@ from tools.claude_session.state_machine import (
 
 class TestClaudeState:
     def test_all_states_defined(self):
-        expected = {"IDLE", "INPUTTING", "THINKING", "TOOL_CALL", "PERMISSION", "ERROR", "DISCONNECTED"}
+        expected = {"IDLE", "INPUTTING", "THINKING", "TOOL_CALL", "PERMISSION", "ERROR", "DISCONNECTED", "EXITED"}
         assert set(ClaudeState.ALL) == expected
 
     def test_poll_intervals(self):
@@ -79,11 +79,22 @@ class TestIsValidTransition:
 
     def test_any_to_error(self):
         for state in ClaudeState.ALL:
+            if state == "EXITED":
+                # EXITED can only go to IDLE (restart) or DISCONNECTED
+                continue
             assert is_valid_transition(state, "ERROR")
 
     def test_any_to_disconnected(self):
         for state in ClaudeState.ALL:
+            if state == "EXITED":
+                continue
             assert is_valid_transition(state, "DISCONNECTED")
+
+    def test_any_to_exited(self):
+        for state in ClaudeState.ALL:
+            if state == "EXITED":
+                continue
+            assert is_valid_transition(state, "EXITED")
 
     def test_idle_to_inputting(self):
         assert is_valid_transition("IDLE", "INPUTTING")

@@ -252,6 +252,17 @@ class ClaudeSessionManager:
                                 "tmux session %s exists, Claude Code in IDLE state. Reusing.",
                                 session_name,
                             )
+                        elif _detected_state == "EXITED":
+                            # Claude Code 已退出（检测到 shell 提示符）
+                            logger.warning(
+                                "tmux session %s exists but Claude Code has exited (shell prompt). "
+                                "Killing and recreating.",
+                                session_name,
+                            )
+                            self._tmux.kill_session()
+                            time.sleep(0.5)
+                            self._tmux.create_session(workdir=workdir)
+                            _needs_init = True
                         else:
                             # 非 IDLE（THINKING/TOOL_CALL/PERMISSION/DISCONNECTED/ERROR）
                             # 或者没有 Claude Code 进程（空 pane → 默认 THINKING）
@@ -596,6 +607,15 @@ class ClaudeSessionManager:
                     "status": "disconnected",
                 }
 
+            if state == ClaudeState.EXITED:
+                self._wait_state = None
+                return {
+                    "error": "Claude Code has exited (shell prompt detected)",
+                    "state": state,
+                    "status": "exited",
+                    "hint": "Claude Code process is no longer running. Restart the session to continue.",
+                }
+
             now = time.monotonic()
             current_tokens = self._buf.total_count()
 
@@ -845,6 +865,16 @@ class ClaudeSessionManager:
                     })
                     self._current_turn = None
 
+                elif transition.to_state == ClaudeState.EXITED:
+                    self._current_turn.finalize()
+                    self._turn_history.append(self._current_turn)
+                    self._fire_event("session_exited", {
+                        "turn_id": self._current_turn.turn_id,
+                        "duration": self._current_turn.total_duration,
+                        "tool_calls": [tc.to_dict() for tc in self._current_turn.tool_calls],
+                    })
+                    self._current_turn = None
+
             # Fire state_changed event
             self._fire_event("state_changed", {
                 "from_state": transition.from_state,
@@ -1066,6 +1096,9 @@ class ClaudeSessionManager:
         在 THINKING 状态时，需要额外验证 pane 中确实有 Claude Code
         相关的输出（而非空 pane 默认返回 THINKING）。
 
+        启动场景检测：在状态检测之前，检查是否有需要自动处理的启动
+        交互（如工作区信任确认）。检测到后自动确认，继续等待正常启动。
+
         Args:
             timeout: 最大等待秒数。
 
@@ -1074,6 +1107,8 @@ class ClaudeSessionManager:
         """
         deadline = time.monotonic() + timeout
         _EMPTY_THRESHOLD = 3  # 少于此行数视为空 pane
+        _startup_scene_attempts = 0
+        _MAX_STARTUP_SCENE_ATTEMPTS = 3
 
         while time.monotonic() < deadline:
             try:
@@ -1083,6 +1118,28 @@ class ClaudeSessionManager:
                 if not lines or len(lines) < _EMPTY_THRESHOLD:
                     # 空 pane — Claude Code 还没开始输出
                     time.sleep(1.0)
+                    continue
+
+                # 启动场景检测（优先于状态检测）
+                # 某些启动交互（如工作区信任确认）会阻止 Claude Code
+                # 正常启动，需要自动确认后才能进入 IDLE/THINKING 状态。
+                startup_scene = OutputParser.detect_startup_scene(lines)
+                if startup_scene and _startup_scene_attempts < _MAX_STARTUP_SCENE_ATTEMPTS:
+                    _startup_scene_attempts += 1
+                    logger.info(
+                        "Startup scene detected: %s (action: %s, attempt %d/%d)",
+                        startup_scene.description,
+                        startup_scene.action,
+                        _startup_scene_attempts,
+                        _MAX_STARTUP_SCENE_ATTEMPTS,
+                    )
+                    if startup_scene.action == "press_enter":
+                        self._tmux.send_special_key("Enter")
+                    elif startup_scene.action == "press_down_enter":
+                        self._tmux.send_special_key("Down")
+                        time.sleep(0.3)
+                        self._tmux.send_special_key("Enter")
+                    time.sleep(2.0)
                     continue
 
                 result = OutputParser.detect_state(lines)
@@ -1118,6 +1175,12 @@ class ClaudeSessionManager:
                         "Claude Code startup failed: ERROR detected in pane. "
                         "Output: %s",
                         pane[-200:],
+                    )
+                    return False
+
+                if result.state == "EXITED":
+                    logger.error(
+                        "Claude Code exited immediately after launch (shell prompt detected)."
                     )
                     return False
 

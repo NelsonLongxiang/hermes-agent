@@ -1,7 +1,7 @@
 """Tests for tools/claude_session/output_parser.py"""
 
 import pytest
-from tools.claude_session.output_parser import OutputParser, ParseResult, UserPromptInfo
+from tools.claude_session.output_parser import OutputParser, ParseResult, UserPromptInfo, StartupScene
 
 
 class TestAnsiStrip:
@@ -24,12 +24,24 @@ class TestAnsiStrip:
 
 class TestDetectState:
     def test_idle_with_prompt(self):
-        lines = ["some output", "❯ "]
+        lines = [
+            "✻ Churned for 2m 57s",
+            "──────────────────────",
+            "❯ ",
+            "──────────────────────",
+            "⏵⏵ bypass permissions on",
+        ]
         result = OutputParser.detect_state(lines)
         assert result.state == "IDLE"
 
     def test_idle_with_typed_text(self):
-        lines = ["some output", "❯ fix the bug"]
+        lines = [
+            "✻ Churned for 2m 57s",
+            "──────────────────────",
+            "❯ fix the bug",
+            "──────────────────────",
+            "⏵⏵ bypass permissions on",
+        ]
         result = OutputParser.detect_state(lines)
         assert result.state == "IDLE"
 
@@ -210,8 +222,15 @@ class TestCompactDetection:
         assert result.is_compacting is False
 
     def test_no_compact_with_idle_prompt(self):
-        """IDLE prompt has higher priority than compact."""
-        lines = ["Compacting done", "❯ "]
+        """IDLE prompt has higher priority than compact when TUI is present."""
+        lines = [
+            "✻ Churned for 2m 57s",
+            "Compacting done",
+            "──────────",
+            "❯ ",
+            "──────────",
+            "⏵⏵ bypass permissions on",
+        ]
         result = OutputParser.detect_state(lines)
         assert result.state == "IDLE"
         assert result.is_compacting is False
@@ -454,3 +473,192 @@ class TestDetectUserPrompt:
         assert "Pick an option:" in result.raw_context
         assert "Option A" in result.raw_context
         assert "Option B" in result.raw_context
+
+
+class TestDetectExited:
+    """Tests for EXITED state detection — shell prompt when Claude has exited."""
+
+    def test_bare_shell_prompt(self):
+        """Bare ❯ with no TUI elements → EXITED."""
+        lines = ["❯"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "EXITED"
+
+    def test_shell_prompt_with_whitespace(self):
+        """Shell prompt with trailing whitespace → EXITED."""
+        lines = ["❯  "]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "EXITED"
+
+    def test_shell_prompt_with_previous_output(self):
+        """Previous shell output + bare ❯ → EXITED."""
+        lines = ["some previous output", "❯"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "EXITED"
+
+    def test_shell_prompt_with_text(self):
+        """Shell prompt with typed text but no TUI → EXITED."""
+        lines = ["some output", "❯ fix the bug"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "EXITED"
+
+    def test_not_exited_with_separators(self):
+        """❯ with separator lines + done marker → IDLE, not EXITED."""
+        lines = ["✻ Churned for 2m 57s", "──────────", "❯", "──────────"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
+    def test_not_exited_with_status_bar(self):
+        """❯ with status bar text → IDLE, not EXITED."""
+        lines = ["❯", "bypass permissions on"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
+    def test_not_exited_with_tool_marker(self):
+        """❯ with tool marker (●) → TOOL_CALL, not EXITED."""
+        lines = ["● Edit src/auth.py", "❯"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "TOOL_CALL"
+
+    def test_not_exited_with_done_marker(self):
+        """❯ with done marker (✻) → IDLE, not EXITED."""
+        lines = ["✻ Churned for 2m 57s", "❯"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
+    def test_not_exited_with_claude_signature(self):
+        """❯ with 'claude' text → not EXITED."""
+        lines = ["Welcome to Claude Code", "❯"]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
+    def test_full_tui_idle_not_exited(self):
+        """Full Claude Code TUI IDLE → not EXITED."""
+        lines = [
+            "✻ Churned for 2m 57s",
+            "──────────────────────",
+            "❯",
+            "──────────────────────",
+            "⏵⏵ bypass permissions on · shift+tab to cycle · esc to interrupt",
+        ]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
+    def test_shell_prompt_with_old_scrollback_is_exited(self):
+        """Shell prompt at bottom with old Claude output in scrollback → EXITED.
+
+        After Claude exits, tmux scrollback may contain old TUI output (done
+        markers, separators, status bar, tool markers). Only the recent lines
+        near ❯ matter — old content should not prevent EXITED detection.
+        """
+        lines = [
+            # Old scrollback from previous Claude session (>10 lines above)
+            "✻ Churned for 2m 57s",
+            "──────────────────────",
+            "⏵⏵ bypass permissions on",
+            "● Read src/auth.py",
+            "Welcome to Claude Code",
+            # Enough filler to push tool markers outside 10-line scan window
+            "response line 1",
+            "response line 2",
+            "response line 3",
+            "response line 4",
+            "response line 5",
+            "response line 6",
+            "response line 7",
+            # Shell output after Claude exited (recent lines)
+            "logout",
+            "some shell output",
+            "❯",
+        ]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "EXITED"
+
+
+class TestDetectStartupScene:
+    """Tests for detect_startup_scene() — startup scene detection."""
+
+    def test_workspace_trust_prompt_detected(self):
+        """Full trust prompt should be detected as workspace_trust scene."""
+        lines = [
+            "Accessing workspace:",
+            "",
+            "\\wsl.localhost\\Ubuntu-22.04\\home\\longxiang\\CLIProxyAPI",
+            "",
+            "Quick safety check: Is this a project you created or one you trust?",
+            "(Like your own code, a well-known open source project, or work from your team).",
+            "If not, take a moment to review what's in this folder first.",
+            "",
+            "Claude Code'll be able to read, edit, and execute files here.",
+            "",
+            "Security guide",
+            "",
+            "❯ 1. Yes, I trust this folder",
+            "  2. No, exit",
+            "",
+            "Enter to confirm · Esc to cancel",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is not None
+        assert result.scene_type == "workspace_trust"
+        assert result.action == "press_enter"
+
+    def test_workspace_trust_minimal(self):
+        """Minimal trust prompt with key phrases."""
+        lines = [
+            "Quick safety check: Is this a project you created or one you trust?",
+            "❯ 1. Yes, I trust this folder",
+            "  2. No, exit",
+            "Enter to confirm · Esc to cancel",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is not None
+        assert result.scene_type == "workspace_trust"
+
+    def test_workspace_trust_already_confirmed(self):
+        """Trust prompt without 'Enter to confirm' should NOT be detected."""
+        lines = [
+            "Quick safety check: Is this a project you created or one you trust?",
+            "❯ 1. Yes, I trust this folder",
+            "  2. No, exit",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is None
+
+    def test_no_startup_scene_normal_idle(self):
+        """Normal IDLE output should not trigger startup scene detection."""
+        lines = [
+            "some output",
+            "✻ Cogitated for 5m 43s",
+            "❯ ",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is None
+
+    def test_no_startup_scene_permission(self):
+        """Permission prompt should not trigger startup scene detection."""
+        lines = [
+            "Allow Edit to src/auth.py?",
+            "❯ Allow",
+            "  Deny",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is None
+
+    def test_no_startup_scene_empty(self):
+        """Empty lines should return None."""
+        result = OutputParser.detect_startup_scene([])
+        assert result is None
+
+    def test_trust_prompt_with_prefix_content(self):
+        """Trust prompt detection works with unrelated content above."""
+        lines = [
+            "Some unrelated startup output",
+            "Quick safety check: Is this a project you created or one you trust?",
+            "❯ 1. Yes, I trust this folder",
+            "  2. No, exit",
+            "Enter to confirm",
+        ]
+        result = OutputParser.detect_startup_scene(lines)
+        assert result is not None
+        assert result.scene_type == "workspace_trust"

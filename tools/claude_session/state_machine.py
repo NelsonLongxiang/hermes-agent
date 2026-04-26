@@ -16,9 +16,10 @@ class ClaudeState:
     PERMISSION = "PERMISSION"
     ERROR = "ERROR"
     DISCONNECTED = "DISCONNECTED"
+    EXITED = "EXITED"
 
     ALL = frozenset({
-        IDLE, INPUTTING, THINKING, TOOL_CALL, PERMISSION, ERROR, DISCONNECTED,
+        IDLE, INPUTTING, THINKING, TOOL_CALL, PERMISSION, ERROR, DISCONNECTED, EXITED,
     })
 
     ACTIVE_STATES = frozenset({THINKING, TOOL_CALL, PERMISSION})
@@ -32,6 +33,7 @@ class ClaudeState:
         PERMISSION: 0.3,
         ERROR: 1.0,
         DISCONNECTED: 5.0,
+        EXITED: 5.0,
     }
 
     # TUI output patterns for state detection
@@ -45,25 +47,26 @@ class ClaudeState:
 
 # Valid state transitions (from → set of allowed to states)
 VALID_TRANSITIONS: dict = {
-    ClaudeState.DISCONNECTED: {ClaudeState.IDLE, ClaudeState.ERROR, ClaudeState.DISCONNECTED},
-    ClaudeState.IDLE: {ClaudeState.THINKING, ClaudeState.INPUTTING, ClaudeState.DISCONNECTED, ClaudeState.ERROR},
-    ClaudeState.INPUTTING: {ClaudeState.THINKING, ClaudeState.IDLE, ClaudeState.DISCONNECTED, ClaudeState.ERROR},
+    ClaudeState.DISCONNECTED: {ClaudeState.IDLE, ClaudeState.ERROR, ClaudeState.DISCONNECTED, ClaudeState.EXITED},
+    ClaudeState.IDLE: {ClaudeState.THINKING, ClaudeState.INPUTTING, ClaudeState.DISCONNECTED, ClaudeState.ERROR, ClaudeState.EXITED},
+    ClaudeState.INPUTTING: {ClaudeState.THINKING, ClaudeState.IDLE, ClaudeState.DISCONNECTED, ClaudeState.ERROR, ClaudeState.EXITED},
     ClaudeState.THINKING: {
         ClaudeState.TOOL_CALL, ClaudeState.PERMISSION, ClaudeState.IDLE,
-        ClaudeState.ERROR, ClaudeState.DISCONNECTED,
+        ClaudeState.ERROR, ClaudeState.DISCONNECTED, ClaudeState.EXITED,
     },
     ClaudeState.TOOL_CALL: {
         ClaudeState.THINKING, ClaudeState.PERMISSION, ClaudeState.IDLE,
-        ClaudeState.ERROR, ClaudeState.DISCONNECTED,
+        ClaudeState.ERROR, ClaudeState.DISCONNECTED, ClaudeState.EXITED,
     },
     ClaudeState.PERMISSION: {
         ClaudeState.THINKING, ClaudeState.IDLE,
-        ClaudeState.ERROR, ClaudeState.DISCONNECTED,
+        ClaudeState.ERROR, ClaudeState.DISCONNECTED, ClaudeState.EXITED,
     },
     ClaudeState.ERROR: {
         ClaudeState.THINKING, ClaudeState.IDLE,
-        ClaudeState.DISCONNECTED, ClaudeState.ERROR,
+        ClaudeState.DISCONNECTED, ClaudeState.ERROR, ClaudeState.EXITED,
     },
+    ClaudeState.EXITED: {ClaudeState.IDLE, ClaudeState.DISCONNECTED, ClaudeState.EXITED},
 }
 
 

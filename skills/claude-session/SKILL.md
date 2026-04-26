@@ -43,8 +43,63 @@ v3.0 引入 **Named Sessions**：通过用户友好的名称管理多个并行 C
 
 **核心概念**：
 - **name**: 1-64 字符，`[a-zA-Z0-9_-]`，同一 gateway 下唯一
+  - **必填参数**：start action 必须提供 name
+  - 语义化命名：如 `frontend`、`backend`、`code-review`、`test-suite`
+  - 避免自动生成：`hermes-{hash}` 格式已废弃
 - **active session**: 每个 gateway 记录最近交互的会话，无显式指定时自动路由
 - **路由优先级**: `session_id` > `name` > 活跃会话 > 最近创建的会话
+
+### 设计哲学（第一性原理）
+
+**为什么 name 必须必填？**
+
+问题：自动生成 `hermes-7935c242` 这样的会话名增加了认知负担
+- 不可读，无法快速识别用途
+- 多会话场景下难以区分
+- 不符合"明确会话用途"的原则
+
+方案：强制用户提供语义化名称
+- 优势1：启动前必须思考"这个会话做什么"
+- 优势2：名称即文档，一目了然用途
+- 优势3：多会话管理清晰，避免混淆
+- 优势4：并行场景下用不同 name 区分相同 workdir
+
+**workdir 参数仍然重要**
+- 指定会话的工作目录（文件操作都在此目录）
+- 可选参数，不提供时使用当前目录 `.`
+- 不阻止并行会话：相同 workdir + 不同 name 允许并行
+- 反向查找：便于从 workdir 找到对应的会话
+
+### 索引策略
+
+**变更前（v2.x）**：
+- 主索引：`(gateway_key, workdir)`
+- 限制：相同 workdir 只能有一个会话
+- 复用逻辑：检测到相同 workdir 的活跃会话时复用
+
+**变更后（v3.1+）**：
+- 主索引：`(gateway_key, name)`
+- 优势：同一 workdir 可以有多个不同 name 的会话
+- 唯一性：相同 name 不能重复创建
+- 反向索引：`(gateway_key, workdir)` 仅用于从路径查找会话
+
+### 破坏性变更（2026-04-26）
+
+**影响范围**：`start` action
+- 所有 start 调用必须包含 `name` 参数
+- 不再支持自动生成 `hermes-{hash}` 格式的会话名
+- 相同 workdir 可以创建多个不同 name 的会话（支持真正的并行）
+
+**迁移示例**：
+```python
+# ❌ v2.x：旧方式（不再支持）
+claude_session(start, workdir="/project")  # 错误：name is required
+
+# ✅ v3.1+：新方式（必须使用）
+claude_session(start, name="frontend", workdir="/project/web")
+claude_session(start, name="backend",  workdir="/project/api")
+claude_session(start, name="review",   workdir="/project")
+```
 
 ## When to Use
 
@@ -255,7 +310,7 @@ claude_session(action="send", message="""
 
 ## State Awareness
 
-The tool tracks 7 states:
+The tool tracks 8 states:
 - **IDLE**: Claude is waiting for input (you can send)
 - **INPUTTING**: Text being typed (not yet sent)
 - **THINKING**: Claude is reasoning
@@ -263,6 +318,7 @@ The tool tracks 7 states:
 - **PERMISSION**: Claude needs permission approval
 - **ERROR**: Something went wrong
 - **DISCONNECTED**: tmux session lost
+- **EXITED**: Claude Code process has exited (shell prompt detected, needs restart)
 
 Use `status` to check current state at any time.
 
@@ -447,29 +503,18 @@ tmux capture-pane -t claude-work -p -S -3000 2>/dev/null > /tmp/claude_output.tx
 然后用 `read_file` 读取并过滤。
 
 ### 陷阱5：首次进入新项目目录的 Trust Prompt
-**现象**：首次在某个项目目录启动 Claude Code 时，会弹出 "Quick safety check: Is this a project you created or one you trust?" 交互式选择界面。如果此时 `send` 的消息被当作 shell 命令执行（如 `1: command not found`），会话将无法正常使用。
-**原因**：Claude Code 的 trust 选择界面不是标准输入，tmux send-keys 发送的文本会被 shell 解释而非 Claude Code 的选择器接收。
-**应对（按优先级）**：
-**方法1：提前预确认（推荐）**
-```bash
-# 在启动 claude_session 之前，先在终端手动完成 trust 确认
-cd /目标/项目/目录
-echo -e "1\nq" | claude --permission-mode bypassPermissions 2>&1 | head -20
-# 然后启动 claude_session，trust 状态已记录，直接进入 IDLE
-```
+**现象**：首次在某个项目目录启动 Claude Code 时，会弹出 "Quick safety check: Is this a project you created or one you trust?" 交互式选择界面。
+**原因**：Claude Code 首次访问未信任的工作区目录时需要用户确认。
+**自动处理（已实现）**：
+- `_wait_for_claude_startup()` 中的启动场景检测会自动识别 Trust Prompt
+- 检测到后自动按 Enter 确认默认选项（"Yes, I trust this folder"）
+- 最多尝试 3 次自动确认，避免无限循环
+- 信任确认后 Claude Code 正常启动进入 IDLE 状态
 
-**方法2：停止并重试**
-- 如果遇到 `1: command not found` 或类似错误，说明 trust prompt 处理失败
-- 用 `stop` 终止当前会话，然后 `start` 重新启动
-- Trust 状态通常已被记录，第二次启动会直接进入 IDLE
-
-**方法3：发送空消息**
-- 如果第二次启动仍然出现 trust prompt，尝试 `claude_session(action="send", message="")` 发送空消息
-- 可能会触发默认行为或让 prompt 消失
-
-**预防**：
-- 如果知道是新目录，先在终端手动运行一次 `claude --permission-mode bypassPermissions` 完成信任确认
-- 使用 `--permission-mode bypassPermissions` 可以减少额外的权限弹窗
+**如果自动处理失败**（极少见）：
+1. 用 `stop` 终止当前会话，然后 `start` 重新启动
+2. Trust 状态通常已被自动确认记录，第二次启动会直接进入 IDLE
+3. 如果仍然失败，手动预确认：`cd /目标目录 && claude --permission-mode bypassPermissions`
 
 ### 陷阱6：多步任务中的连续 Permission 响应
 **现象**：Claude 在执行多步任务时（如文档更新 + 代码修改 + 测试），每个步骤都可能触发 Permission 状态，需要多次批准。
@@ -767,16 +812,22 @@ When `wait_for_idle` returns `PERMISSION` state:
 
 ### start
 ```
-claude_session(action="start", workdir="/path", name="my-task",
+claude_session(action="start", name="my-task", workdir="/path",
                session_name="claude-work",
                model="sonnet", permission_mode="skip", on_event="notify")
 ```
 
-**name 参数**（v3.0 新增）：
-- 为会话分配一个人类可读的名称，用于后续 `switch`/`stop`/`send` 路由
-- 不指定 name 时，会话仍可正常工作（通过 session_id 或活跃会话路由）
-- name 会纳入 tmux session 名的哈希计算，同 workdir 不同 name 生成不同 tmux 名
+**name 参数**（必填）：
+- **必填参数**：start action 必须提供 name，否则返回错误
+- 语义化命名：用于 `switch`/`stop`/`send` 路由和会话识别
+- 示例：`frontend`、`backend`、`code-review`、`test-suite`
 - 规则：1-64 字符，仅 `[a-zA-Z0-9_-]`，同一 gateway 下唯一
+- **不指定 name 会返回错误**：`"name is required for 'start' action. Provide a meaningful name to identify the session."`
+
+**workdir 参数**（可选但重要）：
+- 指定会话的工作目录（文件操作都在此目录）
+- 可选参数，不提供时使用当前目录 `.`
+- 不阻止并行会话：相同 workdir + 不同 name 允许并行
 
 ### send (atomic)
 ```
