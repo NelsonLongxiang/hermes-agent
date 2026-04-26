@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Session Registry（支持并行运行多个独立会话 + gateway session 隔离）
 # ---------------------------------------------------------------------------
 _sessions: dict = {}   # session_id → ClaudeSessionManager 实例
-_workdir_index: dict = {}  # (gateway_key, workdir) → session_id 反向索引
-_name_index: dict[tuple[str, str], str] = {}  # (gateway_key, name) → session_id
+_workdir_index: dict[tuple[str, str], list[str]] = {}  # (gateway_key, workdir) → list[session_id] (一对多，同一 workdir 支持多个会话)
+_name_index: dict[tuple[str, str], str] = {}  # (gateway_key, name) → session_id (主索引)
 _active_session: dict[str, str] = {}  # gateway_key → session_id (最近活跃)
 _sessions_lock = threading.Lock()
 
@@ -459,7 +459,9 @@ def _handle_claude_session(args, **kw):
 
             # 预占槽位，防止并发 start 时双重创建
             _name_index[(gw_key, session_name_arg)] = "__starting__"
-            _workdir_index[(gw_key, abs_workdir)] = "__starting__"  # workdir 索引仅用于反向查找
+            workdir_idx_key = (gw_key, abs_workdir)
+            existing_list = _workdir_index.get(workdir_idx_key, [])
+            _workdir_index[workdir_idx_key] = existing_list + ["__starting__"]  # 添加占位符到列表
 
         try:
             mgr = ClaudeSessionManager()
@@ -478,7 +480,13 @@ def _handle_claude_session(args, **kw):
             # 启动异常时清理占位
             with _sessions_lock:
                 _name_index.pop((gw_key, session_name_arg), None)
-                _workdir_index.pop((gw_key, abs_workdir), None)
+                workdir_idx_key = (gw_key, abs_workdir)
+                session_list = _workdir_index.get(workdir_idx_key, [])
+                # 从列表中移除占位符（只移除一个，避免影响其他并发启动）
+                if "__starting__" in session_list:
+                    updated_list = session_list.copy()
+                    updated_list.remove("__starting__")
+                    _workdir_index[workdir_idx_key] = updated_list
             return json.dumps({"error": f"Failed to create session: {e}"}, ensure_ascii=False)
 
         # 仅启动成功时注册到会话表和索引
@@ -488,7 +496,14 @@ def _handle_claude_session(args, **kw):
                 with _sessions_lock:
                     _sessions[sid] = mgr
                     _name_index[(gw_key, session_name_arg)] = sid  # 基于 name 的主索引
-                    _workdir_index[(gw_key, abs_workdir)] = sid  # workdir 反向索引
+                    workdir_idx_key = (gw_key, abs_workdir)
+                    session_list = _workdir_index.get(workdir_idx_key, [])
+                    # 将占位符替换为实际的 session_id，或添加到列表
+                    if "__starting__" in session_list:
+                        updated_list = [sid if x == "__starting__" else x for x in session_list]
+                        _workdir_index[workdir_idx_key] = updated_list
+                    else:
+                        _workdir_index[workdir_idx_key] = session_list + [sid]
                 _touch_active(gw_key, sid)
                 # Attach status observer for this gateway session (per-key isolation).
 
