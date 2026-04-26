@@ -116,6 +116,33 @@ class TestDetectState:
         result = OutputParser.detect_state(lines)
         assert result.state != "PERMISSION"
 
+    def test_idle_with_done_marker_early_and_phantom_prompt(self):
+        """Regression: done marker in early output, phantom ❯ in last 5 lines.
+
+        The TUI shows the completion marker well above the bottom area.
+        The ❯ at the bottom is surrounded by separators but should still be
+        recognized as IDLE because a done marker exists in earlier lines.
+        The tool call line is scrolled outside the recent-10 window.
+        """
+        lines = [
+            "● Edit src/auth.py",          # tool call (scrolled out of recent 10)
+            "✻ Cogitated for 5m 43s",      # done marker (early)
+            "Here is the result:",           # response text
+            "some more output",
+            "and more output",
+            "line 6",
+            "line 7",
+            "line 8",
+            "line 9",
+            "line 10",
+            "────────────────────",          # separator above ❯
+            "❯",                            # prompt (sandwiched)
+            "────────────────────",          # separator below ❯
+            "⏵⏵ bypass permissions on...",
+        ]
+        result = OutputParser.detect_state(lines)
+        assert result.state == "IDLE"
+
 
 class TestCompactDetection:
     """Tests for compact operation detection in output_parser."""

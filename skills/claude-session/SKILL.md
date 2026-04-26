@@ -553,6 +553,71 @@ echo -e "1\nq" | claude --permission-mode bypassPermissions 2>&1 | head -20
 - 连续 3 次 `respond_permission("allow")` 才恢复正常
 - 如果立即重启会话，会丢失已完成的代码审查进度
 
+### 陷阱11：detect_state() 错误判断 THINKING 而非 IDLE（2026-04-26 补充）
+**现象**：
+- Claude Code TUI 显示欢迎界面和 `❯` 提示符，明确是 IDLE 状态
+- 但 `claude_session(action="status")` 返回 "THINKING"，无法发送任务
+- 手动查看 tmux pane 可以看到 completion markers 如 "✻ Cogitated for 5m 43s" 或 "✻ Beaming…"
+**根因**：
+- `tools/claude_session/output_parser.py` 的 `detect_state()` 方法中，IDLE 检测逻辑只检查最后5行（`last_lines`）
+- 当 `❯` 被分隔线包围时，代码认为是 phantom prompt（幻影提示符）
+- 检查 completion markers 时，范围限制在 `last_lines[:prompt_idx]`（5行窗口内）
+- 但实际 completion markers 出现在更早的历史行中（`lines[:prompt_idx]`），不在5行窗口内
+- 导致 `has_done_marker = False`，误判为幻影提示符，返回 THINKING
+
+**具体场景**：
+```
+（更早的输出，包含完成标记 "✻ Cogitated for 5m 43s"）
+───────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+```
+
+当 `prompt_idx = 2`（在5行中），`last_lines[:2]` 只有：
+```
+[空行]
+───────────────────────────────────────────────────────────────────────────────
+```
+
+不包含完成标记，所以被误判为幻影提示符。
+
+**诊断方法**：
+1. 使用 `execute_code` 模拟 tmux 输出和 regex 匹配逻辑
+2. 确认 `last_lines` 的范围和内容
+3. 检查 `has_done_marker` 的检查范围是否过小
+4. 验证实际 completion markers 出现的位置
+
+**修复方案**：
+修改 `tools/claude_session/output_parser.py` 第168-173行：
+```python
+# 错误代码（当前）：
+has_done_marker = any(
+    _DONE_TIME_RE.search(l)
+    for l in last_lines[:prompt_idx]  # ❌ 只检查最后5行
+)
+if not has_done_marker:
+    continue
+
+# 正确代码（修复后）：
+has_done_marker = any(
+    _DONE_TIME_RE.search(l)
+    for l in lines[:prompt_idx]  # ✅ 检查所有历史行
+)
+if not has_done_marker:
+    continue
+```
+
+**验证步骤**：
+1. 修复后运行测试：`pytest tests/tools/test_claude_session_parser.py -v`
+2. 手动验证：启动 Claude session，检查 `status` 命令是否能正确识别 IDLE 状态
+3. 确保不破坏其他状态的检测逻辑（PERMISSION、TOOL_CALL、ERROR）
+
+**预防**：
+- 遇到状态判断错误时，优先用 `execute_code` 模拟验证
+- 检查正则表达式和范围限制是否符合预期
+- 不要假设代码逻辑正确，实际场景可能触发边界条件
+
 ## Permission Handling (normal mode)
 
 When `wait_for_idle` returns `PERMISSION` state:

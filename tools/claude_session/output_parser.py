@@ -165,9 +165,10 @@ class OutputParser:
                         # Possible phantom — but check for completion time indicator
                         # above the separators. "✻ ... for Xm Xs" means Claude
                         # finished its response and the ❯ is a real idle prompt.
+                        global_prompt_idx = len(lines) - len(last_lines) + prompt_idx
                         has_done_marker = any(
                             _DONE_TIME_RE.search(l)
-                            for l in last_lines[:prompt_idx]
+                            for l in lines[:global_prompt_idx]
                         )
                         if not has_done_marker:
                             continue
