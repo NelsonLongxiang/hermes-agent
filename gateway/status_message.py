@@ -75,6 +75,16 @@ class StatusMessageManager:
         if self._edit_count >= self._MAX_EDITS_PER_SESSION:
             return
 
+        # Auto-bump: if we have an existing message and state changed significantly,
+        # delete it so the new message appears at the bottom of the chat
+        if (
+            self._message_id is not None
+            and new_state is not None
+            and new_state != self._last_state
+            and new_state in ("THINKING", "TOOL_CALL", "IDLE")
+        ):
+            await self.bump()
+
         text = self._format_status(status_info)
 
         try:
@@ -134,6 +144,26 @@ class StatusMessageManager:
             )
         except Exception:
             pass
+
+    async def bump(self) -> None:
+        """Delete the status message so next update() sends a fresh one at bottom.
+
+        When new messages arrive in the chat, call this to delete the current
+        status message. The next update() call will send a new message at the
+        bottom of the chat where the user can see it.
+        """
+        if not self._message_id:
+            return
+        try:
+            await self._adapter.delete_message(
+                chat_id=self._chat_id,
+                message_id=self._message_id,
+            )
+            self._message_id = None
+            self._edit_count = 0
+            logger.debug("Status message bumped (deleted) due to new message")
+        except Exception as e:
+            logger.debug("Failed to bump status message: %s", e)
 
     def _handle_edit_failure(self, result) -> None:
         """Handle an edit failure — track flood strikes."""
