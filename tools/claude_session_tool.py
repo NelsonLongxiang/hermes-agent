@@ -295,7 +295,7 @@ CLAUDE_SESSION_SCHEMA = {
         "- Complex multi-file coding tasks (refactoring, feature implementation)\n"
         "- Tasks requiring real-time monitoring and mid-task intervention\n"
         "- Long-running Claude Code sessions with state tracking\n"
-        "- Any task where you need to see and control Claude's progress\n\n"
+        "- Multiple named sessions for parallel development (name is REQUIRED for 'start')\n\n"
         "WHEN NOT TO USE:\n"
         "- Simple shell commands -> use terminal\n"
         "- Non-Claude reasoning tasks -> use delegate_task\n"
@@ -325,7 +325,7 @@ CLAUDE_SESSION_SCHEMA = {
             },
             "name": {
                 "type": "string",
-                "description": "Named session identifier — used with start/list/switch/stop for multi-session management. Must be 1-64 chars, [a-zA-Z0-9_-].",
+                "description": "Named session identifier — REQUIRED. Used with start/list/switch/stop for multi-session management. Must be 1-64 chars, [a-zA-Z0-9_-].",
             },
             # start
             "workdir": {
@@ -419,55 +419,52 @@ def _handle_claude_session(args, **kw):
     action = args.get("action", "")
     gw_key = _get_gateway_session_key()
 
-    # ── start：创建新实例并注册（gateway session + workdir 联合隔离）──
+    # ── start：创建新实例并注册（name 必填 + workdir 可选）──
     if action == "start":
         from tools.claude_session.manager import ClaudeSessionManager
 
+        # name 必须提供（第一性原理：明确会话用途，避免自动命名的混淆）
+        session_name_arg = args.get("name")
+        if not session_name_arg:
+            return json.dumps({"error": "name is required for 'start' action. Provide a meaningful name to identify the session."}, ensure_ascii=False)
+
+        # 验证 name
+        err = _validate_session_name(session_name_arg, gw_key)
+        if err:
+            return json.dumps({"error": err}, ensure_ascii=False)
+
         workdir = args.get("workdir", ".")
         abs_workdir = os.path.abspath(workdir)
-        idx_key = (gw_key, abs_workdir)
-        session_name_arg = args.get("name")
+        idx_key = (gw_key, session_name_arg)  # 改为基于 name 的索引键
 
-        # 验证 name（如果提供）
-        if session_name_arg:
-            err = _validate_session_name(session_name_arg, gw_key)
-            if err:
-                return json.dumps({"error": err}, ensure_ascii=False)
-
-        # 基于 (gateway_session_key, workdir[, name]) 生成确定性 tmux session 名
-        sn = args.get("session_name")
-        if not sn:
-            sn = _derive_session_name(abs_workdir, gw_key, name=session_name_arg)
+        # 生成确定性 tmux session 名（基于 name，不再依赖 workdir）
+        sn = _derive_session_name(abs_workdir, gw_key, name=session_name_arg)
 
         with _sessions_lock:
-            # 检查 (gateway_key, workdir) 索引：同一 gateway session 下已有活跃会话则复用
-            existing = _get_session_by_workdir(abs_workdir, gw_key)
-            if existing and existing._session_active:
-                # 如果提供了 name，注册到 _name_index
-                if session_name_arg:
-                    _name_index[(gw_key, session_name_arg)] = existing._session_id
-                    existing._session_name = session_name_arg
-                _touch_active(gw_key, existing._session_id, already_locked=True)
+            # 检查 (gateway_key, name) 索引：同一 name 不能重复创建
+            existing_sid = _name_index.get((gw_key, session_name_arg))
+            if existing_sid and existing_sid in _sessions and _sessions[existing_sid]._session_active:
+                _touch_active(gw_key, existing_sid, already_locked=True)
+                existing_mgr = _sessions[existing_sid]
                 resp = {
-                    "session_id": existing._session_id,
-                    "tmux_session": existing._tmux.session_name if existing._tmux else None,
-                    "state": existing._sm.current_state,
-                    "permission_mode": existing._permission_mode,
-                    "claude_session_uuid": existing._claude_session_uuid,
-                    "note": "Session already active for this workdir",
+                    "session_id": existing_sid,
+                    "tmux_session": existing_mgr._tmux.session_name if existing_mgr._tmux else None,
+                    "state": existing_mgr._sm.current_state,
+                    "permission_mode": existing_mgr._permission_mode,
+                    "claude_session_uuid": existing_mgr._claude_session_uuid,
+                    "note": f"Session '{session_name_arg}' already active",
+                    "name": session_name_arg,
                 }
-                if session_name_arg:
-                    resp["name"] = session_name_arg
                 return json.dumps(resp, ensure_ascii=False)
 
             # 预占槽位，防止并发 start 时双重创建
-            _workdir_index[idx_key] = "__starting__"
+            _name_index[(gw_key, session_name_arg)] = "__starting__"
+            _workdir_index[(gw_key, abs_workdir)] = "__starting__"  # workdir 索引仅用于反向查找
 
         try:
             mgr = ClaudeSessionManager()
             mgr._gateway_session_key = gw_key
-            if session_name_arg:
-                mgr._session_name = session_name_arg
+            mgr._session_name = session_name_arg
             result = mgr.start(
                 workdir=abs_workdir,
                 session_name=sn,
@@ -480,7 +477,8 @@ def _handle_claude_session(args, **kw):
         except Exception as e:
             # 启动异常时清理占位
             with _sessions_lock:
-                _workdir_index.pop(idx_key, None)
+                _name_index.pop((gw_key, session_name_arg), None)
+                _workdir_index.pop((gw_key, abs_workdir), None)
             return json.dumps({"error": f"Failed to create session: {e}"}, ensure_ascii=False)
 
         # 仅启动成功时注册到会话表和索引
@@ -489,11 +487,11 @@ def _handle_claude_session(args, **kw):
             if sid:
                 with _sessions_lock:
                     _sessions[sid] = mgr
-                    _workdir_index[idx_key] = sid
-                    if session_name_arg:
-                        _name_index[(gw_key, session_name_arg)] = sid
+                    _name_index[(gw_key, session_name_arg)] = sid  # 基于 name 的主索引
+                    _workdir_index[(gw_key, abs_workdir)] = sid  # workdir 反向索引
                 _touch_active(gw_key, sid)
                 # Attach status observer for this gateway session (per-key isolation).
+
                 with _status_observers_lock:
                     _observer = _status_observers.get(gw_key)
                 if _observer:
