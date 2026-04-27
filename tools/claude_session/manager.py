@@ -647,6 +647,13 @@ class ClaudeSessionManager:
 
     def cancel_input(self) -> dict:
         """Cancel current input (Ctrl+C)."""
+        logger.warning(
+            "cancel_input called for session %s (state=%s). "
+            "Repeated cancellations indicate micromanagement. "
+            "Consider: is Claude really stuck, or am I being impatient?",
+            self._session_id,
+            self._sm.current_state if hasattr(self._sm, 'current_state') else 'UNKNOWN'
+        )
         with self._lock:
             if not self._session_active:
                 return {"error": "No active session"}

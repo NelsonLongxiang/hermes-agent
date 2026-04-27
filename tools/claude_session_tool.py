@@ -308,7 +308,14 @@ CLAUDE_SESSION_SCHEMA = {
         "- One-shot quick questions -> use terminal with 'claude -p'\n\n"
         "Provides real-time state awareness (IDLE/THINKING/TOOL_CALL/PERMISSION), "
         "turn-level tracking, atomic send, and permission handling.\n"
-        "Load 'claude-session' skill for detailed workflows and troubleshooting."
+        "Load 'claude-session' skill for detailed workflows and troubleshooting.\n\n"
+        "COLLABORATION PRINCIPLES (IMPORTANT):\n"
+        "- Claude is a COOPERATOR, not a subordinate\n"
+        "- After delegating a task via send(), trust Claude to complete it autonomously\n"
+        "- Avoid frequent checks/interrupts — this breaks collaboration efficiency\n"
+        "- Only cancel if Claude is truly stuck (no output for 10+ minutes)\n"
+        "- Before cancelling, analyze why Claude hasn't responded\n"
+        "- If you must cancel, note the reason — repeated cancellations indicate micromanagement"
     ),
     "parameters": {
         "type": "object",
