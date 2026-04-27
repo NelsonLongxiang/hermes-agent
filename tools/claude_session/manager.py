@@ -782,6 +782,7 @@ class ClaudeSessionManager:
             pane_text = self._tmux.capture_pane()
             pane_lines = OutputParser.clean_lines(pane_text)
             parse_result = OutputParser.detect_state(pane_lines)
+            activity_info = OutputParser.detect_activity(pane_lines)
             if getattr(parse_result, 'is_compacting', False) and not self._wait_state["compact_detected"]:
                 self._wait_state["compact_detected"] = True
                 self._wait_state["compact_start_time"] = now
@@ -827,7 +828,7 @@ class ClaudeSessionManager:
                     "wait_for_idle patrol: elapsed=%.0fs, state=%s, token_delta=%d",
                     elapsed, state, patrol_delta,
                 )
-                return {
+                progress_result = {
                     "status": "progress",
                     "state": state,
                     "elapsed_seconds": round(elapsed, 1),
@@ -839,6 +840,10 @@ class ClaudeSessionManager:
                         "call wait_for_idle again to continue waiting, or inspect output/status first."
                     ),
                 }
+                if activity_info and activity_info.get("activity") != "idle":
+                    progress_result["current_activity"] = activity_info["activity"]
+                    progress_result["activity_detail"] = activity_info.get("detail", "")
+                return progress_result
 
             # ── 自适应轮询间隔 ──
             stall_duration = now - self._wait_state["last_growth_time"]
@@ -1086,7 +1091,7 @@ class ClaudeSessionManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _handle_state_change(self, transition: StateTransition, prompt_info=None) -> None:
+    def _handle_state_change(self, transition: StateTransition, prompt_info=None, activity_info=None) -> None:
         """Called by poller on state changes. Updates turns and fires events.
 
         Runs in the poller background thread. All shared state mutations
@@ -1181,6 +1186,10 @@ class ClaudeSessionManager:
             try:
                 status_info["tool_name"] = getattr(transition, "tool_name", None)
                 status_info["tool_target"] = getattr(transition, "tool_target", None)
+                # Include activity info from poller
+                if activity_info and activity_info.get("activity") != "idle":
+                    status_info["current_activity"] = activity_info["activity"]
+                    status_info["activity_detail"] = activity_info.get("detail", "")
                 # Enrich with permission details for PERMISSION transitions
                 if permission_details:
                     status_info["needs_permission"] = True

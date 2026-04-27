@@ -101,8 +101,61 @@ _CLAUDE_TUI_SIGNATURE_RE = re.compile(
 )
 
 
+# Claude TUI activity detection patterns
+# tool_call (● markers) first — text patterns would otherwise match inside "● Read file.py"
+_ACTIVITY_PATTERNS = [
+    ("tool_call", re.compile(r"●\s+(\w+)(?:\s+(.+))?")),
+    ("reading", re.compile(r"(?:Read|Reading)\s+([^\n]+)")),
+    ("writing", re.compile(r"(?:Write|Writing)\s+([^\n]+)")),
+    ("executing", re.compile(r"(?:Bash|Executing|Running)\s+([^\n]+)")),
+    ("searching", re.compile(r"(?:Search|Grep|Searching|Globbing)\s+([^\n]+)")),
+    ("thinking", re.compile(r"(?:Thinking|Processing|Cogitating)")),
+]
+
+
 class OutputParser:
     """Static methods for parsing Claude Code TUI output from tmux capture-pane."""
+
+    @staticmethod
+    def detect_activity(lines: list) -> dict:
+        """Detect Claude's current activity from output lines.
+
+        Scans recent lines for activity indicators. More specific activities
+        (reading, writing, etc.) take priority over generic ones (thinking).
+
+        Returns:
+            dict with keys: activity, detail, raw
+        """
+        if not lines:
+            return {"activity": "idle", "detail": "", "raw": ""}
+
+        recent = lines[-20:] if len(lines) >= 20 else lines
+
+        # Check specific activities first (skip thinking — lowest priority)
+        for activity, pattern in _ACTIVITY_PATTERNS:
+            if activity == "thinking":
+                continue
+            for line in reversed(recent):
+                match = pattern.search(line)
+                if match:
+                    return {
+                        "activity": activity,
+                        "detail": match.group(1).strip() if match.groups() else "",
+                        "raw": line.strip(),
+                    }
+
+        # Thinking as fallback
+        for activity, pattern in _ACTIVITY_PATTERNS:
+            if activity == "thinking":
+                for line in reversed(recent):
+                    if pattern.search(line):
+                        return {
+                            "activity": "thinking",
+                            "detail": "",
+                            "raw": line.strip(),
+                        }
+
+        return {"activity": "idle", "detail": "", "raw": ""}
 
     @staticmethod
     def strip_ansi(text: str) -> str:

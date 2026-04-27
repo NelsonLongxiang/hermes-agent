@@ -84,7 +84,7 @@ class AdaptivePoller:
         if not self._tmux.session_exists():
             transition = self._sm.transition(ClaudeState.DISCONNECTED)
             if transition:
-                self._fire_callback(transition, None)
+                self._fire_callback(transition, None, None)
             return
 
         raw = self._tmux.capture_pane()
@@ -98,6 +98,9 @@ class AdaptivePoller:
         result = OutputParser.detect_state(lines)
         transition = self._sm.transition(result.state)
 
+        # Detect current activity
+        activity_info = OutputParser.detect_activity(lines)
+
         # Detect user-input prompt when in IDLE or PERMISSION state
         prompt_info: Optional[UserPromptInfo] = None
         if result.state in ("IDLE", "PERMISSION"):
@@ -106,24 +109,25 @@ class AdaptivePoller:
         if transition:
             transition.tool_name = result.tool_name
             transition.tool_target = result.tool_target
-            self._fire_callback(transition, prompt_info)
-        elif prompt_info:
-            # No state transition, but prompt detected — fire synthetic callback
+            self._fire_callback(transition, prompt_info, activity_info)
+        elif prompt_info or activity_info["activity"] != "idle":
+            # No state transition, but prompt or activity detected — fire synthetic callback
             synthetic = StateTransition(
                 from_state=self._sm.current_state,
                 to_state=self._sm.current_state,
                 timestamp=time.monotonic(),
             )
-            self._fire_callback(synthetic, prompt_info)
+            self._fire_callback(synthetic, prompt_info, activity_info)
 
     def _fire_callback(
         self,
         transition: StateTransition,
         prompt_info: Optional[UserPromptInfo],
+        activity_info: Optional[dict] = None,
     ) -> None:
         """Fire the state-change callback with backward compatibility.
 
-        Uses inspect.signature to detect whether the callback accepts 1 or 2
+        Uses inspect.signature to detect whether the callback accepts 1, 2, or 3
         parameters, calling it appropriately so old callbacks still work.
         """
         if not self._on_state_change:
@@ -133,7 +137,9 @@ class AdaptivePoller:
             param_count = len(sig.parameters)
         except (ValueError, TypeError):
             param_count = 1
-        if param_count >= 2:
+        if param_count >= 3:
+            self._on_state_change(transition, prompt_info, activity_info)
+        elif param_count >= 2:
             self._on_state_change(transition, prompt_info)
         else:
             self._on_state_change(transition)
