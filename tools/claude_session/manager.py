@@ -1104,8 +1104,13 @@ class ClaudeSessionManager:
         now = time.monotonic()
 
         with self._lock:
+            # Skip turn tracking for synthetic transitions (from_state == to_state).
+            # These are generated when activity is detected without an actual state
+            # change, and would otherwise create false ToolCall/cycle records.
+            is_synthetic = transition.from_state == transition.to_state
+
             # Update current turn
-            if self._current_turn:
+            if self._current_turn and not is_synthetic:
                 if transition.to_state == ClaudeState.TOOL_CALL:
                     tc = ToolCall(
                         tool_name=getattr(transition, "tool_name", "Unknown") or "Unknown",

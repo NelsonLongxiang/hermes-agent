@@ -101,16 +101,26 @@ _CLAUDE_TUI_SIGNATURE_RE = re.compile(
 )
 
 
-# Claude TUI activity detection patterns
-# tool_call (● markers) first — text patterns would otherwise match inside "● Read file.py"
-_ACTIVITY_PATTERNS = [
-    ("tool_call", re.compile(r"●\s+(\w+)(?:\s+(.+))?")),
-    ("reading", re.compile(r"(?:Read|Reading)\s+([^\n]+)")),
-    ("writing", re.compile(r"(?:Write|Writing)\s+([^\n]+)")),
-    ("executing", re.compile(r"(?:Bash|Executing|Running)\s+([^\n]+)")),
-    ("searching", re.compile(r"(?:Search|Grep|Searching|Globbing)\s+([^\n]+)")),
-    ("thinking", re.compile(r"(?:Thinking|Processing|Cogitating)")),
-]
+# Claude TUI activity detection — tool marker pattern only.
+# Fine-grained classification (reading/writing/executing/searching) is derived
+# from the tool NAME captured by this pattern, NOT from separate text regexes.
+# Text regexes were removed because they produce false positives on Claude's
+# natural language output (e.g. "I will Read the file" → false "reading").
+_TOOL_MARKER_RE = re.compile(r"^●\s+(\w+)(?:\s+(.+))?$")
+
+# Tool name → activity classification
+_TOOL_ACTIVITY_MAP = {
+    "Read": "reading",
+    "Write": "writing",
+    "Edit": "writing",
+    "MultiEdit": "writing",
+    "Bash": "executing",
+    "Grep": "searching",
+    "Glob": "searching",
+    "Search": "searching",
+    "WebSearch": "searching",
+    "WebFetch": "searching",
+}
 
 
 class OutputParser:
@@ -120,8 +130,8 @@ class OutputParser:
     def detect_activity(lines: list) -> dict:
         """Detect Claude's current activity from output lines.
 
-        Scans recent lines for activity indicators. More specific activities
-        (reading, writing, etc.) take priority over generic ones (thinking).
+        Scans recent lines for ● tool markers and classifies activity based on
+        the tool name. Falls back to thinking indicator detection.
 
         Returns:
             dict with keys: activity, detail, raw
@@ -131,29 +141,56 @@ class OutputParser:
 
         recent = lines[-20:] if len(lines) >= 20 else lines
 
-        # Check specific activities first (skip thinking — lowest priority)
-        for activity, pattern in _ACTIVITY_PATTERNS:
-            if activity == "thinking":
-                continue
-            for line in reversed(recent):
-                match = pattern.search(line)
-                if match:
+        # Scan for ● tool markers (most recent first)
+        # Try parenthetical form first (● Bash(args)), then standard form (● Read file)
+        rev = list(reversed(recent))
+        for i, line in enumerate(rev):
+            stripped = line.strip()
+            m = _TOOL_CALL_PAREN_RE.match(stripped)
+            if m:
+                tool_name = m.group(1)
+                target = m.group(2)
+            else:
+                m = _TOOL_MARKER_RE.match(stripped)
+                if not m:
+                    continue
+                tool_name = m.group(1)
+                target = m.group(2) or ""
+
+            # Stale marker check: if a ✻ completion marker or ❯ prompt
+            # appears AFTER this ● marker in the ORIGINAL lines,
+            # the tool call has finished.
+            # rev = list(reversed(recent)) (defined above)
+            # rev[i] = current marker. Elements after i in rev = elements before marker in original.
+            # We want elements AFTER the marker in original = rev[:i] (NOT rev[1:]).
+            # But when i=0, rev[:0] is empty. Use rev[1:] instead.
+            after_in_original = rev[:i] if i > 0 else rev[1:]
+            has_completion = any("✻" in l for l in after_in_original)
+            has_prompt = any("❯" in l for l in after_in_original)
+            if has_completion or has_prompt:
+                continue  # Stale marker — skip to next line
+
+            # Classify activity from tool name
+            activity = _TOOL_ACTIVITY_MAP.get(tool_name, "tool_call")
+            return {
+                "activity": activity,
+                "detail": target,
+                "raw": stripped,
+            }
+
+        # Check for thinking indicators as fallback
+        thinking_patterns = [
+            "Thinking", "Processing", "Cogitating",
+            "Shenaniganing", "Simmered", "Sautéed", "Churned",
+        ]
+        for line in reversed(recent):
+            for pattern in thinking_patterns:
+                if pattern in line:
                     return {
-                        "activity": activity,
-                        "detail": match.group(1).strip() if match.groups() else "",
+                        "activity": "thinking",
+                        "detail": "",
                         "raw": line.strip(),
                     }
-
-        # Thinking as fallback
-        for activity, pattern in _ACTIVITY_PATTERNS:
-            if activity == "thinking":
-                for line in reversed(recent):
-                    if pattern.search(line):
-                        return {
-                            "activity": "thinking",
-                            "detail": "",
-                            "raw": line.strip(),
-                        }
 
         return {"activity": "idle", "detail": "", "raw": ""}
 
