@@ -574,6 +574,7 @@ class StatusCard:
             result = await self._send_func(
                 chat_id=self._chat_id,
                 content=text[:self._MAX_MSG_LEN],
+                reply_to=None,  # Don't reply to user command — prevents ghost message in reply chains
             )
             if getattr(result, "success", False) and getattr(result, "message_id", None):
                 old_id = self._message_id
