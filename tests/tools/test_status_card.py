@@ -206,6 +206,14 @@ class TestFormatStatusCard:
         result = format_status_card({"status": "active", "state": "PERMISSION"})
         assert "⏸️ Waiting for permission" in result
 
+    def test_session_name_shown(self):
+        result = format_status_card({"status": "active", "state": "IDLE"}, session_name="amazonpatrol-dev")
+        assert "📝 amazonpatrol-dev" in result
+
+    def test_session_name_hidden_when_empty(self):
+        result = format_status_card({"status": "active", "state": "IDLE"}, session_name="")
+        assert "📝" not in result
+
     def test_idle_state(self):
         result = format_status_card({"status": "active", "state": "IDLE"})
         assert "✅ Idle" in result

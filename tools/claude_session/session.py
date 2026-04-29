@@ -755,6 +755,7 @@ class ClaudeSession:
                 poll_interval=config.get("poll_interval", 3.0),
                 max_card_length=config.get("max_card_length", 500),
                 bump_threshold=config.get("bump_threshold", 3),
+                session_name=self._session_name or "",
             )
             self._status_card.start()
 
