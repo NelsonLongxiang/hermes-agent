@@ -29,10 +29,10 @@ logger = logging.getLogger(__name__)
 # IDLE: Session quiet — minimal polling.
 # UNKNOWN / fallback: Use default interval from constructor.
 _STATE_INTERVALS = {
-    "THINKING": 180.0,
-    "TOOL_CALL": 2.0,
-    "PERMISSION": 3.0,
-    "IDLE": 15.0,
+    "THINKING": 5.0,     # 5s — thinking generates output slowly but we need timely Telegram updates
+    "TOOL_CALL": 2.0,   # 2s — fast feedback during tool execution
+    "PERMISSION": 3.0,  # 3s — moderate while waiting for user
+    "IDLE": 15.0,       # 15s — session quiet, minimal polling
 }
 
 
