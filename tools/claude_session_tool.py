@@ -279,6 +279,8 @@ def _resolve_target_session(args: dict, gw_key: str):
             resolved_id = _name_index.get((gw_key, name))
         if not resolved_id:
             return None, tool_error(f"No session named '{name}' in current gateway context.")
+        if resolved_id == "__starting__":
+            return None, tool_error(f"Session '{name}' is being created. Please retry shortly.")
         mgr = _get_session(resolved_id, gateway_session_key=gw_key, strict=True)
         if mgr is None:
             return None, tool_error(f"Session '{name}' (id={resolved_id[:8]}) no longer exists.")
