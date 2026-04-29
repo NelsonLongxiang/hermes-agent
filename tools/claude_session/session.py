@@ -471,7 +471,7 @@ class ClaudeSession:
         STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STALL_THRESHOLD", "1800"))
         COMPACT_MIN_WAIT = 3600  # 1 hour minimum for compaction
         COMPACT_MAX_WAIT = 7200  # 2 hours maximum for compaction
-        POLL_INTERVAL = 180  # 3 minutes - poll for state changes when thinking/calling
+        POLL_INTERVAL = 15  # poll for state changes when thinking/calling
 
         deadline = time.monotonic() + timeout
         last_patrol_tokens = self._buf.total_count()
