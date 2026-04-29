@@ -86,12 +86,28 @@ class TmuxInterface:
     def kill_session(self) -> None:
         """Kill the tmux session.
 
-        tmux kill-session closes the pty, which sends SIGHUP to all child
-        processes (Claude Code, shell, etc.) — no manual process-group
-        killing needed.
+        tmux kill-session closes the pty and sends SIGHUP to child processes.
+        However, Claude Code may setsid and escape the SIGHUP — fall back to
+        SIGTERM the pane PID if the session leader is gone.
         """
         try:
             self._run(["kill-session", "-t", self.session_name], timeout=5)
             logger.info("Tmux session %s killed", self.session_name)
         except Exception as e:
-            logger.warning("Failed to kill tmux session %s: %s", self.session_name, e)
+            logger.warning("tmux kill-session failed for %s: %s", self.session_name, e)
+            # Fallback: find the pane PID and SIGTERM it
+            try:
+                result = self._run(
+                    ["list-panes", "-t", self.session_name, "-F", "#{pane_pid}"], timeout=5
+                )
+                for line in result.stdout.strip().split("\n"):
+                    line = line.strip()
+                    if line.lstrip("-").isdigit():
+                        pid = int(line)
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            logger.info("Sent SIGTERM to pane PID %d", pid)
+                        except ProcessLookupError:
+                            pass
+            except Exception as sig_e:
+                logger.warning("SIGTERM fallback also failed for %s: %s", self.session_name, sig_e)

@@ -37,9 +37,10 @@ _sessions_lock = threading.Lock()
 from typing import Callable
 _status_observers: dict[str, Callable[[str, dict], None]] = {}  # gw_key → callback(session_id, info)
 _status_observers_lock = threading.Lock()
-# Gateway adapter registry: gw_key → {loop, send_func, edit_func, delete_func, chat_id}
+# Gateway adapter registry: gw_key → {loop, send_func, edit_func, delete_func, chat_id, timestamp}
 _gateway_adapters: dict[str, dict] = {}
 _gateway_adapters_lock = threading.Lock()
+_gateway_adapters_ttl = 300  # seconds — clean up stale entries after 5 minutes
 
 
 def register_status_observer(callback, gateway_session_key: str = ""):
@@ -83,13 +84,29 @@ def register_gateway_adapter(
             "edit_func": edit_func,
             "delete_func": delete_func,
             "chat_id": chat_id,
+            "timestamp": time.time(),
         }
+
+
+def _cleanup_stale_adapters():
+    """Remove adapter entries older than TTL to prevent memory leaks."""
+    cutoff = time.time() - _gateway_adapters_ttl
+    with _gateway_adapters_lock:
+        stale = [k for k, v in _gateway_adapters.items() if v.get("timestamp", 0) < cutoff]
+        for k in stale:
+            _gateway_adapters.pop(k, None)
+        return stale
 
 
 def unregister_gateway_adapter(gateway_session_key: str = ""):
     """Remove the adapter registration for a specific gateway session."""
     with _gateway_adapters_lock:
         _gateway_adapters.pop(gateway_session_key, None)
+        # Also clean up any stale entries while we're here
+        cutoff = time.time() - _gateway_adapters_ttl
+        stale = [k for k, v in _gateway_adapters.items() if v.get("timestamp", 0) < cutoff]
+        for k in stale:
+            _gateway_adapters.pop(k, None)
 
 
 def _get_gateway_session_key() -> str:

@@ -9907,18 +9907,7 @@ class GatewayRunner:
                     _get_gateway_session_key,
                 )
 
-                # Dummy observer callback — StatusCard gets its updates
-                # via session._on_observer_update, not via this bridge.
-                def _claude_session_status_bridge(
-                    session_id: str, status_info: dict,
-                ) -> None:
-                    pass  # Observers notify StatusCard through session._status_callback
-
                 _saved_gw_key = _get_gateway_session_key()
-                register_status_observer(
-                    _claude_session_status_bridge,
-                    gateway_session_key=_saved_gw_key,
-                )
                 # Register adapter for StatusCard to send messages via Gateway
                 register_gateway_adapter(
                     gateway_session_key=_saved_gw_key,
