@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Session Registry（支持并行运行多个独立会话 + gateway session 隔离）
 # ---------------------------------------------------------------------------
-_sessions: dict = {}   # session_id → ClaudeSessionManager 实例
+_sessions: dict = {}   # session_id → ClaudeSession 实例
 _workdir_index: dict[tuple[str, str], list[str]] = {}  # (gateway_key, workdir) → list[session_id] (一对多，同一 workdir 支持多个会话)
 _name_index: dict[tuple[str, str], str] = {}  # (gateway_key, name) → session_id (主索引)
 _active_session: dict[str, str] = {}  # gateway_key → session_id (最近活跃)
@@ -37,12 +37,15 @@ _sessions_lock = threading.Lock()
 from typing import Callable
 _status_observers: dict[str, Callable[[str, dict], None]] = {}  # gw_key → callback(session_id, info)
 _status_observers_lock = threading.Lock()
+# Gateway adapter registry: gw_key → {loop, send_func, edit_func, delete_func, chat_id}
+_gateway_adapters: dict[str, dict] = {}
+_gateway_adapters_lock = threading.Lock()
 
 
 def register_status_observer(callback, gateway_session_key: str = ""):
     """Register a status observer for a specific gateway session.
 
-    Called by gateway/run.py to bridge ClaudeSessionManager status updates
+    Called by gateway/run.py to bridge ClaudeSession status updates
     to Telegram status messages. The callback receives (session_id, status_info).
 
     Uses per-gateway-session-key isolation so concurrent sessions (e.g. a DM
@@ -57,6 +60,36 @@ def unregister_status_observer(gateway_session_key: str = ""):
     """Remove the status observer for a specific gateway session."""
     with _status_observers_lock:
         _status_observers.pop(gateway_session_key, None)
+
+
+def register_gateway_adapter(
+    gateway_session_key: str,
+    loop,
+    send_func,
+    edit_func,
+    delete_func,
+    chat_id: str,
+):
+    """Register Gateway adapter callbacks for StatusCard to use.
+
+    Called by gateway/run.py when setting up the status bridge.
+    StatusCard reads these to send/edit/delete messages via the Gateway's
+    platform adapter (instead of creating its own Bot instance).
+    """
+    with _gateway_adapters_lock:
+        _gateway_adapters[gateway_session_key] = {
+            "loop": loop,
+            "send_func": send_func,
+            "edit_func": edit_func,
+            "delete_func": delete_func,
+            "chat_id": chat_id,
+        }
+
+
+def unregister_gateway_adapter(gateway_session_key: str = ""):
+    """Remove the adapter registration for a specific gateway session."""
+    with _gateway_adapters_lock:
+        _gateway_adapters.pop(gateway_session_key, None)
 
 
 def _get_gateway_session_key() -> str:
@@ -434,7 +467,7 @@ def _handle_claude_session(args, **kw):
 
     # ── start：创建新实例并注册（name 必填 + workdir 可选）──
     if action == "start":
-        from tools.claude_session.manager import ClaudeSessionManager
+        from tools.claude_session.session import ClaudeSession
 
         # name 必须提供（第一性原理：明确会话用途，避免自动命名的混淆）
         session_name_arg = args.get("name")
@@ -492,7 +525,35 @@ def _handle_claude_session(args, **kw):
             return json.dumps(_existing_resp, ensure_ascii=False)
 
         try:
-            mgr = ClaudeSessionManager()
+            # Build status_card_config from gateway adapter registry
+            _status_card_config = None
+            if get_session_env is not None:
+                try:
+                    _sc_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+                    _sc_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+                    logger.debug(
+                        "StatusCard config: platform=%s chat_id=%s gw_key=%s adapters=%s",
+                        _sc_platform, _sc_chat_id, gw_key, list(_gateway_adapters.keys()),
+                    )
+                    if _sc_platform == "telegram" and _sc_chat_id:
+                        # Read adapter from gateway registry (set by gateway/run.py)
+                        with _gateway_adapters_lock:
+                            _adapter_info = _gateway_adapters.get(gw_key)
+                        if _adapter_info:
+                            _status_card_config = {
+                                "chat_id": _sc_chat_id,
+                                "loop": _adapter_info["loop"],
+                                "send_func": _adapter_info["send_func"],
+                                "edit_func": _adapter_info["edit_func"],
+                                "delete_func": _adapter_info["delete_func"],
+                            }
+                            logger.info("StatusCard config built for gw_key=%s", gw_key)
+                        else:
+                            logger.warning("StatusCard: no adapter registered for gw_key=%s (registered: %s)", gw_key, list(_gateway_adapters.keys()))
+                except Exception as _sce:
+                    logger.warning("StatusCard config build error: %s", _sce)
+
+            mgr = ClaudeSession()
             mgr._gateway_session_key = gw_key
             mgr._session_name = session_name_arg
             result = mgr.start(
@@ -503,6 +564,7 @@ def _handle_claude_session(args, **kw):
                 on_event=args.get("on_event", "notify"),
                 completion_queue=kw.get("completion_queue"),
                 resume_uuid=args.get("resume_uuid"),
+                status_card_config=_status_card_config,
             )
 
         except Exception as e:
@@ -535,13 +597,21 @@ def _handle_claude_session(args, **kw):
                         _workdir_index[workdir_idx_key] = session_list + [sid]
                 _touch_active(gw_key, sid)
                 # Attach status observer for this gateway session (per-key isolation).
+                # Only set the bridge callback if StatusCard hasn't already set one.
+                # StatusCard's _status_callback sends real-time Telegram updates;
+                # the bridge callback routes to gateway's StatusMessageManager (now removed).
+                # Co-existence: if both exist, chain them.
 
                 with _status_observers_lock:
                     _observer = _status_observers.get(gw_key)
                 if _observer:
-                    mgr._status_callback = (
-                        lambda info, _sid=sid, _obs=_observer: _safe_call_observer(_obs, _sid, info)
-                    )
+                    _existing = mgr._status_callback
+                    _bridge = lambda info, _sid=sid, _obs=_observer: _safe_call_observer(_obs, _sid, info)
+                    if _existing:
+                        # Chain: StatusCard callback first, then bridge
+                        mgr._status_callback = lambda info, _ex=_existing, _br=_bridge: (_ex(info), _br(info))
+                    else:
+                        mgr._status_callback = _bridge
                 # 返回结果中附带 name
                 if session_name_arg:
                     result["name"] = session_name_arg

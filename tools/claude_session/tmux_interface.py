@@ -84,69 +84,12 @@ class TmuxInterface:
         self._run(["send-keys", "-t", self.session_name, key])
 
     def kill_session(self) -> None:
-        """Kill the tmux session and terminate all child processes.
-        
-        This is critical for preventing resource leaks: tmux kill-session
-        destroys the session but leaves child processes (like Claude Code)
-        running as orphans. We must explicitly terminate them first.
+        """Kill the tmux session.
+
+        tmux kill-session closes the pty, which sends SIGHUP to all child
+        processes (Claude Code, shell, etc.) — no manual process-group
+        killing needed.
         """
-        # Step 1: Get the pane PID (the shell process)
-        pane_pid = None
-        try:
-            r = self._run([
-                "list-panes",
-                "-t", self.session_name,
-                "-F", "#{pane_pid}"
-            ], timeout=5)
-            if r.returncode == 0 and r.stdout.strip():
-                pane_pid = int(r.stdout.strip())
-                logger.debug("Session %s pane PID: %d", self.session_name, pane_pid)
-        except Exception as e:
-            logger.warning("Failed to get pane PID for %s: %s", self.session_name, e)
-
-        # Step 2: Find and kill the Claude Code process group
-        if pane_pid:
-            try:
-                # Get the process group ID
-                pgid = os.getpgid(pane_pid)
-                logger.debug("Session %s PGID: %d", self.session_name, pgid)
-                
-                # Send SIGTERM to the entire process group (graceful shutdown)
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                    logger.info("Sent SIGTERM to PGID %d for session %s", pgid, self.session_name)
-                except ProcessLookupError:
-                    # Process already gone - that's fine
-                    logger.debug("PGID %d already terminated", pgid)
-                    pgid = None
-                
-                # Step 3: Wait up to 3 seconds for graceful termination
-                if pgid:
-                    for _ in range(30):  # 30 * 0.1s = 3 seconds
-                        try:
-                            os.killpg(pgid, 0)  # Check if process group exists
-                            time.sleep(0.1)
-                        except ProcessLookupError:
-                            # Process group terminated successfully
-                            logger.debug("PGID %d terminated gracefully", pgid)
-                            break
-                    else:
-                        # Step 4: Force kill with SIGKILL if still running
-                        logger.warning("PGID %d did not terminate gracefully, sending SIGKILL", pgid)
-                        try:
-                            os.killpg(pgid, signal.SIGKILL)
-                            time.sleep(0.5)  # Brief wait for SIGKILL to take effect
-                        except ProcessLookupError:
-                            pass  # Already gone
-                        
-            except ProcessLookupError:
-                logger.debug("Pane PID %d no longer exists", pane_pid)
-            except PermissionError:
-                logger.warning("No permission to kill PGID for PID %d", pane_pid)
-            except Exception as e:
-                logger.warning("Failed to kill process group: %s", e)
-
-        # Step 5: Finally kill the tmux session
         try:
             self._run(["kill-session", "-t", self.session_name], timeout=5)
             logger.info("Tmux session %s killed", self.session_name)

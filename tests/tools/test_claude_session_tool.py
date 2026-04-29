@@ -21,7 +21,7 @@ class TestSchema:
     def test_schema_action_enum(self):
         actions = CLAUDE_SESSION_SCHEMA["parameters"]["properties"]["action"]["enum"]
         expected = [
-            "start", "send", "type", "submit", "cancel_input",
+            "start", "send", "type", "submit", "send_text", "cancel_input",
             "status", "wait_for_idle", "wait_for_state",
             "output", "respond_permission", "stop", "history", "events",
             "list", "switch",
@@ -160,6 +160,14 @@ class TestCheckFn:
 
 class TestDiagnose:
     """Tests for _diagnose_claude_session and the diagnose action."""
+
+    def setup_method(self):
+        """Reset module-level state before each test."""
+        from tools.claude_session_tool import _sessions, _workdir_index, _name_index, _active_session
+        _sessions.clear()
+        _workdir_index.clear()
+        _name_index.clear()
+        _active_session.clear()
 
     def test_diagnose_function_all_ok(self):
         with patch("tools.claude_session_tool.shutil.which") as mock_which, \

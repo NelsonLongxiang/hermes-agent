@@ -9896,46 +9896,40 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
-        # Bridge Claude Session status → Telegram status message.
-        # Only set up for platforms that support message editing (skip webhook).
-        _claude_status_msg = None
-        _last_claude_status = [None]  # track last status for completion summary
+        # Register observer and adapter for StatusCard.
+        # The StatusCard (in session.py) receives observer updates via _on_observer_update.
         _saved_gw_key = None
         if _status_adapter and source.platform != Platform.WEBHOOK:
             try:
-                from gateway.status_message import StatusMessageManager
                 from tools.claude_session_tool import (
                     register_status_observer,
+                    register_gateway_adapter,
                     _get_gateway_session_key,
                 )
 
-                _claude_status_msg = StatusMessageManager(
-                    adapter=_status_adapter,
-                    chat_id=_status_chat_id,
-                    metadata=_status_thread_metadata,
-                )
-
+                # Dummy observer callback — StatusCard gets its updates
+                # via session._on_observer_update, not via this bridge.
                 def _claude_session_status_bridge(
                     session_id: str, status_info: dict,
                 ) -> None:
-                    if not _run_still_current():
-                        return
-                    _last_claude_status[0] = status_info
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            _claude_status_msg.update(status_info),
-                            _loop_for_step,
-                        )
-                    except Exception as _e:
-                        logger.debug("claude session status bridge error: %s", _e)
+                    pass  # Observers notify StatusCard through session._status_callback
 
                 _saved_gw_key = _get_gateway_session_key()
                 register_status_observer(
                     _claude_session_status_bridge,
                     gateway_session_key=_saved_gw_key,
                 )
+                # Register adapter for StatusCard to send messages via Gateway
+                register_gateway_adapter(
+                    gateway_session_key=_saved_gw_key,
+                    loop=_loop_for_step,
+                    send_func=_status_adapter.send,
+                    edit_func=_status_adapter.edit_message,
+                    delete_func=_status_adapter.delete_message,
+                    chat_id=_status_chat_id,
+                )
             except Exception as _e:
-                logger.debug("Could not set up claude session status bridge: %s", _e)
+                logger.warning("Could not set up claude session status bridge: %s", _e)
                 _saved_gw_key = _get_gateway_session_key()
 
         def run_sync():
@@ -11119,21 +11113,16 @@ class GatewayRunner:
             # Clean up claude session status observer and finalize message
             if _saved_gw_key:
                 try:
-                    from tools.claude_session_tool import unregister_status_observer
+                    from tools.claude_session_tool import (
+                        unregister_status_observer,
+                        unregister_gateway_adapter,
+                    )
                     unregister_status_observer(
                         gateway_session_key=_saved_gw_key,
                     )
-                except Exception:
-                    pass
-            if _claude_status_msg:
-                try:
-                    if _last_claude_status[0] and not _inactivity_timeout:
-                        summary = _claude_status_msg.format_summary(
-                            _last_claude_status[0],
-                        )
-                        await _claude_status_msg.finish(summary)
-                    else:
-                        await _claude_status_msg.cancel()
+                    unregister_gateway_adapter(
+                        gateway_session_key=_saved_gw_key,
+                    )
                 except Exception:
                     pass
 

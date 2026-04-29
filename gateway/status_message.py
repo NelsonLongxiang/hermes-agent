@@ -181,6 +181,8 @@ class StatusMessageManager:
         state = info.get("state", "THINKING")
         tool_name = info.get("tool_name")
         tool_target = info.get("tool_target")
+        current_activity = info.get("current_activity", "")
+        activity_detail = info.get("activity_detail", "")
         turn_id = info.get("turn_id", "?")
         elapsed = info.get("elapsed_seconds", 0)
         tool_calls = info.get("tool_calls", [])
@@ -196,6 +198,13 @@ class StatusMessageManager:
             parts.append("\u26a0\ufe0f 等待授权...")
         else:
             parts.append(f"\U0001f916 {state}")
+
+        # Activity detail (e.g. "executing", "reading", "writing", "searching")
+        if current_activity and current_activity != "idle":
+            if activity_detail:
+                parts.append(f"\U0001f50d {current_activity}: {activity_detail}")
+            else:
+                parts.append(f"\U0001f50d {current_activity}")
 
         # Tool call details (max 3 recent)
         if tool_calls:
