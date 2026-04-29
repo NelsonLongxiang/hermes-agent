@@ -236,7 +236,8 @@ class TestFormatStatusCard:
 
     def test_text_preview_truncated_to_80(self):
         long_text = "a" * 200
-        result = format_status_card({"status": "active", "text": long_text})
+        observer = {"state": "TOOL_CALL", "recent_output": long_text}
+        result = format_status_card({"status": "active", "text": long_text}, observer_state=observer)
         # preview should be "a"*80 + "..."
         assert "💭 " in result
         for line in result.split("\n"):
@@ -244,17 +245,21 @@ class TestFormatStatusCard:
                 assert len(line) <= 86  # "💭 " (4 chars including emoji) + 80 + "..."
 
     def test_text_preview_short_text_unchanged(self):
-        result = format_status_card({"status": "active", "text": "short"})
+        observer = {"state": "TOOL_CALL", "recent_output": "short"}
+        result = format_status_card({"status": "active", "text": "short"}, observer_state=observer)
         assert "💭 short" in result
 
     def test_text_preview_first_line_only(self):
-        result = format_status_card({"status": "active", "text": "line1\nline2\nline3"})
+        observer = {"state": "TOOL_CALL", "recent_output": "line1\nline2\nline3"}
+        result = format_status_card({"status": "active", "text": "line1\nline2\nline3"}, observer_state=observer)
         assert "💭 line1" in result
         assert "line2" not in result
 
     def test_max_length_truncation(self):
+        observer = {"state": "TOOL_CALL", "recent_output": "x" * 1000}
         result = format_status_card(
             {"status": "active", "text": "x" * 1000},
+            observer_state=observer,
             max_length=50,
         )
         assert len(result) == 50
@@ -284,7 +289,7 @@ class TestFormatStatusCard:
 
     def test_observer_recent_output_used(self):
         state = {"status": "active", "text": "old text"}
-        observer = {"recent_output": "new output from observer"}
+        observer = {"state": "TOOL_CALL", "recent_output": "new output from observer"}
         result = format_status_card(state, observer_state=observer)
         assert "💭 new output from observer" in result
         assert "old text" not in result

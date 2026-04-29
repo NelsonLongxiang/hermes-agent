@@ -124,6 +124,29 @@ def parse_jsonl(jsonl_path: Path) -> dict:
 # Formatting
 # ------------------------------------------------------------------
 
+# Spinner line extraction — finds the most recent spinner line from tmux output
+_SPINNER_LINE_RE = re.compile(
+    r"^[" + re.escape("✶✽✻✢·*") + r"]\s+(.+)$",
+)
+
+
+def _extract_spinner_text(raw_output: str, max_len: int = 80) -> str:
+    """Extract the most recent spinner text from raw tmux output.
+
+    Returns e.g. "Boogieing… (12s · ↓ 88 tokens · thinking with xhigh effort)"
+    """
+    if not raw_output:
+        return ""
+    lines = raw_output.split("\n")
+    for line in reversed(lines):
+        line = line.strip()
+        m = _SPINNER_LINE_RE.match(line)
+        if m:
+            text = m.group(1).strip()
+            return text[:max_len]
+    return ""
+
+
 _TOOL_ICONS = {
     "Write": "✏️",
     "Edit": "📝",
@@ -184,13 +207,20 @@ def format_status_card(state: dict, observer_state: dict = None, max_length: int
         else:
             lines.append(f"{icon} {tool}")
 
-    # Text preview
-    text = real_time.get("recent_output") or state.get("text") or state.get("recent_output")
-    if text:
-        preview = text[:80] + "..." if len(text) > 80 else text
-        first_line = preview.split("\n", 1)[0].strip()
-        if first_line:
-            lines.append(f"💭 {first_line}")
+    # Text preview — only for THINKING (show spinner verb) and TOOL_CALL (show detail)
+    if current_state == "THINKING":
+        # Extract spinner verb from recent_output (e.g. "✻ Boogieing… (12s)")
+        raw_output = real_time.get("recent_output", "")
+        spinner_text = _extract_spinner_text(raw_output)
+        if spinner_text:
+            lines.append(f"💭 {spinner_text}")
+    elif current_state == "TOOL_CALL":
+        text = real_time.get("recent_output") or state.get("text") or state.get("recent_output")
+        if text:
+            preview = text[:80] + "..." if len(text) > 80 else text
+            first_line = preview.split("\n", 1)[0].strip()
+            if first_line:
+                lines.append(f"💭 {first_line}")
 
     result = "\n".join(lines)
 
@@ -425,10 +455,20 @@ class StatusCard:
         self._prev_activity = None
 
         # Poll loop
+        _poll_count = 0
         while self._running and not self._stop_event.is_set():
             try:
                 state = parse_jsonl(self._jsonl_path)
                 card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length)
+
+                _poll_count += 1
+                if _poll_count <= 5 or _poll_count % 20 == 0:
+                    logger.warning(
+                        "StatusCard poll #%d: jsonl=%s status=%s card_len=%d last=%s msg_id=%s running=%s",
+                        _poll_count, self._jsonl_path.name, state.get("status"),
+                        len(card_text), self._last_card_text[:30] if self._last_card_text else None,
+                        self._message_id, self._running,
+                    )
 
                 current_state = (self._observer_state or {}).get("state", "IDLE")
                 should_bump = self._should_bump(current_state)
