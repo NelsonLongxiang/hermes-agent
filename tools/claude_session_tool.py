@@ -608,8 +608,14 @@ def _handle_claude_session(args, **kw):
                     _existing = mgr._status_callback
                     _bridge = lambda info, _sid=sid, _obs=_observer: _safe_call_observer(_obs, _sid, info)
                     if _existing:
-                        # Chain: StatusCard callback first, then bridge
-                        mgr._status_callback = lambda info, _ex=_existing, _br=_bridge: (_ex(info), _br(info))
+                        # Chain: call both sequentially, each with its own exception handling
+                        def _chained(info, _ex=_existing, _br=_bridge):
+                            for fn in (_ex, _br):
+                                try:
+                                    fn(info)
+                                except Exception as e:
+                                    logger.warning("Chained callback error: %s", e)
+                        mgr._status_callback = _chained
                     else:
                         mgr._status_callback = _bridge
                 # 返回结果中附带 name

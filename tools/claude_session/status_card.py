@@ -361,6 +361,9 @@ class StatusCard:
                 do_bump = self._should_bump(new_state)
 
                 async def _immediate_send():
+                    # Guard: don't send before initial message is sent
+                    if self._message_id is None:
+                        return
                     state = parse_jsonl(self._jsonl_path)
                     card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length)
                     if card_text == self._last_card_text and not do_bump:
@@ -463,7 +466,7 @@ class StatusCard:
 
                 _poll_count += 1
                 if _poll_count <= 5 or _poll_count % 20 == 0:
-                    logger.warning(
+                    logger.debug(
                         "StatusCard poll #%d: jsonl=%s status=%s card_len=%d last=%s msg_id=%s running=%s",
                         _poll_count, self._jsonl_path.name, state.get("status"),
                         len(card_text), self._last_card_text[:30] if self._last_card_text else None,
