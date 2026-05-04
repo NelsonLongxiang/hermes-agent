@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
-from tools.claude_session_tool import register_gateway_adapter
+from tools.claude_session_tool import register_gateway_adapter, unregister_gateway_adapter
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -9882,14 +9882,15 @@ class GatewayRunner:
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
-        register_gateway_adapter(
-            gateway_session_key=session_entry.session_key,
-            loop=_loop_for_step,
-            send_func=_status_adapter.send,
-            edit_func=_status_adapter.edit_message,
-            delete_func=_status_adapter.delete_message,
-            chat_id=_status_chat_id,
-        )
+        if _status_adapter:
+            register_gateway_adapter(
+                gateway_session_key=session_entry.session_key,
+                loop=_loop_for_step,
+                send_func=_status_adapter.send,
+                edit_func=_status_adapter.edit_message,
+                delete_func=_status_adapter.delete_message,
+                chat_id=_status_chat_id,
+            )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -10406,6 +10407,7 @@ class GatewayRunner:
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
+                unregister_gateway_adapter(session_entry.session_key)
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
