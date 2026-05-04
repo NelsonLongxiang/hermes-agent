@@ -7,7 +7,7 @@ triggers:
   - "coding task"
   - "delegation"
   - "interactive session"
-version: 4.2
+version: 4.1
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
     prompt: "Stream stale timeout (秒，推荐 300)"
@@ -182,29 +182,6 @@ claude_session(action="start", name="backend", workdir="/project")
 
 ---
 
-## 状态决策矩阵
-
-```
-当前状态              收到消息后           等待中超时
-───────────────────────────────────────────────────────────
-IDLE                  立即 send            -
-INPUTTING             等几秒再 send        -
-THINKING              cancel后 send        继续等待
-TOOL_CALL             cancel后 send        继续等待
-PERMISSION            按上文判断           respond_permission
-ERROR                 restart              restart
-DISCONNECTED          restart              restart
-EXITED                restart              restart
-```
-
-**决策原则**：
-1. 不要看到 "bypass permissions" 就认为需要响应权限
-2. 不要看到 THINKING/TOOL_CALL 就立即 cancel
-3. 给足够的时间让 Claude 完成工作
-4. 如果不确定等待还是取消，先 `status` 查看 `output_tail`
-
----
-
 ## State Awareness
 
 8个状态：`IDLE` `INPUTTING` `THINKING` `TOOL_CALL` `PERMISSION` `ERROR` `DISCONNECTED` `EXITED`
@@ -212,25 +189,10 @@ EXITED                restart              restart
 ```python
 # 检查状态
 status = claude_session(action="status")
-state = status["state"]
-output = status.get("output_tail", "")
-
-if state == "IDLE":
+if status["state"] == "IDLE":
     # 可以发送任务
-    claude_session(action="send", message="...")
-elif state == "PERMISSION":
-    if "bypass permissions" in output or "shift+tab" in output:
-        # TUI 提示，无需响应，继续等待
-        pass
-    else:
-        # 真正需要权限
-        claude_session(action="respond_permission", response="allow")
-elif state in ("THINKING", "TOOL_CALL"):
-    # 等待，不要 cancel
-    pass
-elif state in ("ERROR", "DISCONNECTED", "EXITED"):
-    # 需要重启
-    claude_session(action="start", ...)
+elif status["state"] == "PERMISSION":
+    # 需要响应权限
 ```
 
 ---
@@ -271,6 +233,7 @@ wait_for_idle(60) → 没完成 → wait_for_idle(300) → 没完成 → wait_fo
 
 **正确做法**：`wait_for_idle(900)` 一次给够 timeout，不中途打断
 
+### 错误4：动画鬼影导致提前返回 IDLE
 ### 错误4：动画鬼影导致提前返回 IDLE
 
 **现象**：`wait_for_idle` 返回 `status: idle`，但 `output_since_send` 显示的是动画（Forming/Unfurling/Jitterbugging/Stewing），命令实际结果未捕获。
@@ -341,25 +304,11 @@ send → wait_for_idle(30) → output → wait_for_idle(30) → output → ... (
 
 **应对**：首次启动 timeout 设为 300 秒。
 
-### Permission 状态处理（关键）
+### 陷阱1：Permission 状态幽灵
 
-**问题现象**：即使 `permission_mode="skip"`，Claude Code TUI 仍可能显示 "bypass permissions on (shift+tab to cycle)" 提示。
+**现象**：status 返回 PERMISSION，但 Claude 实际在正常工作。
 
-**判断方法**：
-```python
-status = claude_session(action="status")
-output = status.get("output_tail", "")
-
-if status["state"] == "PERMISSION":
-    if "bypass permissions" in output or "shift+tab" in output:
-        # 这是 TUI 提示，不是真正的权限请求，直接继续等待
-        # 用 wait_for_idle(timeout=300) 继续
-    else:
-        # 真正需要权限
-        claude_session(action="respond_permission", response="allow")
-```
-
-**重要**：TUI 显示提示不代表需要响应权限。检查 `output_tail` 是否有实际权限请求文本。
+**应对**：检查 `output_tail` 是否有权限提示文本，再决定是否 respond。
 
 ### 陷阱2：多行文本粘贴后不发送
 
@@ -381,26 +330,11 @@ claude_session(action="send", message="简化指令")
 
 ## Error Recovery
 
-**决策优先级**：
-1. **IDLE** → 直接 send
-2. **PERMISSION** → 检查 output_tail 判断是否真正需要响应
-3. **THINKING/TOOL_CALL** → 等待，不要 cancel
-4. **非 IDLE 超时** → 先 status 查看原因，不要立即重启
-5. **ERROR/DISCONNECTED/EXITED** → restart
-
-**常见错误决策**：
-- ❌ "bypass permissions 出现了" → respond_permission → 错误
-- ✅ 检查 output_tail，有实际权限请求文本才 respond
-- ❌ "THINKING 状态等太久了" → cancel → 错误
-- ✅ 继续等待，GLM-5.1 处理大上下文需要时间
-- ❌ "状态不是 IDLE" → restart → 错误
-- ✅ 等待状态自然转为 IDLE
-
-**处理步骤**：
-1. 检查 `status` 的 state 和 `output_tail`
-2. 根据状态决策矩阵决定行动
+1. 检查 `status` 的 state 字段
+2. 检查 `output_tail` 或 `output_since_send` 的错误信息
 3. 发送修正指令（最多 2 次重试）
 4. 仍然失败 → 报告用户
+5. **绝不等得久就放弃当前方案**
 
 ---
 

@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import threading
-import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -242,7 +241,9 @@ def _get_session(session_id: str = None, gateway_session_key: str = "", strict: 
         if sessions_for_gateway:
             return sessions_for_gateway[-1]
 
-        # 无匹配会话，返回 None 让调用方处理
+        # 最后兜底：跨作用域返回全局最后一个（主要兼容旧 CLI/cron 行为）。
+        if _sessions:
+            return list(_sessions.values())[-1]
     return None
 
 
@@ -279,8 +280,6 @@ def _resolve_target_session(args: dict, gw_key: str):
             resolved_id = _name_index.get((gw_key, name))
         if not resolved_id:
             return None, tool_error(f"No session named '{name}' in current gateway context.")
-        if resolved_id == "__starting__":
-            return None, tool_error(f"Session '{name}' is being created. Please retry shortly.")
         mgr = _get_session(resolved_id, gateway_session_key=gw_key, strict=True)
         if mgr is None:
             return None, tool_error(f"Session '{name}' (id={resolved_id[:8]}) no longer exists.")
@@ -520,12 +519,6 @@ def _handle_claude_session(args, **kw):
                     "note": f"Session '{session_name_arg}' already active",
                     "name": session_name_arg,
                 }
-            elif existing_sid == "__starting__":
-                # 另一个并发请求正在创建同名会话，拒绝重复创建
-                return json.dumps({
-                    "error": f"Session '{session_name_arg}' is already being created by another request. Please retry shortly.",
-                    "retry": True,
-                })
             else:
                 # 预占槽位，防止并发 start 时双重创建
                 _name_index[(gw_key, session_name_arg)] = "__starting__"

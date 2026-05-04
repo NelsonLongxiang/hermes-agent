@@ -9884,7 +9884,7 @@ class GatewayRunner:
 
         if _status_adapter:
             register_gateway_adapter(
-                gateway_session_key=session_entry.session_key,
+                gateway_session_key=session_key,
                 loop=_loop_for_step,
                 send_func=_status_adapter.send,
                 edit_func=_status_adapter.edit_message,
@@ -10407,7 +10407,7 @@ class GatewayRunner:
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
-                unregister_gateway_adapter(session_entry.session_key)
+                unregister_gateway_adapter(session_key)
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
@@ -11085,6 +11085,22 @@ class GatewayRunner:
                 progress_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+
+            # Clean up claude session status observer and finalize message
+            if _saved_gw_key:
+                try:
+                    from tools.claude_session_tool import (
+                        unregister_status_observer,
+                        unregister_gateway_adapter,
+                    )
+                    unregister_status_observer(
+                        gateway_session_key=_saved_gw_key,
+                    )
+                    unregister_gateway_adapter(
+                        gateway_session_key=_saved_gw_key,
+                    )
+                except Exception:
+                    pass
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
