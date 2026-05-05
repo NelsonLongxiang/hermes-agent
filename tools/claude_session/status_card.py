@@ -159,22 +159,30 @@ _TOOL_ICONS = {
 }
 
 
-def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500,
-                       session_name: str = "", session_id: str = "") -> str:
-    """Format session state as a compact Telegram status card."""
-    if state["status"] == "no_session":
-        return "⏳ Starting session..."
-    if state["status"] == "empty":
-        return "⏳ Waiting for activity..."
-
+def _build_header(session_name: str, session_id: str) -> str:
+    """Build status card header with optional session identification."""
     header = "📊 Claude Status"
     if session_name or session_id:
         parts = []
         if session_name:
-            parts.append(session_name)
+            parts.append(session_name[:30])
         if session_id:
             parts.append(session_id)
         header += f" [{' · '.join(parts)}]"
+    return header
+
+
+def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500,
+                       session_name: str = "", session_id: str = "") -> str:
+    """Format session state as a compact Telegram status card."""
+    if state["status"] == "no_session":
+        h = _build_header(session_name, session_id)
+        return f"{h}\n⏳ Starting session..."
+    if state["status"] == "empty":
+        h = _build_header(session_name, session_id)
+        return f"{h}\n⏳ Waiting for activity..."
+
+    header = _build_header(session_name, session_id)
     lines = [header]
 
     real_time = observer_state or {}
@@ -186,7 +194,21 @@ def format_status_card(state: dict, observer_state: dict = None, max_length: int
     elif current_state == "TOOL_CALL":
         lines.append("🔧 Working...")
     elif current_state == "PERMISSION":
-        lines.append("⏸️ Waiting for permission")
+        perm_tool = real_time.get("tool_name") or state.get("tool")
+        perm_target = real_time.get("tool_target") or state.get("tool_input", {})
+        perm_detail = ""
+        if perm_tool:
+            icon = _TOOL_ICONS.get(perm_tool, "🔧")
+            if isinstance(perm_target, dict):
+                perm_detail = _format_tool_detail(perm_tool, perm_target)
+            elif perm_target:
+                perm_detail = str(perm_target)[:50]
+            if perm_detail:
+                lines.append(f"⏸️ {icon} {perm_tool}: {perm_detail}")
+            else:
+                lines.append(f"⏸️ {icon} {perm_tool}")
+        else:
+            lines.append("⏸️ Waiting for permission")
     else:
         lines.append("✅ Idle")
 
@@ -337,6 +359,10 @@ class StatusCard:
             ("TOOL_CALL", "IDLE"),
             ("IDLE", "TOOL_CALL"),
             ("PERMISSION", "IDLE"),
+            ("PERMISSION", "THINKING"),
+            ("PERMISSION", "TOOL_CALL"),
+            ("TOOL_CALL", "PERMISSION"),
+            ("THINKING", "PERMISSION"),
         }
 
     def _should_bump(self, new_state: str) -> bool:
