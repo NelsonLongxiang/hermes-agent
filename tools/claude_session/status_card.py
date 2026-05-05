@@ -159,14 +159,23 @@ _TOOL_ICONS = {
 }
 
 
-def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500) -> str:
+def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500,
+                       session_name: str = "", session_id: str = "") -> str:
     """Format session state as a compact Telegram status card."""
     if state["status"] == "no_session":
         return "⏳ Starting session..."
     if state["status"] == "empty":
         return "⏳ Waiting for activity..."
 
-    lines = ["📊 Claude Status"]
+    header = "📊 Claude Status"
+    if session_name or session_id:
+        parts = []
+        if session_name:
+            parts.append(session_name)
+        if session_id:
+            parts.append(session_id)
+        header += f" [{' · '.join(parts)}]"
+    lines = [header]
 
     real_time = observer_state or {}
 
@@ -291,8 +300,12 @@ class StatusCard:
         poll_interval: float = 3.0,
         max_card_length: int = 500,
         bump_threshold: int = 3,
+        session_name: str = "",
+        session_id: str = "",
     ):
         self._session_uuid = session_uuid
+        self._session_name = session_name
+        self._session_id = session_id
         self._loop = loop
         self._send_func = send_func
         self._edit_func = edit_func
@@ -365,7 +378,7 @@ class StatusCard:
                     if self._message_id is None:
                         return
                     state = parse_jsonl(self._jsonl_path)
-                    card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length)
+                    card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
                     if card_text == self._last_card_text and not do_bump:
                         return
                     try:
@@ -426,7 +439,7 @@ class StatusCard:
     def _run_loop(self) -> None:
         """Background thread: polls JSONL and updates via Gateway adapter."""
         # Send initial message (with retries)
-        initial_text = format_status_card(parse_jsonl(self._jsonl_path), max_length=self._max_card_length)
+        initial_text = format_status_card(parse_jsonl(self._jsonl_path), max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
         sent = False
         for attempt in range(1, self._INIT_RETRIES + 1):
             try:
@@ -462,7 +475,7 @@ class StatusCard:
         while self._running and not self._stop_event.is_set():
             try:
                 state = parse_jsonl(self._jsonl_path)
-                card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length)
+                card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
 
                 _poll_count += 1
                 if _poll_count <= 5 or _poll_count % 20 == 0:
