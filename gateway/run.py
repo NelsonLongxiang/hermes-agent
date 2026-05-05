@@ -9914,7 +9914,6 @@ class GatewayRunner:
             try:
                 from tools.claude_session_tool import (
                     register_status_observer,
-                    register_gateway_adapter,
                     _get_gateway_session_key,
                 )
 
@@ -11127,7 +11126,6 @@ class GatewayRunner:
                 try:
                     from tools.claude_session_tool import (
                         unregister_status_observer,
-                        unregister_gateway_adapter,
                     )
                     unregister_status_observer(
                         gateway_session_key=_saved_gw_key,
