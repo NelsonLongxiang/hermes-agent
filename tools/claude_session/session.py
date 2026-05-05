@@ -167,7 +167,8 @@ class ClaudeSession:
                 self._send_marker = 0
 
             self._session_id = f"cs_{uuid.uuid4().hex[:8]}"
-            self._session_name = session_name
+            if self._session_name is None:
+                self._session_name = session_name
             self._permission_mode = permission_mode
             self._workdir = os.path.abspath(workdir)
             self._tmux = TmuxInterface(session_name)
