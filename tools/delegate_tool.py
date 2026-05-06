@@ -149,6 +149,14 @@ _active_subagents_lock = threading.Lock()
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
+# model_tools._last_resolved_tool_names is a module-level global that gets
+# overwritten during AIAgent construction.  In gateway concurrent sessions
+# (two Telegram chats calling delegate_task simultaneously), unprotected
+# reads/writes corrupt the value.  This lock serialises all access from
+# delegate_task so the parent's tool names are never clobbered by another
+# session's child construction.
+_tool_names_lock = threading.Lock()
+
 
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock new delegate_task spawns.
@@ -684,6 +692,7 @@ def _build_child_progress_callback(
     # Gateway: batch tool names, flush periodically
     _BATCH_SIZE = 5
     _batch: List[str] = []
+    _batch_lock = threading.Lock()  # protects _batch across callback (worker) and _flush (parent) threads
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
 
     def _identity_kwargs() -> Dict[str, Any]:
@@ -814,18 +823,20 @@ def _build_child_progress_callback(
 
         if parent_cb:
             _relay("subagent.tool", tool_name, preview, args)
-            _batch.append(tool_name or "")
-            if len(_batch) >= _BATCH_SIZE:
-                summary = ", ".join(_batch)
-                _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
-                _batch.clear()
+            with _batch_lock:
+                _batch.append(tool_name or "")
+                if len(_batch) >= _BATCH_SIZE:
+                    summary = ", ".join(_batch)
+                    _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
+                    _batch.clear()
 
     def _flush():
         """Flush remaining batched tool names to gateway on completion."""
-        if parent_cb and _batch:
-            summary = ", ".join(_batch)
-            _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
-            _batch.clear()
+        with _batch_lock:
+            if parent_cb and _batch:
+                summary = ", ".join(_batch)
+                _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
+                _batch.clear()
 
     _callback._flush = _flush
     return _callback
@@ -1284,8 +1295,11 @@ def _run_single_child(
     import model_tools
 
     _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
+        child, "_delegate_saved_tool_names", None
     )
+    if _saved_tool_names is None:
+        with _tool_names_lock:
+            _saved_tool_names = list(model_tools._last_resolved_tool_names)
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
@@ -1807,7 +1821,8 @@ def _run_single_child(
 
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
+            with _tool_names_lock:
+                model_tools._last_resolved_tool_names = list(saved_tool_names)
 
         # Remove child from active tracking
 
@@ -1952,9 +1967,12 @@ def delegate_task(
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
+    # _tool_names_lock prevents concurrent gateway sessions from corrupting
+    # the value while we snapshot, build children, and restore.
     import model_tools as _model_tools
 
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    with _tool_names_lock:
+        _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
@@ -1966,35 +1984,37 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command")
-                or acp_command
-                or creds.get("command"),
-                override_acp_args=(
-                    task_acp_args
-                    if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
-                ),
-                role=effective_role,
-            )
+            with _tool_names_lock:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_acp_command=t.get("acp_command")
+                    or acp_command
+                    or creds.get("command"),
+                    override_acp_args=(
+                        task_acp_args
+                        if task_acp_args is not None
+                        else (acp_args if acp_args is not None else creds.get("args"))
+                    ),
+                    role=effective_role,
+                )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+        with _tool_names_lock:
+            _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)

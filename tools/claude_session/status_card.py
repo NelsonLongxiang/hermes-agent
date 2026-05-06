@@ -159,13 +159,15 @@ _TOOL_ICONS = {
 }
 
 
-def _build_header(session_name: str, session_id: str) -> str:
+def _build_header(session_name: str, session_id: str, tmux_session: str = "") -> str:
     """Build status card header with optional session identification."""
     header = "📊 Claude Status"
-    if session_name or session_id:
+    if session_name or session_id or tmux_session:
         parts = []
         if session_name:
             parts.append(session_name[:30])
+        if tmux_session:
+            parts.append(tmux_session)
         if session_id:
             parts.append(session_id)
         header += f" [{' · '.join(parts)}]"
@@ -173,19 +175,49 @@ def _build_header(session_name: str, session_id: str) -> str:
 
 
 def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500,
-                       session_name: str = "", session_id: str = "") -> str:
+                       session_name: str = "", session_id: str = "", tmux_session: str = "") -> str:
     """Format session state as a compact Telegram status card."""
+    real_time = observer_state or {}
+    # When observer reports a live state, prefer it over stale JSONL status.
+    # This prevents "Starting session..." from sticking when the JSONL file
+    # hasn't been written yet but the observer already detects IDLE/THINKING.
+    observer_state_name = real_time.get("state")
+    if observer_state_name and state["status"] in ("no_session", "empty"):
+        # Observer has real data — build card using observer state instead
+        header = _build_header(session_name, session_id, tmux_session)
+        lines = [header]
+
+        if observer_state_name == "THINKING":
+            lines.append("🤔 Thinking...")
+        elif observer_state_name == "TOOL_CALL":
+            lines.append("🔧 Working...")
+        elif observer_state_name == "PERMISSION":
+            lines.append("⏸️ Waiting for permission")
+        else:
+            lines.append("✅ Idle")
+
+        activity = real_time.get("current_activity", "")
+        activity_detail = real_time.get("activity_detail", "")
+        if activity and activity != "idle":
+            if activity_detail:
+                lines.append(f"⚡ {activity}: {activity_detail}")
+            else:
+                lines.append(f"⚡ {activity}")
+
+        result = "\n".join(lines)
+        if len(result) > max_length:
+            result = result[:max_length - 3] + "..."
+        return result
+
     if state["status"] == "no_session":
-        h = _build_header(session_name, session_id)
+        h = _build_header(session_name, session_id, tmux_session)
         return f"{h}\n⏳ Starting session..."
     if state["status"] == "empty":
-        h = _build_header(session_name, session_id)
+        h = _build_header(session_name, session_id, tmux_session)
         return f"{h}\n⏳ Waiting for activity..."
 
-    header = _build_header(session_name, session_id)
+    header = _build_header(session_name, session_id, tmux_session)
     lines = [header]
-
-    real_time = observer_state or {}
 
     # State indicator
     current_state = real_time.get("state") or state.get("state", "IDLE")
@@ -324,10 +356,12 @@ class StatusCard:
         bump_threshold: int = 3,
         session_name: str = "",
         session_id: str = "",
+        tmux_session: str = "",
     ):
         self._session_uuid = session_uuid
         self._session_name = session_name
         self._session_id = session_id
+        self._tmux_session = tmux_session
         self._loop = loop
         self._send_func = send_func
         self._edit_func = edit_func
@@ -350,6 +384,7 @@ class StatusCard:
         # State transition tracking (protected by _state_lock)
         self._state_lock = threading.Lock()
         self._prev_state: Optional[str] = None
+        self._pending_bump: bool = False
         self._prev_activity: Optional[str] = None
         self._STATE_TRANSITIONS = {
             ("IDLE", "THINKING"),
@@ -366,14 +401,26 @@ class StatusCard:
         }
 
     def _should_bump(self, new_state: str) -> bool:
-        """Check if state transition warrants a bump (new message at bottom)."""
+        """Check if state transition warrants a bump (new message at bottom).
+
+        When a valid transition is detected, sets ``_pending_bump`` so the bump
+        survives across polls until it is actually performed.
+        """
         with self._state_lock:
             if self._prev_state is None:
                 self._prev_state = new_state
                 return False
             transition = (self._prev_state, new_state)
             self._prev_state = new_state
-            return transition in self._STATE_TRANSITIONS
+            if transition in self._STATE_TRANSITIONS:
+                self._pending_bump = True
+                return True
+            return False
+
+    def _clear_pending_bump(self) -> None:
+        """Clear the pending-bump flag after a bump has been performed."""
+        with self._state_lock:
+            self._pending_bump = False
 
     def update_from_observer(self, info: dict) -> None:
         """Update cached observer state from real-time session monitoring."""
@@ -404,7 +451,7 @@ class StatusCard:
                     if self._message_id is None:
                         return
                     state = parse_jsonl(self._jsonl_path)
-                    card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
+                    card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id, tmux_session=self._tmux_session)
                     if card_text == self._last_card_text and not do_bump:
                         return
                     try:
@@ -465,7 +512,7 @@ class StatusCard:
     def _run_loop(self) -> None:
         """Background thread: polls JSONL and updates via Gateway adapter."""
         # Send initial message (with retries)
-        initial_text = format_status_card(parse_jsonl(self._jsonl_path), max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
+        initial_text = format_status_card(parse_jsonl(self._jsonl_path), max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id, tmux_session=self._tmux_session)
         sent = False
         for attempt in range(1, self._INIT_RETRIES + 1):
             try:
@@ -494,6 +541,7 @@ class StatusCard:
         self._last_card_text = initial_text
         self._last_edit_time = time.monotonic()
         self._prev_state = None
+        self._pending_bump = False
         self._prev_activity = None
 
         # Poll loop
@@ -501,7 +549,7 @@ class StatusCard:
         while self._running and not self._stop_event.is_set():
             try:
                 state = parse_jsonl(self._jsonl_path)
-                card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id)
+                card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id, tmux_session=self._tmux_session)
 
                 _poll_count += 1
                 if _poll_count <= 5 or _poll_count % 20 == 0:
@@ -513,7 +561,7 @@ class StatusCard:
                     )
 
                 current_state = (self._observer_state or {}).get("state", "IDLE")
-                should_bump = self._should_bump(current_state)
+                should_bump = self._should_bump(current_state) or self._pending_bump
 
                 if card_text != self._last_card_text:
                     logger.info(
@@ -539,7 +587,7 @@ class StatusCard:
                                 self._last_card_text = card_text
                                 self._last_edit_time = time.monotonic()
                                 self._bump_count = 0
-                            should_bump = False
+                            self._clear_pending_bump()
                         else:
                             future = asyncio.run_coroutine_threadsafe(
                                 self._edit_telegram(card_text), self._loop
@@ -549,6 +597,7 @@ class StatusCard:
                                 self._last_card_text = card_text
                                 self._last_edit_time = time.monotonic()
                                 self._bump_count = 0
+                                self._clear_pending_bump()
                             else:
                                 logger.warning("StatusCard edit failed (bump_count=%d)", self._bump_count)
                                 self._bump_count += 1
@@ -560,6 +609,7 @@ class StatusCard:
                                     self._last_card_text = card_text
                                     self._last_edit_time = time.monotonic()
                                     self._bump_count = 0
+                                    self._clear_pending_bump()
                 else:
                     now = time.monotonic()
                     if self._message_id and (now - self._last_edit_time) >= self._BUMP_INTERVAL:
@@ -583,6 +633,7 @@ class StatusCard:
                         self._last_card_text = card_text
                         self._last_edit_time = time.monotonic()
                         self._bump_count = 0
+                    self._clear_pending_bump()
             except Exception as e:
                 logger.warning("Status card poll error: %s", e)
 

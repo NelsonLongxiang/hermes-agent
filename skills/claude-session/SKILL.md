@@ -7,7 +7,8 @@ triggers:
   - "coding task"
   - "delegation"
   - "interactive session"
-version: 4.1
+version: 4.3
+code_commit: f30e117cc + observer-signal + pending-bump + adaptive-paste + stale-adapter-clean
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
     prompt: "Stream stale timeout (秒，推荐 300)"
@@ -49,7 +50,7 @@ required_environment_variables:
 │  │  - 缓冲输出供 API 查询                           │   │
 │  └─────────────────────────────────────────────────┘   │
 │       ↓                                                │
-│  StateMachine (状态检测)                               │
+│  StateDetection (纯函数 detect_state)                   │
 │       ↓                                                │
 │  tmux_interface (终端控制)                             │
 │       ↓                                                │
@@ -117,7 +118,7 @@ claude_session(action="wait_for_idle", timeout=60)  # 等待就绪
 
 # 第2轮：执行任务
 claude_session(action="send", message="Your task here")
-claude_session(action="wait_for_idle", timeout=300)  # 一次等到底
+claude_session(action="wait_for_idle", timeout=300)  # 一次等到底（工具默认900s）
 
 # 第3轮：获取结果
 result = claude_session(action="output", limit=100)
@@ -184,7 +185,7 @@ claude_session(action="start", name="backend", workdir="/project")
 
 ## State Awareness
 
-8个状态：`IDLE` `INPUTTING` `THINKING` `TOOL_CALL` `PERMISSION` `ERROR` `DISCONNECTED` `EXITED`
+7个状态：`IDLE` `THINKING` `TOOL_CALL` `PERMISSION` `ERROR` `DISCONNECTED` `EXITED`
 
 ```python
 # 检查状态
@@ -234,7 +235,6 @@ wait_for_idle(60) → 没完成 → wait_for_idle(300) → 没完成 → wait_fo
 **正确做法**：`wait_for_idle(900)` 一次给够 timeout，不中途打断
 
 ### 错误4：动画鬼影导致提前返回 IDLE
-### 错误4：动画鬼影导致提前返回 IDLE
 
 **现象**：`wait_for_idle` 返回 `status: idle`，但 `output_since_send` 显示的是动画（Forming/Unfurling/Jitterbugging/Stewing），命令实际结果未捕获。
 
@@ -253,22 +253,13 @@ if state == SessionState.IDLE:
     return {**self._build_idle_result(), "status": "idle"}
 ```
 
-### 错误5：参数单位混乱导致 stall 检测失效
+### 错误5：PATROL_INTERVAL 默认值过大（中低优）
 
-**现象**：`HERMES_CLAUDE_SESSION_PATROL_INTERVAL` 环境变量设置 300，但 300 秒后 stall 未触发。
+**现象**：`PATROL_INTERVAL=300`（5分钟）导致 THINKING/TOOL_CALL 状态轮询间隔过长。
 
-**原因**：
-- `PATROL_INTERVAL = int(os.environ.get("HERMES_CLAUDE_SESSION_PATROL_INTERVAL", "300"))` — 300 是**毫秒**，不是秒
-- `STALL_THRESHOLD` 定义了但从未使用，stall 实际由 `MAX_STALLED_PATROLS × PATROL_INTERVAL` 计算（错误）
-- 实际触发时间：3 × 300ms = **0.9 秒**，不是 30 分钟
+**现状**：代码中 THINKING 使用 `POLL_INTERVAL=180s`（3分钟），与 PATROL_INTERVAL 分离。
 
-**正确做法**：统一使用**秒**为单位
-```python
-PATROL_INTERVAL = int(os.environ.get("HERMES_CLAUDE_SESSION_PATROL_INTERVAL", "180"))  # 秒
-STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STALL_THRESHOLD", "1800"))  # 秒
-COMPACT_MIN_WAIT = 3600  # 1小时（秒）
-COMPACT_MAX_WAIT = 7200  # 2小时（秒）
-```
+**建议**：保持现状，observer 使用自适应轮询（THINKING=5s 已修复），wait_for_idle 使用 POLL_INTERVAL=180s。
 
 ---
 

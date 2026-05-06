@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Optional
 
 from tools.registry import registry, tool_error, tool_result
+from tools.claude_session.errors import SessionError
 
 # Module-level import of gateway session context — avoids repeated import on hot path.
 try:
@@ -475,6 +476,47 @@ CLAUDE_SESSION_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Output streaming helper
+# ---------------------------------------------------------------------------
+
+def _setup_output_streamer(mgr, gw_key: str):
+    """Create a SessionOutputStreamer if a gateway adapter is available.
+
+    Wires the streamer into the session's observer callback chain so
+    incremental output is pushed to the user's chat in real-time.
+    """
+    from tools.claude_session.stream_output import SessionOutputStreamer
+    try:
+        with _gateway_adapters_lock:
+            adapter_info = _gateway_adapters.get(gw_key)
+        if not adapter_info or not adapter_info.get("loop"):
+            return None
+        chat_id = adapter_info.get("chat_id", "")
+        if not chat_id:
+            return None
+
+        streamer = SessionOutputStreamer(mgr, adapter_info)
+
+        # Chain into existing status callback (preserves StatusCard updates)
+        existing_cb = mgr._status_callback
+
+        def _chained(info: dict) -> None:
+            if existing_cb:
+                try:
+                    existing_cb(info)
+                except Exception:
+                    pass
+            streamer.on_observer_update(info)
+
+        mgr._status_callback = _chained
+        mgr._output_streamer = streamer
+        return streamer
+    except Exception as e:
+        logger.debug("Output streamer setup failed: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
@@ -485,6 +527,9 @@ def _handle_claude_session(args, **kw):
 
     # ── start：创建新实例并注册（name 必填 + workdir 可选）──
     if action == "start":
+        # 每次 start 时清理过期 adapter，防止断开时未正确注销导致内存泄漏
+        _cleanup_stale_adapters()
+
         from tools.claude_session.session import ClaudeSession
 
         # name 必须提供（第一性原理：明确会话用途，避免自动命名的混淆）
@@ -505,9 +550,17 @@ def _handle_claude_session(args, **kw):
         sn = _derive_session_name(abs_workdir, gw_key, name=session_name_arg)
 
         # 查找已有会话（锁内仅读取注册表，不执行耗时操作）
+        # check-and-set: name 查找 + 占位符注册在同一锁内，防止并发 start
+        # 双重创建（TOCTOU fix）。
         _existing_resp = None
         with _sessions_lock:
             existing_sid = _name_index.get((gw_key, session_name_arg))
+            if existing_sid == "__starting__":
+                # 另一个线程正在创建同名会话 — 拒绝本次请求
+                return json.dumps(
+                    {"error": f"Session '{session_name_arg}' is currently being created by another request. Retry in a moment."},
+                    ensure_ascii=False,
+                )
             if existing_sid and existing_sid in _sessions and _sessions[existing_sid]._session_active:
                 _touch_active(gw_key, existing_sid, already_locked=True)
                 existing_mgr = _sessions[existing_sid]
@@ -585,13 +638,23 @@ def _handle_claude_session(args, **kw):
                 status_card_config=_status_card_config,
             )
 
+        except SessionError as e:
+            # 启动异常时清理占位
+            with _sessions_lock:
+                _name_index.pop((gw_key, session_name_arg), None)
+                workdir_idx_key = (gw_key, abs_workdir)
+                session_list = _workdir_index.get(workdir_idx_key, [])
+                if "__starting__" in session_list:
+                    updated_list = session_list.copy()
+                    updated_list.remove("__starting__")
+                    _workdir_index[workdir_idx_key] = updated_list
+            return json.dumps(e.to_dict() | {"name": session_name_arg}, ensure_ascii=False)
         except Exception as e:
             # 启动异常时清理占位
             with _sessions_lock:
                 _name_index.pop((gw_key, session_name_arg), None)
                 workdir_idx_key = (gw_key, abs_workdir)
                 session_list = _workdir_index.get(workdir_idx_key, [])
-                # 从列表中移除占位符（只移除一个，避免影响其他并发启动）
                 if "__starting__" in session_list:
                     updated_list = session_list.copy()
                     updated_list.remove("__starting__")
@@ -698,7 +761,10 @@ def _handle_claude_session(args, **kw):
             )
         # Clear callback before stop to prevent late callbacks to cleaned-up resources.
         mgr._status_callback = None
-        result = mgr.stop()
+        try:
+            result = mgr.stop()
+        except SessionError as e:
+            result = e.to_dict()
         if result.get("stopped"):
             stopped_id = result.get("session_id")
             with _sessions_lock:
@@ -758,30 +824,65 @@ def _handle_claude_session(args, **kw):
         message = args.get("message")
         if not message:
             return tool_error("message is required for send action")
-        result = mgr.send(message)
+        try:
+            result = mgr.send(message)
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "type":
         text = args.get("text")
         if not text:
             return tool_error("text is required for type action")
-        result = mgr.type_text(text)
+        try:
+            result = mgr.type_text(text)
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "submit":
-        result = mgr.submit()
+        try:
+            result = mgr.submit()
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "send_text":
         text = args.get("text")
         if not text:
             return tool_error("text is required for send_text action")
-        result = mgr.send_text(text)
+        try:
+            result = mgr.send_text(text)
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "cancel_input":
-        result = mgr.cancel_input()
+        try:
+            result = mgr.cancel_input()
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "status":
         result = mgr.status()
     elif action == "wait_for_idle":
-        result = mgr.wait_for_idle(timeout=args.get("timeout", 900))
+        try:
+            # Set up output streamer if gateway adapter is available
+            _streamer = _setup_output_streamer(mgr, gw_key)
+
+            result = mgr.wait_for_idle(timeout=args.get("timeout", 900))
+
+            # Finalize streamer (sends final edit without cursor)
+            if _streamer:
+                _streamer.finish()
+                mgr._output_streamer = None
+                if _streamer.already_sent:
+                    result["output_streamed"] = True
+
+        except SessionError as e:
+            if mgr._output_streamer:
+                mgr._output_streamer.finish()
+                mgr._output_streamer = None
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "wait_for_state":
         target = args.get("target_state")
         if not target:
             return tool_error("target_state is required for wait_for_state action")
-        result = mgr.wait_for_state(target_state=target, timeout=args.get("timeout", 60))
+        try:
+            result = mgr.wait_for_state(target_state=target, timeout=args.get("timeout", 60))
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "output":
         result = mgr.output(
             offset=args.get("offset", 0),
@@ -791,7 +892,10 @@ def _handle_claude_session(args, **kw):
         response = args.get("response")
         if not response:
             return tool_error("response is required for respond_permission action")
-        result = mgr.respond_permission(response)
+        try:
+            result = mgr.respond_permission(response)
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "history":
         result = mgr.history()
     elif action == "events":
