@@ -247,6 +247,7 @@ class ClaudeSession:
                     claude_cmd += f" --session-id {shlex.quote(self._claude_session_uuid)}"
                 if permission_mode == "skip":
                     claude_cmd += " --permission-mode bypassPermissions"
+                    claude_cmd = "CLAUDE_CODE_TRUST_WORKSPACE=0 " + claude_cmd
                 if model:
                     claude_cmd += f" --model {shlex.quote(model)}"
                 self._tmux.send_keys(claude_cmd, enter=True)
