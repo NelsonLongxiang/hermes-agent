@@ -30,10 +30,18 @@ from tools.claude_session.tmux_interface import TmuxInterface
 from tools.claude_session.task_context import TaskContext
 from tools.claude_session.observer import SessionObserver
 from tools.claude_session.status_card import StatusCard
+from tools.claude_session.errors import (
+    SessionError, TmuxError, TmuxNotFoundError, TmuxTimeoutError,
+    SessionDisconnectedError, SessionNotActiveError, StartupFailedError,
+    SessionExitedError, PermissionError, InvalidPermissionResponseError,
+    WaitTimeoutError, StallDetectedError, ValidationError,
+    wrap_tmux_error,
+)
 
 logger = logging.getLogger(__name__)
 
-PASTE_SUBMIT_DELAY_SECONDS = 10.0
+PASTE_SUBMIT_DELAY_SECONDS = 2.0
+_PASTE_POLL_INTERVAL = 0.1
 
 
 class _StateView:
@@ -102,6 +110,9 @@ class ClaudeSession:
         # Status card (optional Telegram real-time status)
         self._status_card: Optional[StatusCard] = None
 
+        # Output streamer (optional real-time output to chat)
+        self._output_streamer = None
+
     # ------------------------------------------------------------------
     # Backward compatibility shim
     # ------------------------------------------------------------------
@@ -149,7 +160,7 @@ class ClaudeSession:
                 }
 
             if permission_mode not in ("normal", "skip"):
-                return {"error": f"Invalid permission_mode: {permission_mode}"}
+                raise ValidationError(f"Invalid permission_mode: {permission_mode}")
 
             self._claude_session_uuid = str(uuid.uuid4())
 
@@ -259,10 +270,20 @@ class ClaudeSession:
                         pass
                     with self._lock:
                         self._initializing = False
-                    return {
-                        "error": f"Claude Code did not start within {STARTUP_HEALTH_TIMEOUT}s.",
-                    }
+                    raise StartupFailedError(
+                        f"Claude Code did not start within {STARTUP_HEALTH_TIMEOUT}s.",
+                        detail=f"session={session_name}",
+                    )
 
+        except SessionError:
+            with self._lock:
+                self._initializing = False
+            if self._tmux:
+                try:
+                    self._tmux.kill_session()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             with self._lock:
                 self._initializing = False
@@ -271,7 +292,7 @@ class ClaudeSession:
                     self._tmux.kill_session()
                 except Exception:
                     pass
-            return {"error": f"Failed to start session: {e}"}
+            raise wrap_tmux_error(e) from e
 
         # Phase 2: finalize (under lock)
         with self._lock:
@@ -323,7 +344,7 @@ class ClaudeSession:
         """Stop the session and clean up."""
         with self._lock:
             if not self._session_active:
-                return {"error": "No active session"}
+                raise SessionNotActiveError("No active session")
 
             if self._observer:
                 self._observer.stop()
@@ -378,9 +399,9 @@ class ClaudeSession:
         """Type text without pressing Enter."""
         with self._lock:
             if not self._session_active:
-                return {"error": "No active session"}
+                raise SessionNotActiveError("No active session")
             if self._state in (SessionState.EXITED, SessionState.DISCONNECTED):
-                return {"error": "Claude Code has exited."}
+                raise SessionExitedError("Claude Code has exited.")
             self._tmux.send_keys(text)
             return {"typed": True, "state": self._state}
 
@@ -388,9 +409,9 @@ class ClaudeSession:
         """Submit typed text by pressing Enter."""
         with self._lock:
             if not self._session_active:
-                return {"error": "No active session"}
+                raise SessionNotActiveError("No active session")
             if self._state in (SessionState.EXITED, SessionState.DISCONNECTED):
-                return {"error": "Claude Code has exited."}
+                raise SessionExitedError("Claude Code has exited.")
             self._tmux.send_special_key("Enter")
         return {"submitted": True, "state": self._state}
 
@@ -399,7 +420,7 @@ class ClaudeSession:
         logger.warning("cancel_input for session %s", self._session_id)
         with self._lock:
             if not self._session_active:
-                return {"error": "No active session"}
+                raise SessionNotActiveError("No active session")
             self._tmux.send_special_key("C-c")
             return {"cancelled": True, "state": self._state}
 
@@ -409,11 +430,11 @@ class ClaudeSession:
 
         with self._lock:
             if not self._session_active:
-                return {"error": "No active session"}
+                raise SessionNotActiveError("No active session")
             if not self._tmux:
-                return {"error": "No tmux interface"}
+                raise TmuxError("No tmux interface")
             if self._state in (SessionState.EXITED, SessionState.DISCONNECTED):
-                return {"error": "Claude Code has exited."}
+                raise SessionExitedError("Claude Code has exited.")
 
             self._send_marker = self._buf.total_count()
 
@@ -422,15 +443,33 @@ class ClaudeSession:
             else:
                 self._tmux.send_keys(text, enter=True)
 
-        # Multi-line: wait for bracketed paste, then submit
+        # Multi-line: wait for bracketed paste to land, then submit
         if is_multiline:
-            logger.info("Multi-line send: waiting %.1fs for paste...", PASTE_SUBMIT_DELAY_SECONDS)
-            time.sleep(PASTE_SUBMIT_DELAY_SECONDS)
-            self._tmux.send_special_key("Enter")
+            self._wait_for_paste_then_submit()
 
         # Refresh state
         self._refresh_state()
         return {"sent": True, "state": self._state}
+
+    def _wait_for_paste_then_submit(self) -> None:
+        """Wait for bracketed paste to land in tmux, then send Enter."""
+        baseline = self._send_marker
+        deadline = time.monotonic() + PASTE_SUBMIT_DELAY_SECONDS
+        settled = False
+
+        while time.monotonic() < deadline:
+            time.sleep(_PASTE_POLL_INTERVAL)
+            if self._buf.total_count() > baseline:
+                # Pane received new content — paste has landed
+                settled = True
+                break
+
+        if settled:
+            logger.info("Multi-line send: paste landed, submitting")
+        else:
+            logger.warning("Multi-line send: no pane change after %.1fs, submitting anyway", PASTE_SUBMIT_DELAY_SECONDS)
+
+        self._tmux.send_special_key("Enter")
 
     # ------------------------------------------------------------------
     # Status and wait
@@ -464,7 +503,7 @@ class ClaudeSession:
         "disconnected" | "exited" | "timeout"
         """
         if not self._session_active:
-            return {"error": "No active session", "status": "disconnected"}
+            raise SessionNotActiveError("No active session")
 
         # Timeout & patrol intervals (all in seconds)
         # PATROL_INTERVAL: how often to check for output growth when idle (default 300s = 5 min)
@@ -491,6 +530,13 @@ class ClaudeSession:
             self._update_state(result.state)
             state = self._state
 
+            # Push incremental output to streamer
+            if self._output_streamer:
+                try:
+                    self._output_streamer.poll_increment()
+                except Exception:
+                    pass
+
             # Terminal states
             if state == SessionState.IDLE:
                 # Guard against animation ghost: when IDLE is first detected,
@@ -507,10 +553,28 @@ class ClaudeSession:
                 return {**self._build_idle_result(), "status": "idle"}
 
             if state == SessionState.PERMISSION:
-                return {**self._build_permission_result(lines), "status": "permission"}
+                perm_context = self._build_permission_context(lines)
+
+                if self._permission_mode == "skip":
+                    logger.info("Auto-allowing permission in skip mode: %s",
+                                perm_context.get("permission_request", ""))
+                    self.respond_permission("allow")
+                    self._state_event.clear()
+                    self._state_event.wait(timeout=1)
+                    continue  # 继续等待 IDLE
+
+                # normal模式：返回上下文让Hermes决策
+                return {**perm_context, "status": "permission"}
 
             if state == SessionState.ERROR:
-                return {"state": state, "error_output": self._buf.last_n_chars(500), "status": "error"}
+                return {
+                    "state": state,
+                    "error_output": self._buf.last_n_chars(500),
+                    "status": "error",
+                    "error_type": "StateDetectionError",
+                    "severity": "transient",
+                    "retryable": True,
+                }
 
             if state == SessionState.DISCONNECTED:
                 return {"error": "Session disconnected", "state": state, "status": "disconnected"}
@@ -546,7 +610,10 @@ class ClaudeSession:
                 and (now - compact_start) < COMPACT_MAX_WAIT
             )
             if not compact_active and (now - last_growth_time) > STALL_THRESHOLD:
-                return {
+                return StallDetectedError(
+                    f"No output growth for {STALL_THRESHOLD}s",
+                    detail=f"state={state}, stalled={round(now - last_growth_time, 1)}s",
+                ).to_dict() | {
                     "status": "stalled",
                     "state": state,
                     "stalled_seconds": round(now - last_growth_time, 1),
@@ -563,7 +630,11 @@ class ClaudeSession:
 
         # Timeout
         elapsed = time.monotonic() - (deadline - timeout)
-        return {
+        err = WaitTimeoutError(
+            f"wait_for_idle timed out after {timeout}s",
+            detail=f"state={self._state}, elapsed={round(elapsed, 1)}s",
+        )
+        return err.to_dict() | {
             "status": "timeout",
             "state": self._state,
             "timeout_reached": True,
@@ -575,7 +646,7 @@ class ClaudeSession:
     def wait_for_state(self, target_state: str, timeout: int = 60) -> dict:
         """Wait for a specific state."""
         if not self._session_active:
-            return {"error": "No active session"}
+            raise SessionNotActiveError("No active session")
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -610,7 +681,7 @@ class ClaudeSession:
     def respond_permission(self, response: str) -> dict:
         """Respond to a permission request."""
         if response not in ("allow", "deny"):
-            return {"error": f"Invalid response: {response}"}
+            raise InvalidPermissionResponseError(f"Invalid response: {response}")
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -625,10 +696,10 @@ class ClaudeSession:
                     else:
                         if attempt < max_retries - 1:
                             continue
-                        return {
-                            "error": "Not in PERMISSION state",
-                            "hint": "Permission may have been auto-handled.",
-                        }
+                        raise PermissionError(
+                            "Not in PERMISSION state",
+                            detail="Permission may have been auto-handled.",
+                        )
 
                 is_numbered = self._detect_numbered_selector(pane)
                 if response == "allow":
@@ -649,7 +720,7 @@ class ClaudeSession:
             self._refresh_state()
             return {"responded": True, "state": self._state}
 
-        return {"error": "Not in PERMISSION state after retries"}
+        raise PermissionError("Not in PERMISSION state after retries")
 
     # ------------------------------------------------------------------
     # History / Events (simplified — no turn tracking)
@@ -689,15 +760,22 @@ class ClaudeSession:
             if result.state == SessionState.PERMISSION and self._permission_mode == "skip":
                 self._auto_approve_permission()
         except Exception as e:
-            logger.warning("State refresh failed: %s", e)
-            # Detect tmux session loss and update state
-            err_msg = str(e).lower()
-            if "session not found" in err_msg or "can't find session" in err_msg or "no session" in err_msg:
-                logger.warning("Tmux session lost, updating state to DISCONNECTED")
+            session_err = wrap_tmux_error(e)
+            logger.warning("State refresh failed: %s [%s]", session_err, session_err.severity.value)
+            if isinstance(session_err, SessionDisconnectedError):
                 self._update_state(SessionState.DISCONNECTED)
 
     def _on_observer_update(self, info: dict) -> None:
         """Called by observer thread with activity updates."""
+        # Signal wait_for_idle when observer detects a terminal state,
+        # so it wakes immediately instead of sleeping through POLL_INTERVAL.
+        observed_state = info.get("state")
+        if observed_state in (
+            SessionState.IDLE, SessionState.PERMISSION, SessionState.ERROR,
+            SessionState.DISCONNECTED, SessionState.EXITED,
+        ):
+            self._state_event.set()
+
         if self._status_callback:
             try:
                 now = time.monotonic()
@@ -759,6 +837,7 @@ class ClaudeSession:
                 bump_threshold=config.get("bump_threshold", 3),
                 session_name=self._session_name or "",
                 session_id=self._session_id or "",
+                tmux_session=self._tmux.session_name if self._tmux else "",
             )
             self._status_card.start()
 
@@ -809,6 +888,92 @@ class ClaudeSession:
                     result["permission_request"] = line
                     break
         return result
+
+    def _build_permission_context(self, lines: list = None) -> dict:
+        """构建权限上下文，供Hermes智能决策使用"""
+        context = {
+            "state": SessionState.PERMISSION,
+            "needs_hermes_decision": True,
+            "permission_request": "",
+            "operation": "",
+            "target": "",
+            "risk_level": "unknown",
+        }
+
+        if not lines:
+            return context
+
+        # 从输出中提取权限请求详情
+        for line in reversed(lines[-15:]):
+            lower = line.lower()
+            if "allow" in lower or "permission" in lower or "proceed?" in lower:
+                context["permission_request"] = line.strip()
+                break
+
+        # 识别操作类型和目标
+        for line in lines:
+            stripped = line.strip()
+            # Edit/Write 操作
+            m = re.match(r"●\s*(Edit|Write|MultiEdit)\s+(.+)", stripped)
+            if m:
+                context["operation"] = m.group(1)
+                context["target"] = m.group(2).strip()
+                context["risk_level"] = self._assess_risk(m.group(1), m.group(2))
+                break
+            # Bash 操作
+            m = re.match(r"●\s*Bash\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = "Bash"
+                context["target"] = m.group(1).strip()
+                context["risk_level"] = self._assess_risk("Bash", m.group(1))
+                break
+            # 只读操作（低风险）
+            m = re.match(r"●\s*(Grep|Search|WebFetch|Read)\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = m.group(1)
+                context["target"] = m.group(2).strip()
+                context["risk_level"] = "low"
+                break
+
+        # 如果没有检测到具体操作，从权限文本推断
+        if not context["operation"] and context["permission_request"]:
+            req_lower = context["permission_request"].lower()
+            if "edit" in req_lower or "write" in req_lower:
+                context["operation"] = "Edit"
+            elif "delete" in req_lower or "remove" in req_lower:
+                context["operation"] = "Delete"
+                context["risk_level"] = "high"
+            elif "run" in req_lower or "execute" in req_lower:
+                context["operation"] = "Bash"
+                context["risk_level"] = "high"
+
+        return context
+
+    def _assess_risk(self, operation: str, target: str) -> str:
+        """评估操作风险等级"""
+        target_lower = target.lower()
+
+        # 高风险模式
+        high_risk_patterns = [
+            r"rm\s+-rf\b", r"\bdelete\b", r"\bremove\b", r"\bdrop\b",
+            r"chmod\s+0?[0-7]{3}",
+            r"system", r"/etc", r"/usr", r"sudo",
+            r"\.\./", r"\.\.\\",
+        ]
+        for pattern in high_risk_patterns:
+            if re.search(pattern, target_lower, re.IGNORECASE):
+                return "high"
+
+        # 中风险模式
+        medium_risk_patterns = [
+            r"chmod", r"chown", r"mv\s+", r"cp\s+",
+            r"~/", r"/home", r"\.config",
+        ]
+        for pattern in medium_risk_patterns:
+            if re.search(pattern, target_lower, re.IGNORECASE):
+                return "medium"
+
+        return "low"
 
     def _get_output_since_send(self) -> str:
         lines = self._buf.since(self._send_marker)
