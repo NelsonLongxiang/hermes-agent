@@ -13435,23 +13435,15 @@ class GatewayRunner:
         if _status_adapter and source.platform != Platform.WEBHOOK:
             try:
                 from tools.claude_session_tool import (
-                    register_status_observer,
                     _get_gateway_session_key,
                 )
 
-                # Dummy observer callback — StatusCard gets its updates
-                # via session._on_observer_update, not via this bridge.
-                def _claude_session_status_bridge(
-                    session_id: str, status_info: dict,
-                ) -> None:
-                    pass  # Observers notify StatusCard through session._status_callback
-
                 _saved_gw_key = _get_gateway_session_key()
-                register_status_observer(
-                    _claude_session_status_bridge,
-                    gateway_session_key=_saved_gw_key,
-                )
-                # Register adapter for StatusCard to send messages via Gateway
+                # Register adapter for StatusCard to send/edit/delete messages
+                # via the Gateway's platform adapter.  Turn-scoped: registered
+                # at turn start, unregistered in the finally block so a new
+                # turn re-registers with the current adapter (adapter may
+                # change across turns if the platform connection is replaced).
                 register_gateway_adapter(
                     gateway_session_key=_saved_gw_key,
                     loop=_loop_for_step,
@@ -13462,7 +13454,7 @@ class GatewayRunner:
                 )
             except Exception as _e:
                 logger.warning("Could not set up claude session status bridge: %s", _e)
-                _saved_gw_key = _get_gateway_session_key()
+                _saved_gw_key = None
 
         def run_sync():
             # The conditional re-assignment of `message` further below
@@ -14736,14 +14728,11 @@ class GatewayRunner:
             interrupt_monitor.cancel()
             _notify_task.cancel()
 
-            # Clean up claude session status observer and finalize message
+            # Clean up claude session gateway adapter (turn-scoped)
             if _saved_gw_key:
                 try:
                     from tools.claude_session_tool import (
                         unregister_status_observer,
-                    )
-                    unregister_status_observer(
-                        gateway_session_key=_saved_gw_key,
                     )
                     unregister_gateway_adapter(
                         gateway_session_key=_saved_gw_key,
