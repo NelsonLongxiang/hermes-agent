@@ -7,6 +7,7 @@ from tools.claude_session.idle import (
     detect_startup_scene, strip_ansi, is_permission_in_text,
 )
 from tools.claude_session.session import ClaudeSession, _StateView
+from tools.claude_session.errors import SessionNotActiveError
 
 
 # ---------------------------------------------------------------------------
@@ -190,19 +191,19 @@ class TestClaudeSessionBasic:
 
     def test_send_no_session(self):
         s = ClaudeSession()
-        result = s.send("hello")
-        assert "error" in result
+        with pytest.raises(SessionNotActiveError):
+            s.send("hello")
 
     def test_send_task_context_no_session(self):
         s = ClaudeSession()
         tc = TaskContext(task_description="test")
-        result = s.send(tc)
-        assert "error" in result
+        with pytest.raises(SessionNotActiveError):
+            s.send(tc)
 
     def test_stop_no_session(self):
         s = ClaudeSession()
-        result = s.stop()
-        assert "error" in result
+        with pytest.raises(SessionNotActiveError):
+            s.stop()
 
     def test_output_no_session(self):
         s = ClaudeSession()
