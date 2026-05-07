@@ -718,6 +718,7 @@ class ClaudeSession:
                     else:
                         self._tmux.send_keys("n", enter=True)
 
+            time.sleep(0.5)  # 等待 Claude 处理权限
             self._refresh_state()
             return {"responded": True, "state": self._state}
 
