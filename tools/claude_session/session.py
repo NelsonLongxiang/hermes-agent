@@ -101,6 +101,10 @@ class ClaudeSession:
         # Prevent double permission response
         self._permission_responded = False
 
+        # Initialization grace period — don't trust observer non-IDLE states during startup
+        self._session_ready_time: Optional[float] = None  # None until fully initialized
+        self._startup_grace_period: float = 5.0  # seconds
+
         # Status callback
         self._status_callback = None
 
@@ -303,6 +307,7 @@ class ClaudeSession:
             self._initializing = False
             self._session_active = True
             self._session_start_time = time.monotonic()
+            self._session_ready_time = time.monotonic()  # Mark session as fully initialized
             self._update_state(SessionState.IDLE)
 
             # Start status card first (sets self._status_callback for observer)
@@ -495,6 +500,7 @@ class ClaudeSession:
             "output_tail": self._buf.last_n_chars(200),
             "current_activity": activity.get("activity", "idle"),
             "activity_detail": activity.get("detail", ""),
+            "session_ready": self._session_ready_time is not None,
         }
 
     def wait_for_idle(self, timeout: int = 1800) -> dict:
