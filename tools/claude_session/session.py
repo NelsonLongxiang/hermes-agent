@@ -98,6 +98,9 @@ class ClaudeSession:
         self._gateway_session_key: str = ""
         self._session_name: Optional[str] = None
 
+        # Prevent double permission response
+        self._permission_responded = False
+
         # Status callback
         self._status_callback = None
 
@@ -684,6 +687,7 @@ class ClaudeSession:
         if response not in ("allow", "deny"):
             raise InvalidPermissionResponseError(f"Invalid response: {response}")
 
+        self._permission_responded = True
         max_retries = 3
         for attempt in range(max_retries):
             with self._lock:
@@ -857,11 +861,15 @@ class ClaudeSession:
 
     def _auto_approve_permission(self) -> None:
         """Auto-approve permission in skip mode."""
+        if self._permission_responded:
+            self._permission_responded = False
+            return
         for _ in range(3):
             time.sleep(0.3)
             pane = self._tmux.capture_pane()
             if not is_permission_in_text(pane):
                 self._update_state(SessionState.THINKING)
+                self._permission_responded = False
                 return
 
             is_numbered = self._detect_numbered_selector(pane)
@@ -873,6 +881,7 @@ class ClaudeSession:
             time.sleep(0.5)
             self._refresh_state()
             if self._state != SessionState.PERMISSION:
+                self._permission_responded = False
                 return
 
     def _build_idle_result(self) -> dict:
