@@ -219,8 +219,15 @@ def format_status_card(state: dict, observer_state: dict = None, max_length: int
     header = _build_header(session_name, session_id, tmux_session)
     lines = [header]
 
-    # State indicator
-    current_state = real_time.get("state") or state.get("state", "IDLE")
+    # State indicator — trust session state over observer when session is IDLE
+    # Observer polls every 5s and may report stale THINKING while Claude is actually idle
+    session_state = state.get("state", "IDLE")
+    if session_state == "IDLE":
+        # Trust session's IDLE — it's more accurate than stale observer state
+        current_state = "IDLE"
+    else:
+        current_state = real_time.get("state") or session_state
+
     if current_state == "THINKING":
         lines.append("🤔 Thinking...")
     elif current_state == "TOOL_CALL":
