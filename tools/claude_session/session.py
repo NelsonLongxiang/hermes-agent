@@ -129,12 +129,13 @@ class ClaudeSession:
         return _StateView(self)
 
     def _update_state(self, new_state: str) -> None:
-        if new_state != self._state:
-            old = self._state
-            self._state = new_state
-            self._state_entered = time.monotonic()
-            self._state_event.set()
-            logger.debug("State: %s → %s", old, new_state)
+        with self._lock:
+            if new_state != self._state:
+                old = self._state
+                self._state = new_state
+                self._state_entered = time.monotonic()
+                self._state_event.set()
+                logger.debug("State: %s → %s", old, new_state)
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -549,16 +550,10 @@ class ClaudeSession:
 
             # Terminal states
             if state == SessionState.IDLE:
-                # Guard against animation ghost: when IDLE is first detected,
-                # wait a short moment and confirm the prompt is still stable
-                # (animations like "Forming…" can produce a transient ❯ before clearing)
-                time.sleep(0.5)
-                confirm_pane = self._tmux.capture_pane()
-                confirm_lines = clean_lines(confirm_pane)
-                confirm_result = detect_state(confirm_lines)
-                if confirm_result.state != SessionState.IDLE:
-                    # Still transitioning, continue waiting
-                    self._update_state(confirm_result.state)
+                # Guard against animation ghost (Forming/Unfurling etc. 3-8s).
+                # Confirm IDLE with 3 successive stable checks over 2 seconds.
+                idle_confirmed = self._confirm_idle_stable(checks=3, interval=0.7)
+                if not idle_confirmed:
                     continue
                 return {**self._build_idle_result(), "status": "idle"}
 
@@ -889,6 +884,24 @@ class ClaudeSession:
             if self._state != SessionState.PERMISSION:
                 self._permission_responded = False
                 return
+
+    def _confirm_idle_stable(self, checks: int = 3, interval: float = 0.7) -> bool:
+        """Confirm IDLE is stable across multiple checks (defeats animation ghosts).
+
+        Claude Code animations (Forming, Unfurling, etc.) can produce transient
+        ❯ prompts that last 3-8 seconds. A single 0.5s confirmation is insufficient.
+        This method polls `checks` times over `checks * interval` seconds and
+        only returns True if ALL checks agree on IDLE.
+        """
+        for _ in range(checks):
+            time.sleep(interval)
+            pane = self._tmux.capture_pane()
+            lines = clean_lines(pane)
+            result = detect_state(lines)
+            if result.state != SessionState.IDLE:
+                self._update_state(result.state)
+                return False
+        return True
 
     def _build_idle_result(self) -> dict:
         return {
