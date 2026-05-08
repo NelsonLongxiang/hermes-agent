@@ -90,7 +90,7 @@ class ClaudeSession:
         self._send_marker: int = 0
 
         # Threading
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock: allows reentrant locking from same thread
         self._state_event = threading.Event()
         self._initializing = False
 
