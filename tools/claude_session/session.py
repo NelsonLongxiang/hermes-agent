@@ -100,6 +100,7 @@ class ClaudeSession:
 
         # Prevent double permission response
         self._permission_responded = False
+        self._permission_auto_allow_low_risk = True  # auto-allow low-risk in normal mode
 
         # Initialization grace period — don't trust observer non-IDLE states during startup
         self._session_ready_time: Optional[float] = None  # None until fully initialized
@@ -571,7 +572,18 @@ class ClaudeSession:
                     self._state_event.wait(timeout=1)
                     continue  # 继续等待 IDLE
 
-                # normal模式：返回上下文让Hermes决策
+                # normal模式：low风险自动批准，medium/high交给Hermes决策
+                risk = perm_context.get("risk_level", "medium")
+                if risk == "low":
+                    logger.info("Auto-allowing low-risk permission: %s %s",
+                                perm_context.get("operation", ""),
+                                perm_context.get("target", ""))
+                    self.respond_permission("allow")
+                    self._state_event.clear()
+                    self._state_event.wait(timeout=1)
+                    continue  # 继续等待 IDLE
+
+                # medium/high风险：返回上下文让Hermes决策
                 return {**perm_context, "status": "permission"}
 
             if state == SessionState.ERROR:
@@ -766,9 +778,12 @@ class ClaudeSession:
             result = detect_state(lines)
             self._update_state(result.state)
 
-            # Auto-approve in skip mode
-            if result.state == SessionState.PERMISSION and self._permission_mode == "skip":
-                self._auto_approve_permission()
+            # Auto-approve in skip mode or low-risk in normal mode
+            if result.state == SessionState.PERMISSION:
+                if self._permission_mode == "skip":
+                    self._auto_approve_permission()
+                elif self._permission_auto_allow_low_risk:
+                    self._try_auto_approve_low_risk(pane)
         except Exception as e:
             session_err = wrap_tmux_error(e)
             logger.warning("State refresh failed: %s [%s]", session_err, session_err.severity.value)
@@ -887,6 +902,23 @@ class ClaudeSession:
             if self._state != SessionState.PERMISSION:
                 self._permission_responded = False
                 return
+
+    def _try_auto_approve_low_risk(self, pane_text: str) -> None:
+        """Auto-approve low-risk permissions even in normal mode.
+
+        Called from _refresh_state when permission is detected and mode is 'normal'.
+        Builds permission context, checks risk level, and auto-allows if low risk.
+        """
+        if self._permission_responded:
+            return
+        lines = clean_lines(pane_text)
+        perm_context = self._build_permission_context(lines)
+        risk = perm_context.get("risk_level", "medium")
+        if risk == "low":
+            logger.info("Auto-allowing low-risk permission (observer path): %s %s",
+                        perm_context.get("operation", ""),
+                        perm_context.get("target", ""))
+            self._auto_approve_permission()
 
     def _confirm_idle_stable(self, checks: int = 3, interval: float = 0.7) -> bool:
         """Confirm IDLE is stable across multiple checks (defeats animation ghosts).
