@@ -101,6 +101,7 @@ class ClaudeSession:
         # Prevent double permission response
         self._permission_responded = False
         self._permission_auto_allow_low_risk = True  # auto-allow low-risk in normal mode
+        self._in_auto_approve = False  # guard against recursive _auto_approve_permission
 
         # Initialization grace period — don't trust observer non-IDLE states during startup
         self._session_ready_time: Optional[float] = None  # None until fully initialized
@@ -779,7 +780,8 @@ class ClaudeSession:
             self._update_state(result.state)
 
             # Auto-approve in skip mode or low-risk in normal mode
-            if result.state == SessionState.PERMISSION:
+            # Guard: skip if already inside _auto_approve_permission to prevent recursion
+            if result.state == SessionState.PERMISSION and not self._in_auto_approve:
                 if self._permission_mode == "skip":
                     self._auto_approve_permission()
                 elif self._permission_auto_allow_low_risk:
@@ -883,34 +885,43 @@ class ClaudeSession:
         if self._permission_responded:
             self._permission_responded = False
             return
-        for _ in range(3):
-            time.sleep(0.3)
-            pane = self._tmux.capture_pane()
-            if not is_permission_in_text(pane):
-                self._update_state(SessionState.THINKING)
-                self._permission_responded = False
-                return
+        self._in_auto_approve = True
+        try:
+            for _ in range(3):
+                time.sleep(0.3)
+                pane = self._tmux.capture_pane()
+                if not is_permission_in_text(pane):
+                    self._update_state(SessionState.THINKING)
+                    self._permission_responded = False
+                    return
 
-            is_numbered = self._detect_numbered_selector(pane)
-            if is_numbered:
-                self._tmux.send_special_key("Enter")
-            else:
-                self._tmux.send_keys("y", enter=True)
+                is_numbered = self._detect_numbered_selector(pane)
+                if is_numbered:
+                    self._tmux.send_special_key("Enter")
+                else:
+                    self._tmux.send_keys("y", enter=True)
 
-            time.sleep(0.5)
-            self._refresh_state()
-            if self._state != SessionState.PERMISSION:
-                self._permission_responded = False
-                return
+                time.sleep(0.5)
+                self._refresh_state()
+                if self._state != SessionState.PERMISSION:
+                    self._permission_responded = False
+                    return
+        finally:
+            self._in_auto_approve = False
 
     def _try_auto_approve_low_risk(self, pane_text: str) -> None:
         """Auto-approve low-risk permissions even in normal mode.
 
         Called from _refresh_state when permission is detected and mode is 'normal'.
         Builds permission context, checks risk level, and auto-allows if low risk.
+        Uses _lock to prevent race with wait_for_idle's permission handling.
         """
-        if self._permission_responded:
-            return
+        with self._lock:
+            if self._permission_responded:
+                return
+            # Claim immediately to prevent concurrent paths
+            self._permission_responded = True
+
         lines = clean_lines(pane_text)
         perm_context = self._build_permission_context(lines)
         risk = perm_context.get("risk_level", "medium")
@@ -919,6 +930,9 @@ class ClaudeSession:
                         perm_context.get("operation", ""),
                         perm_context.get("target", ""))
             self._auto_approve_permission()
+        else:
+            # Not low-risk, release the flag so wait_for_idle can handle it
+            self._permission_responded = False
 
     def _confirm_idle_stable(self, checks: int = 3, interval: float = 0.7) -> bool:
         """Confirm IDLE is stable across multiple checks (defeats animation ghosts).
@@ -962,7 +976,7 @@ class ClaudeSession:
             "permission_request": "",
             "operation": "",
             "target": "",
-            "risk_level": "unknown",
+            "risk_level": "medium",
         }
 
         if not lines:
@@ -1022,7 +1036,7 @@ class ClaudeSession:
         high_risk_patterns = [
             r"rm\s+-rf\b", r"\bdelete\b", r"\bremove\b", r"\bdrop\b",
             r"chmod\s+0?[0-7]{3}",
-            r"system", r"/etc", r"/usr", r"sudo",
+            r"\bsystem\s+", r"/etc", r"/usr", r"\bsudo\b",
             r"\.\./", r"\.\.\\",
         ]
         for pattern in high_risk_patterns:
