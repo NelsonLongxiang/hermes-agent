@@ -129,13 +129,16 @@ class ClaudeSession:
         return _StateView(self)
 
     def _update_state(self, new_state: str) -> None:
+        changed = False
         with self._lock:
             if new_state != self._state:
                 old = self._state
                 self._state = new_state
                 self._state_entered = time.monotonic()
                 self._state_event.set()
-                logger.debug("State: %s → %s", old, new_state)
+                changed = True
+        if changed:
+            logger.debug("State: %s → %s", old, new_state)
 
     # ------------------------------------------------------------------
     # Session lifecycle
