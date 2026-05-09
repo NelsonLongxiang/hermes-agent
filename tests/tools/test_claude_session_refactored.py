@@ -1,6 +1,7 @@
 """Tests for refactored claude_session modules: task_context, idle, session."""
 
 import pytest
+from unittest.mock import MagicMock, patch
 from tools.claude_session.task_context import TaskContext, FileContext
 from tools.claude_session.idle import (
     SessionState, clean_lines, detect_state, detect_activity,
@@ -214,3 +215,307 @@ class TestClaudeSessionBasic:
         s = ClaudeSession()
         result = s.history()
         assert result["total_turns"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Interview state detection tests
+# ---------------------------------------------------------------------------
+
+class TestInterviewDetection:
+    """Tests for INTERVIEW state detection in idle.py."""
+
+    def test_interview_with_navigation_hints(self):
+        """Interview mode with navigation hints + numbered options."""
+        lines = [
+            "←  ☐ 运行环境  ☐ M1 范围  ✔ Submit  →",
+            "❯ 1. WSL 内运行",
+            "2. 混合环境",
+            "3. 都用 Windows",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_interview_with_sections_only(self):
+        """Interview mode with checkbox sections and numbered options."""
+        lines = [
+            "←  ☐ 运行环境  ☐ M1 范围  ✔ Submit  →",
+            "Ready to submit your answers?",
+            "❯ 1. Submit answers",
+            "2. Cancel ⋯",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_interview_with_numbered_options_and_nav(self):
+        """Interview mode: numbered options + nav hints with ❯ cursor."""
+        lines = [
+            "❯ 1. WSL 内运行",
+            "2. 混合环境",
+            "3. 都用 Windows",
+            "4. Type something.",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_interview_not_confused_with_permission(self):
+        """Permission selector should not be detected as INTERVIEW."""
+        lines = [
+            "Allow Bash command?",
+            "❯ 1. Yes",
+            "  2. No",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.PERMISSION
+
+    def test_interview_not_confused_with_idle(self):
+        """Interview mode should NOT return IDLE."""
+        lines = [
+            "❯ 1. WSL 内运行",
+            "2. 混合环境",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+        assert result.state != SessionState.IDLE
+
+    def test_interview_not_triggered_without_nav_or_sections(self):
+        """Numbered options alone without nav hints or sections should not trigger INTERVIEW."""
+        lines = [
+            "Some output",
+            "❯ 1. First option",
+            "2. Second option",
+        ]
+        result = detect_state(lines)
+        # Should not be INTERVIEW (no nav hints, no section markers)
+        assert result.state != SessionState.INTERVIEW
+
+    def test_bare_type_something_not_false_positive(self):
+        """Bare 'Type something.' in prose should not trigger INTERVIEW."""
+        lines = [
+            "To fix this, type something. Then press Enter.",
+            "❯ 1. Option A",
+        ]
+        result = detect_state(lines)
+        assert result.state != SessionState.INTERVIEW
+
+    def test_numbered_explanations_not_false_positive(self):
+        """Claude's numbered explanations without ❯ cursor or nav hints should not trigger."""
+        lines = [
+            "Here are the steps:",
+            "1. First step",
+            "2. Second step",
+            "3. Third step",
+            "Enter to select · Tab/Arrow keys to navigate",
+        ]
+        result = detect_state(lines)
+        assert result.state != SessionState.INTERVIEW
+
+    def test_interview_with_ctrl_o_hint(self):
+        """Interview mode with ctrl+o hint."""
+        lines = [
+            "❯ 1. Option A",
+            "2. Option B",
+            "ctrl+o to expand",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_interview_with_type_something_hint(self):
+        """Interview mode with numbered 'Type something.' hint."""
+        lines = [
+            "❯ 1. Chat about this",
+            "2. Skip interview and plan immediately",
+            "4. Type something.",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_interview_has_higher_priority_than_tool_call(self):
+        """INTERVIEW should be detected before TOOL_CALL when both patterns exist."""
+        lines = [
+            "● Read some_file.py",
+            "←  ☐ Question  ✔ Submit  →",
+            "❯ 1. Option A",
+            "2. Option B",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.INTERVIEW
+
+    def test_permission_has_higher_priority_than_interview(self):
+        """PERMISSION should be detected before INTERVIEW."""
+        lines = [
+            "Allow Bash command?",
+            "❯ 1. Yes",
+            "  2. No",
+            "Enter to select · Tab/Arrow keys to navigate",
+        ]
+        result = detect_state(lines)
+        assert result.state == SessionState.PERMISSION
+
+
+# ---------------------------------------------------------------------------
+# Interview context building tests
+# ---------------------------------------------------------------------------
+
+class TestInterviewContext:
+    """Tests for _build_interview_context in session.py."""
+
+    def test_build_context_extracts_options(self):
+        s = ClaudeSession()
+        lines = [
+            "←  ☐ 运行环境  ☐ M1 范围  ✔ Submit  →",
+            "❯ 1. WSL 内运行",
+            "2. 混合环境",
+            "3. 都用 Windows",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+        ctx = s._build_interview_context(lines)
+        assert ctx["state"] == SessionState.INTERVIEW
+        assert ctx["needs_hermes_decision"] is True
+        assert len(ctx["options"]) == 3
+        assert ctx["options"][0]["number"] == 1
+        assert ctx["options"][0]["text"] == "WSL 内运行"
+        assert ctx["options"][0]["selected"] is True
+        assert ctx["options"][1]["selected"] is False
+
+    def test_build_context_extracts_sections(self):
+        s = ClaudeSession()
+        lines = [
+            "←  ☐ 运行环境  ☐ M1 范围  ✔ Submit  →",
+            "❯ 1. Submit answers",
+            "2. Cancel ⋯",
+        ]
+        ctx = s._build_interview_context(lines)
+        assert len(ctx["sections"]) >= 3  # at least 运行环境, M1 范围, Submit
+        checked = [sec for sec in ctx["sections"] if sec["checked"]]
+        unchecked = [sec for sec in ctx["sections"] if not sec["checked"]]
+        assert len(checked) >= 1  # Submit is ✔
+        assert len(unchecked) >= 1  # ☐ sections
+        # Verify multi-word labels are captured fully (not truncated)
+        labels = [sec["label"] for sec in ctx["sections"]]
+        assert any("M1 范围" in label for label in labels), f"Expected 'M1 范围' in {labels}"
+
+    def test_build_context_extracts_question(self):
+        s = ClaudeSession()
+        lines = [
+            "What is your environment?",
+            "❯ 1. WSL 内运行",
+            "2. 混合环境",
+            "Enter to select",
+        ]
+        ctx = s._build_interview_context(lines)
+        assert "What is your environment?" in ctx["question"]
+
+    def test_build_context_question_not_confused_with_numbered_option(self):
+        """Numbered options containing '?' should not be picked as the question."""
+        s = ClaudeSession()
+        lines = [
+            "What is your environment?",
+            "❯ 1. WSL 内运行",
+            "2. Use Windows?",
+            "Enter to select",
+        ]
+        ctx = s._build_interview_context(lines)
+        assert "What is your environment?" in ctx["question"]
+        assert "Use Windows?" not in ctx["question"]
+
+    def test_build_context_empty_lines(self):
+        s = ClaudeSession()
+        ctx = s._build_interview_context(None)
+        assert ctx["state"] == SessionState.INTERVIEW
+        assert ctx["options"] == []
+        assert ctx["sections"] == []
+
+    def test_build_context_no_question(self):
+        s = ClaudeSession()
+        lines = [
+            "←  ☐ Config  ✔ Submit  →",
+            "❯ 1. Submit",
+        ]
+        ctx = s._build_interview_context(lines)
+        assert ctx["question"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Interview response tests
+# ---------------------------------------------------------------------------
+
+class TestRespondInterview:
+    """Tests for respond_interview in session.py."""
+
+    def test_respond_no_session_raises(self):
+        s = ClaudeSession()
+        with pytest.raises(SessionNotActiveError):
+            s.respond_interview("1")
+
+    def test_respond_wrong_state_raises(self):
+        """respond_interview should reject when not in INTERVIEW state."""
+        s = ClaudeSession()
+        s._session_active = True
+        s._state = SessionState.THINKING
+        with pytest.raises(SessionNotActiveError, match="Not in INTERVIEW state"):
+            s.respond_interview("1")
+
+    def test_respond_enter(self):
+        s = ClaudeSession()
+        s._session_active = True
+        s._tmux = MagicMock()
+        s._state = SessionState.INTERVIEW
+        with patch.object(s, '_refresh_state'):
+            result = s.respond_interview("enter")
+        s._tmux.send_special_key.assert_called_once_with("Enter")
+        assert result["responded"] is True
+
+    def test_respond_escape(self):
+        s = ClaudeSession()
+        s._session_active = True
+        s._tmux = MagicMock()
+        s._state = SessionState.INTERVIEW
+        with patch.object(s, '_refresh_state'):
+            result = s.respond_interview("escape")
+        s._tmux.send_special_key.assert_called_once_with("Escape")
+        assert result["responded"] is True
+
+    def test_respond_number_navigate_and_select(self):
+        s = ClaudeSession()
+        s._session_active = True
+        s._tmux = MagicMock()
+        s._state = SessionState.INTERVIEW
+
+        # Mock capture_pane to return interview output with cursor on option 1
+        pane_text = "❯ 1. Option A\n2. Option B\n3. Option C"
+        s._tmux.capture_pane.return_value = pane_text
+
+        with patch.object(s, '_refresh_state'):
+            result = s.respond_interview("3")
+
+        # Should navigate Down twice (1→2→3) then press Enter
+        calls = s._tmux.send_special_key.call_args_list
+        assert calls[0][0][0] == "Down"
+        assert calls[1][0][0] == "Down"
+        assert calls[2][0][0] == "Enter"
+        assert result["responded"] is True
+
+    def test_respond_option_zero_rejected(self):
+        """Option '0' should fall through to custom text path (not isdigit()>0)."""
+        s = ClaudeSession()
+        s._session_active = True
+        s._tmux = MagicMock()
+        s._state = SessionState.INTERVIEW
+        with patch.object(s, '_refresh_state'):
+            result = s.respond_interview("0")
+        # "0" is a digit but int("0") > 0 is False, so it falls to custom text
+        s._tmux.send_keys.assert_called_once_with("0", enter=True)
+        assert result["responded"] is True
+
+    def test_respond_custom_text(self):
+        s = ClaudeSession()
+        s._session_active = True
+        s._tmux = MagicMock()
+        s._state = SessionState.INTERVIEW
+        with patch.object(s, '_refresh_state'):
+            result = s.respond_interview("custom text input")
+        s._tmux.send_keys.assert_called_once_with("custom text input", enter=True)
+        assert result["responded"] is True

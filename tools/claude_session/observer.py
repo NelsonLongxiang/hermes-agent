@@ -32,6 +32,7 @@ _STATE_INTERVALS = {
     "THINKING": 5.0,
     "TOOL_CALL": 2.0,
     "PERMISSION": 3.0,
+    "INTERVIEW": 3.0,
     "IDLE": 15.0,
 }
 

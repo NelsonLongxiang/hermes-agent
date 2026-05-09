@@ -377,7 +377,7 @@ CLAUDE_SESSION_SCHEMA = {
                 "enum": [
                     "start", "send", "type", "submit", "send_text", "cancel_input",
                     "status", "wait_for_idle", "wait_for_state",
-                    "output", "jsonl_output", "respond_permission", "stop", "history", "events",
+                    "output", "jsonl_output", "respond_permission", "respond_interview", "stop", "history", "events",
                     "list", "switch",
                     "diagnose", "doctor_fix",
                 ],
@@ -463,6 +463,11 @@ CLAUDE_SESSION_SCHEMA = {
                 "type": "string",
                 "enum": ["allow", "deny"],
                 "description": "Permission response for 'respond_permission' action",
+            },
+            # respond_interview
+            "option": {
+                "type": "string",
+                "description": "Option for 'respond_interview' action. A number (e.g. '1') to select, 'enter' to confirm, 'escape' to cancel, or text to type.",
             },
             # events
             "since_turn": {
@@ -829,7 +834,7 @@ def _handle_claude_session(args, **kw):
         return resolve_err or tool_error("No active session. Use 'start' first.")
 
     # 交互类 action 更新 _active_session
-    if action in ("send", "type", "submit", "send_text", "respond_permission", "cancel_input"):
+    if action in ("send", "type", "submit", "send_text", "respond_permission", "respond_interview", "cancel_input"):
         _touch_active(gw_key, mgr._session_id)
 
     if action == "send":
@@ -913,6 +918,14 @@ def _handle_claude_session(args, **kw):
             result = mgr.respond_permission(response)
         except SessionError as e:
             return json.dumps(e.to_dict(), ensure_ascii=False)
+    elif action == "respond_interview":
+        option = args.get("option")
+        if not option:
+            return tool_error("option is required for respond_interview action")
+        try:
+            result = mgr.respond_interview(option)
+        except SessionError as e:
+            return json.dumps(e.to_dict(), ensure_ascii=False)
     elif action == "history":
         result = mgr.history()
     elif action == "events":
@@ -922,7 +935,8 @@ def _handle_claude_session(args, **kw):
             f"Unknown action: {action}. "
             "Valid: start, send, type, submit, cancel_input, status, "
             "wait_for_idle, wait_for_state, output, respond_permission, "
-            "stop, history, events, list, switch, diagnose, doctor_fix"
+            "respond_interview, stop, history, events, list, switch, "
+            "diagnose, doctor_fix"
         )
 
     return json.dumps(result, ensure_ascii=False)

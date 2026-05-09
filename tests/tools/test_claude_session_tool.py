@@ -23,7 +23,8 @@ class TestSchema:
         expected = [
             "start", "send", "type", "submit", "send_text", "cancel_input",
             "status", "wait_for_idle", "wait_for_state",
-            "output", "respond_permission", "stop", "history", "events",
+            "output", "jsonl_output", "respond_permission", "respond_interview",
+            "stop", "history", "events",
             "list", "switch",
             "diagnose", "doctor_fix",
         ]

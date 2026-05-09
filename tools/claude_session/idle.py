@@ -21,6 +21,7 @@ class SessionState:
     THINKING = "THINKING"
     TOOL_CALL = "TOOL_CALL"
     PERMISSION = "PERMISSION"
+    INTERVIEW = "INTERVIEW"
     ERROR = "ERROR"
     DISCONNECTED = "DISCONNECTED"
     EXITED = "EXITED"
@@ -92,6 +93,16 @@ _CLAUDE_TUI_SIGNATURE_RE = re.compile(
 _TRUST_WORKSPACE_RE = re.compile(r"quick\s+safety\s+check", re.IGNORECASE)
 _ENTER_TO_CONFIRM_RE = re.compile(r"enter\s+to\s+confirm", re.IGNORECASE)
 
+# Interview/Selector patterns — Claude Code interactive selection menus
+_INTERVIEW_NAV_RE = re.compile(
+    r"(Enter to select|Tab.*Arrow keys to navigate|Esc to cancel|"
+    r"ctrl\+o to expand|\d+\.\s+Type something\.)",
+    re.IGNORECASE,
+)
+_INTERVIEW_OPTION_RE = re.compile(r"^❯\s*\d+\.\s+\S", re.MULTILINE)
+_INTERVIEW_NUMBERED_RE = re.compile(r"^\s*\d+\.\s+\S", re.MULTILINE)
+_INTERVIEW_SECTION_RE = re.compile(r"[☐✔]\s+\S+", re.UNICODE)
+
 # Tool name → activity classification (for observer)
 _TOOL_ACTIVITY_MAP = {
     "Read": "reading",
@@ -146,7 +157,7 @@ def clean_lines(raw_output: str) -> list:
 def detect_state(lines: list) -> StateResult:
     """Detect current Claude Code state from cleaned output lines.
 
-    Priority: ERROR > PERMISSION > TOOL_CALL > IDLE > THINKING
+    Priority: ERROR > PERMISSION > INTERVIEW > TOOL_CALL > IDLE > THINKING
     """
     if not lines:
         return StateResult(state=SessionState.THINKING)
@@ -166,6 +177,13 @@ def detect_state(lines: list) -> StateResult:
     if non_status:
         if _PERMISSION_RE.search("\n".join(non_status)):
             return StateResult(state=SessionState.PERMISSION)
+
+    # INTERVIEW — interactive selector menu (not permission, not regular prompt)
+    # Requires both: (1) nav/section indicators AND (2) ❯ cursor on a numbered option.
+    # The ❯ cursor is mandatory to distinguish from Claude's numbered explanations.
+    if _INTERVIEW_NAV_RE.search(all_text) or _INTERVIEW_SECTION_RE.search(all_text):
+        if _INTERVIEW_OPTION_RE.search(all_text):
+            return StateResult(state=SessionState.INTERVIEW)
 
     # TOOL_CALL — skip stale markers (❯ appears below ●)
     rev = list(reversed(recent_lines))

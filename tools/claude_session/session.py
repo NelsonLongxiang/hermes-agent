@@ -25,6 +25,7 @@ from tools.claude_session.idle import (
     SessionState, clean_lines, detect_state, detect_startup_scene,
     detect_activity, is_permission_in_text,
     _STATUS_BAR_RE, _PERMISSION_RE, _DONE_TIME_RE,
+    _INTERVIEW_NAV_RE, _INTERVIEW_OPTION_RE, _INTERVIEW_SECTION_RE,
 )
 from tools.claude_session.output_buffer import OutputBuffer
 from tools.claude_session.tmux_interface import TmuxInterface
@@ -588,6 +589,10 @@ class ClaudeSession:
                 # medium/high风险：返回上下文让Hermes决策
                 return {**perm_context, "status": "permission"}
 
+            if state == SessionState.INTERVIEW:
+                interview_context = self._build_interview_context(lines)
+                return {**interview_context, "status": "interview"}
+
             if state == SessionState.ERROR:
                 return {
                     "state": state,
@@ -849,6 +854,66 @@ class ClaudeSession:
         raise PermissionError("Not in PERMISSION state after retries")
 
     # ------------------------------------------------------------------
+    # Interview handling
+    # ------------------------------------------------------------------
+
+    def respond_interview(self, option: str) -> dict:
+        """Respond to an interview selector by selecting an option.
+
+        Args:
+            option: The option to select. Can be:
+                - A number string (e.g. "1") to select that numbered option
+                - A text string to type as custom input
+                - "enter" to confirm the currently selected option
+                - "escape" to cancel
+        """
+        if not self._session_active:
+            raise SessionNotActiveError("No active session")
+
+        if self._state != SessionState.INTERVIEW:
+            raise SessionNotActiveError(
+                f"Not in INTERVIEW state (current: {self._state})"
+            )
+
+        # Validate state and read current selection under lock, then act outside lock
+        if option == "enter":
+            with self._lock:
+                self._tmux.send_special_key("Enter")
+        elif option == "escape":
+            with self._lock:
+                self._tmux.send_special_key("Escape")
+        elif option.isdigit() and int(option) > 0:
+            # Read current cursor position under lock
+            with self._lock:
+                pane = self._tmux.capture_pane()
+                lines = clean_lines(pane)
+                current_selected = None
+                for line in lines[-20:]:
+                    m = re.match(r"\s*❯\s*(\d+)\.", line.strip())
+                    if m:
+                        current_selected = int(m.group(1))
+                        break
+
+            # Navigate outside lock (involves multiple sleeps)
+            if current_selected is not None:
+                target = int(option)
+                diff = target - current_selected
+                key = "Down" if diff > 0 else "Up"
+                for _ in range(abs(diff)):
+                    self._tmux.send_special_key(key)
+                    time.sleep(0.1)
+
+            self._tmux.send_special_key("Enter")
+        else:
+            # Type custom text
+            with self._lock:
+                self._tmux.send_keys(option, enter=True)
+
+        time.sleep(0.5)
+        self._refresh_state()
+        return {"responded": True, "state": self._state}
+
+    # ------------------------------------------------------------------
     # History / Events (simplified — no turn tracking)
     # ------------------------------------------------------------------
 
@@ -901,8 +966,8 @@ class ClaudeSession:
         # so it wakes immediately instead of sleeping through POLL_INTERVAL.
         observed_state = info.get("state")
         if observed_state in (
-            SessionState.IDLE, SessionState.PERMISSION, SessionState.ERROR,
-            SessionState.DISCONNECTED, SessionState.EXITED,
+            SessionState.IDLE, SessionState.PERMISSION, SessionState.INTERVIEW,
+            SessionState.ERROR, SessionState.DISCONNECTED, SessionState.EXITED,
         ):
             self._state_event.set()
 
@@ -1131,6 +1196,55 @@ class ClaudeSession:
 
         return context
 
+    def _build_interview_context(self, lines: list = None) -> dict:
+        """构建 interview 上下文，供 Hermes 智能选择"""
+        context = {
+            "state": SessionState.INTERVIEW,
+            "needs_hermes_decision": True,
+            "question": "",
+            "options": [],
+            "sections": [],
+        }
+
+        if not lines:
+            return context
+
+        # 提取问题（排除编号选项行）
+        for line in reversed(lines[-20:]):
+            stripped = line.strip()
+            if (stripped
+                    and not stripped.startswith("❯")
+                    and not stripped.startswith("←")
+                    and "?" in stripped
+                    and not re.match(r"\s*\d+\.\s+", stripped)):
+                context["question"] = stripped
+                break
+
+        # 提取选项列表
+        for line in lines[-20:]:
+            m = re.match(r"\s*❯?\s*(\d+)\.\s+(.+)", line.strip())
+            if m:
+                num = int(m.group(1))
+                text = m.group(2).strip()
+                selected = line.strip().startswith("❯")
+                context["options"].append({
+                    "number": num,
+                    "text": text,
+                    "selected": selected,
+                })
+
+        # 提取 section 标记（如 ☐ 运行环境  ✔ Submit）
+        for line in lines[-20:]:
+            for m_sec in re.finditer(r"([☐✔])\s+([^☐✔←→]+?)\s*(?=[☐✔←→]|$)", line):
+                label = m_sec.group(2).strip()
+                if label:
+                    context["sections"].append({
+                        "checked": m_sec.group(1) == "✔",
+                        "label": label,
+                    })
+
+        return context
+
     def _assess_risk(self, operation: str, target: str) -> str:
         """评估操作风险等级"""
         target_lower = target.lower()
@@ -1229,7 +1343,7 @@ class ClaudeSession:
                     logger.info("Claude Code startup OK: IDLE")
                     return True
 
-                if result.state in ("THINKING", "TOOL_CALL", "PERMISSION"):
+                if result.state in ("THINKING", "TOOL_CALL", "PERMISSION", "INTERVIEW"):
                     pane_lower = pane.lower()
                     if any(sig in pane_lower for sig in
                            ("claude", "model", "thinking", "permission", "●", "❯")):
