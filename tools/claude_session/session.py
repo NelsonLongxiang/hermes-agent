@@ -894,6 +894,10 @@ class ClaudeSession:
                         current_selected = int(m.group(1))
                         break
 
+            # NOTE: Navigation keys sent outside lock is intentional.
+            # When respond_interview is called, wait_for_idle has already returned INTERVIEW
+            # to Hermes, so no other thread is writing to tmux. The lock is only needed for
+            # reading the current cursor position (capture_pane).
             # Navigate outside lock (involves multiple sleeps)
             if current_selected is not None:
                 target = int(option)

@@ -458,6 +458,11 @@ CLAUDE_SESSION_SCHEMA = {
                 "description": "For 'jsonl_output': return the last N assistant text replies. Omit for summary only.",
                 "minimum": 1,
             },
+            "max_length": {
+                "type": "integer",
+                "description": "For 'jsonl_output': max character length for each reply. Replies exceeding this are truncated. Default: 15000.",
+                "minimum": 1000,
+            },
             # respond_permission
             "response": {
                 "type": "string",
@@ -909,6 +914,7 @@ def _handle_claude_session(args, **kw):
         result = mgr.jsonl_output(
             last_reply=args.get("last_reply", False),
             last_n=args.get("last_n", 0),
+            max_length=args.get("max_length", 15000),
         )
     elif action == "respond_permission":
         response = args.get("response")
