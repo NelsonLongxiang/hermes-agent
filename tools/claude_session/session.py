@@ -696,7 +696,8 @@ class ClaudeSession:
             "has_more": (offset + limit) < self._buf.total_count(),
         }
 
-    def jsonl_output(self, last_reply: bool = False, last_n: int = 0) -> dict:
+    def jsonl_output(self, last_reply: bool = False, last_n: int = 0,
+                     max_length: int = 15000) -> dict:
         """Extract Claude's replies from the JSONL session file.
 
         Use this when tmux output is truncated (long Claude responses).
@@ -706,6 +707,8 @@ class ClaudeSession:
             last_reply: If True, return only the last assistant text reply.
             last_n: If > 0, return the last N assistant text replies.
                     If both are 0/False, returns a summary.
+            max_length: Max chars per reply (default 15000). Truncated with
+                        a notice if exceeded.
         """
         if not self._claude_session_uuid:
             return {"error": "No session UUID", "replies": []}
@@ -714,57 +717,82 @@ class ClaudeSession:
         if not jsonl_path or not os.path.exists(jsonl_path):
             return {"error": "JSONL file not found", "path": str(jsonl_path), "replies": []}
 
+        # Determine how many replies to keep
+        if last_reply:
+            keep = 1
+        elif last_n > 0:
+            keep = last_n
+        else:
+            keep = 0  # summary only
+
         try:
-            entries = []
+            assistant_texts = []
+            total_tools = 0
+            total_entries = 0
+
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        entries.append(json.loads(line))
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    total_entries += 1
 
-            if not entries:
+                    # Fast path: skip non-assistant lines without parsing
+                    if not line.startswith('{"type":"assistant"'):
+                        # Still need to check — type might not be first key
+                        try:
+                            entry = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if entry.get("type") != "assistant":
+                            continue
+                    else:
+                        try:
+                            entry = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+
+                    msg = entry.get("message", {})
+                    for item in msg.get("content", []):
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "tool_use":
+                            total_tools += 1
+                        if item.get("type") == "text" and item.get("text", "").strip():
+                            text = item["text"]
+                            if keep > 0:
+                                # Sliding window: only keep last N
+                                assistant_texts.append(text)
+                                if len(assistant_texts) > keep:
+                                    assistant_texts.pop(0)
+                            else:
+                                # Summary mode: just count
+                                assistant_texts.append(text)
+
+            if total_entries == 0:
                 return {"status": "empty", "replies": []}
 
-            # Collect assistant text replies in order
-            assistant_texts = []
-            total_tools = 0
-            for entry in entries:
-                if entry.get("type") != "assistant":
-                    continue
-                msg = entry.get("message", {})
-                for item in msg.get("content", []):
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") == "tool_use":
-                        total_tools += 1
-                    if item.get("type") == "text" and item.get("text", "").strip():
-                        assistant_texts.append(item["text"])
-
             # Summary mode
-            if not last_reply and last_n <= 0:
+            if keep == 0:
                 return {
                     "status": "active",
-                    "total_entries": len(entries),
+                    "total_entries": total_entries,
                     "assistant_text_count": len(assistant_texts),
                     "tool_call_count": total_tools,
                     "last_reply_length": len(assistant_texts[-1]) if assistant_texts else 0,
                 }
 
-            # Extract requested replies
-            if last_reply:
-                n = 1
-            else:
-                n = min(last_n, len(assistant_texts))
+            # Truncate oversized replies
+            result_texts = []
+            for text in assistant_texts:
+                if len(text) > max_length:
+                    text = text[:max_length] + f"\n... [truncated, {len(text)} total chars]"
+                result_texts.append(text)
 
-            selected = assistant_texts[-n:] if n > 0 else []
             return {
-                "replies": selected,
-                "count": len(selected),
-                "total_assistant_texts": len(assistant_texts),
+                "replies": result_texts,
+                "count": len(result_texts),
+                "total_assistant_texts": len(assistant_texts) + (keep - len(assistant_texts)) if keep > 0 else len(assistant_texts),
             }
 
         except Exception as e:
