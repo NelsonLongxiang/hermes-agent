@@ -377,7 +377,7 @@ CLAUDE_SESSION_SCHEMA = {
                 "enum": [
                     "start", "send", "type", "submit", "send_text", "cancel_input",
                     "status", "wait_for_idle", "wait_for_state",
-                    "output", "respond_permission", "stop", "history", "events",
+                    "output", "jsonl_output", "respond_permission", "stop", "history", "events",
                     "list", "switch",
                     "diagnose", "doctor_fix",
                 ],
@@ -446,6 +446,16 @@ CLAUDE_SESSION_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": "Max lines for 'output' action",
+                "minimum": 1,
+            },
+            # jsonl_output
+            "last_reply": {
+                "type": "boolean",
+                "description": "For 'jsonl_output': return the last assistant text reply (use when tmux output is truncated)",
+            },
+            "last_n": {
+                "type": "integer",
+                "description": "For 'jsonl_output': return the last N assistant text replies. Omit for summary only.",
                 "minimum": 1,
             },
             # respond_permission
@@ -810,6 +820,8 @@ def _handle_claude_session(args, **kw):
             return json.dumps({"state": "DISCONNECTED"}, ensure_ascii=False)
         if action == "output":
             return json.dumps({"lines": [], "offset": 0, "total": 0}, ensure_ascii=False)
+        if action == "jsonl_output":
+            return json.dumps({"error": "No active session", "replies": []}, ensure_ascii=False)
         if action == "events":
             return json.dumps({"events": []}, ensure_ascii=False)
         if action == "history":
@@ -887,6 +899,11 @@ def _handle_claude_session(args, **kw):
         result = mgr.output(
             offset=args.get("offset", 0),
             limit=args.get("limit", 50),
+        )
+    elif action == "jsonl_output":
+        result = mgr.jsonl_output(
+            last_reply=args.get("last_reply", False),
+            last_n=args.get("last_n", 0),
         )
     elif action == "respond_permission":
         response = args.get("response")

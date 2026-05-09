@@ -10,6 +10,7 @@ Core flow:
     TaskContext → format prompt → write to tmux → wait for idle → return result
 """
 
+import json
 import logging
 import os
 import re
@@ -694,6 +695,80 @@ class ClaudeSession:
             "total": self._buf.total_count(),
             "has_more": (offset + limit) < self._buf.total_count(),
         }
+
+    def jsonl_output(self, last_reply: bool = False, last_n: int = 0) -> dict:
+        """Extract Claude's replies from the JSONL session file.
+
+        Use this when tmux output is truncated (long Claude responses).
+        The JSONL file contains the complete conversation history.
+
+        Args:
+            last_reply: If True, return only the last assistant text reply.
+            last_n: If > 0, return the last N assistant text replies.
+                    If both are 0/False, returns a summary.
+        """
+        if not self._claude_session_uuid:
+            return {"error": "No session UUID", "replies": []}
+
+        jsonl_path = self._find_session_jsonl(self._workdir or ".", self._claude_session_uuid)
+        if not jsonl_path or not os.path.exists(jsonl_path):
+            return {"error": "JSONL file not found", "path": str(jsonl_path), "replies": []}
+
+        try:
+            entries = []
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+            if not entries:
+                return {"status": "empty", "replies": []}
+
+            # Collect assistant text replies in order
+            assistant_texts = []
+            total_tools = 0
+            for entry in entries:
+                if entry.get("type") != "assistant":
+                    continue
+                msg = entry.get("message", {})
+                for item in msg.get("content", []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "tool_use":
+                        total_tools += 1
+                    if item.get("type") == "text" and item.get("text", "").strip():
+                        assistant_texts.append(item["text"])
+
+            # Summary mode
+            if not last_reply and last_n <= 0:
+                return {
+                    "status": "active",
+                    "total_entries": len(entries),
+                    "assistant_text_count": len(assistant_texts),
+                    "tool_call_count": total_tools,
+                    "last_reply_length": len(assistant_texts[-1]) if assistant_texts else 0,
+                }
+
+            # Extract requested replies
+            if last_reply:
+                n = 1
+            else:
+                n = min(last_n, len(assistant_texts))
+
+            selected = assistant_texts[-n:] if n > 0 else []
+            return {
+                "replies": selected,
+                "count": len(selected),
+                "total_assistant_texts": len(assistant_texts),
+            }
+
+        except Exception as e:
+            return {"error": str(e), "replies": []}
 
     # ------------------------------------------------------------------
     # Permission handling
