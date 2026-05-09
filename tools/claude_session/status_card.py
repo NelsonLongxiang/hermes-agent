@@ -396,7 +396,8 @@ class StatusCard:
         self._observer_state: dict = {}
         # State transition tracking (protected by _state_lock)
         self._state_lock = threading.Lock()
-        self._send_lock = threading.Lock()  # protects message_id, last_card_text, bump_count across two update paths
+        self._send_lock = threading.Lock()  # protects _sending flag + message state
+        self._sending = False  # True while an async message operation is in flight
         self._prev_state: Optional[str] = None
         self._pending_bump: bool = False
         self._prev_activity: Optional[str] = None
@@ -460,8 +461,14 @@ class StatusCard:
                 new_state = info.get("state", "IDLE")
                 do_bump = self._should_bump(new_state)
 
+                # Claim the sending slot (non-blocking)
+                with self._send_lock:
+                    if self._sending:
+                        return  # _run_loop is already sending
+                    self._sending = True
+
                 async def _immediate_send():
-                    with self._send_lock:
+                    try:
                         # Guard: don't send before initial message is sent
                         if self._message_id is None:
                             return
@@ -472,19 +479,24 @@ class StatusCard:
                             return
                         try:
                             if do_bump and self._message_id:
-                                await self._bump_message_locked(card_text)
+                                await self._bump_message(card_text)
                             else:
                                 success = await self._edit_telegram(card_text)
                                 if not success:
-                                    await self._send_new_message_locked(card_text)
+                                    await self._send_new_message(card_text)
                         except Exception as e:
                             logger.warning("Immediate status send failed: %s", e)
                         self._last_card_text = card_text
                         self._last_edit_time = time.monotonic()
                         self._bump_count = 0
+                    finally:
+                        with self._send_lock:
+                            self._sending = False
 
                 asyncio.run_coroutine_threadsafe(_immediate_send(), self._loop)
             except Exception as e:
+                with self._send_lock:
+                    self._sending = False
                 logger.warning("Immediate status send failed: %s", e)
 
     @property
@@ -581,7 +593,15 @@ class StatusCard:
                 current_state = (self._observer_state or {}).get("state", "IDLE")
                 should_bump = self._should_bump(current_state) or self._pending_bump
 
+                # Claim the sending slot (non-blocking)
                 with self._send_lock:
+                    if self._sending:
+                        # Observer path is already sending — skip this poll
+                        self._stop_event.wait(timeout=self._poll_interval)
+                        continue
+                    self._sending = True
+
+                try:
                     if card_text != self._last_card_text:
                         logger.info(
                             "StatusCard poll: text changed (msg_id=%s, state=%s, observer=%s, bump=%s)",
@@ -653,6 +673,9 @@ class StatusCard:
                             self._last_edit_time = time.monotonic()
                             self._bump_count = 0
                         self._clear_pending_bump()
+                finally:
+                    with self._send_lock:
+                        self._sending = False
             except Exception as e:
                 logger.warning("Status card poll error: %s", e)
 
@@ -699,21 +722,6 @@ class StatusCard:
                 logger.warning("Status card delete old msg failed: %s", e)
         result = await self._send_new_message(text)
         return result
-
-    async def _bump_message_locked(self, text: str) -> bool:
-        """Bump variant for use inside _send_lock — deletes old + sends new."""
-        if self._message_id:
-            try:
-                await self._delete_func(self._chat_id, self._message_id)
-            except Exception as e:
-                logger.warning("Status card delete old msg failed: %s", e)
-        self._message_id = None
-        result = await self._send_new_message(text)
-        return result
-
-    async def _send_new_message_locked(self, text: str) -> bool:
-        """Send variant for use inside _send_lock — sends new message."""
-        return await self._send_new_message(text)
 
     async def _send_or_edit(self, text: str) -> None:
         """Used for the final summary — edit existing message."""
