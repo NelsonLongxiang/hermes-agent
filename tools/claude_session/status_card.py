@@ -396,6 +396,7 @@ class StatusCard:
         self._observer_state: dict = {}
         # State transition tracking (protected by _state_lock)
         self._state_lock = threading.Lock()
+        self._send_lock = threading.Lock()  # protects message_id, last_card_text, bump_count across two update paths
         self._prev_state: Optional[str] = None
         self._pending_bump: bool = False
         self._prev_activity: Optional[str] = None
@@ -460,23 +461,27 @@ class StatusCard:
                 do_bump = self._should_bump(new_state)
 
                 async def _immediate_send():
-                    # Guard: don't send before initial message is sent
-                    if self._message_id is None:
-                        return
-                    state = parse_jsonl(self._jsonl_path)
-                    card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id, tmux_session=self._tmux_session)
-                    if card_text == self._last_card_text and not do_bump:
-                        return
-                    try:
-                        if do_bump and self._message_id:
-                            await self._bump_message(card_text)
-                        else:
-                            success = await self._edit_telegram(card_text)
-                            if not success:
-                                await self._send_new_message(card_text)
-                    except Exception as e:
-                        logger.warning("Immediate status send failed: %s", e)
-                    self._last_card_text = card_text
+                    with self._send_lock:
+                        # Guard: don't send before initial message is sent
+                        if self._message_id is None:
+                            return
+                        # Re-check: _run_loop may have already updated
+                        state = parse_jsonl(self._jsonl_path)
+                        card_text = format_status_card(state, observer_state=self._observer_state, max_length=self._max_card_length, session_name=self._session_name, session_id=self._session_id, tmux_session=self._tmux_session)
+                        if card_text == self._last_card_text and not do_bump:
+                            return
+                        try:
+                            if do_bump and self._message_id:
+                                await self._bump_message_locked(card_text)
+                            else:
+                                success = await self._edit_telegram(card_text)
+                                if not success:
+                                    await self._send_new_message_locked(card_text)
+                        except Exception as e:
+                            logger.warning("Immediate status send failed: %s", e)
+                        self._last_card_text = card_text
+                        self._last_edit_time = time.monotonic()
+                        self._bump_count = 0
 
                 asyncio.run_coroutine_threadsafe(_immediate_send(), self._loop)
             except Exception as e:
@@ -576,77 +581,78 @@ class StatusCard:
                 current_state = (self._observer_state or {}).get("state", "IDLE")
                 should_bump = self._should_bump(current_state) or self._pending_bump
 
-                if card_text != self._last_card_text:
-                    logger.info(
-                        "StatusCard poll: text changed (msg_id=%s, state=%s, observer=%s, bump=%s)",
-                        self._message_id, state.get("status"), current_state, should_bump,
-                    )
-                    now = time.monotonic()
-                    if (now - self._last_edit_time) >= self._MIN_EDIT_INTERVAL or should_bump:
-                        if should_bump and self._message_id:
-                            try:
+                with self._send_lock:
+                    if card_text != self._last_card_text:
+                        logger.info(
+                            "StatusCard poll: text changed (msg_id=%s, state=%s, observer=%s, bump=%s)",
+                            self._message_id, state.get("status"), current_state, should_bump,
+                        )
+                        now = time.monotonic()
+                        if (now - self._last_edit_time) >= self._MIN_EDIT_INTERVAL or should_bump:
+                            if should_bump and self._message_id:
+                                try:
+                                    future = asyncio.run_coroutine_threadsafe(
+                                        self._delete_func(self._chat_id, self._message_id), self._loop
+                                    )
+                                    future.result(timeout=5.0)
+                                except Exception:
+                                    pass
+                                self._message_id = None
                                 future = asyncio.run_coroutine_threadsafe(
-                                    self._delete_func(self._chat_id, self._message_id), self._loop
+                                    self._send_new_message(card_text), self._loop
                                 )
-                                future.result(timeout=5.0)
-                            except Exception:
-                                pass
-                            self._message_id = None
-                            future = asyncio.run_coroutine_threadsafe(
-                                self._send_new_message(card_text), self._loop
-                            )
-                            sent_new = future.result(timeout=10.0)
-                            if sent_new:
-                                self._last_card_text = card_text
-                                self._last_edit_time = time.monotonic()
-                                self._bump_count = 0
-                            self._clear_pending_bump()
-                        else:
-                            future = asyncio.run_coroutine_threadsafe(
-                                self._edit_telegram(card_text), self._loop
-                            )
-                            success = future.result(timeout=10.0)
-                            if success:
-                                self._last_card_text = card_text
-                                self._last_edit_time = time.monotonic()
-                                self._bump_count = 0
+                                sent_new = future.result(timeout=10.0)
+                                if sent_new:
+                                    self._last_card_text = card_text
+                                    self._last_edit_time = time.monotonic()
+                                    self._bump_count = 0
                                 self._clear_pending_bump()
                             else:
-                                logger.warning("StatusCard edit failed (bump_count=%d)", self._bump_count)
-                                self._bump_count += 1
-                                if self._bump_count >= self._bump_threshold:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        self._send_new_message(card_text), self._loop
-                                    )
-                                    future.result(timeout=10.0)
+                                future = asyncio.run_coroutine_threadsafe(
+                                    self._edit_telegram(card_text), self._loop
+                                )
+                                success = future.result(timeout=10.0)
+                                if success:
                                     self._last_card_text = card_text
                                     self._last_edit_time = time.monotonic()
                                     self._bump_count = 0
                                     self._clear_pending_bump()
-                else:
-                    now = time.monotonic()
-                    if self._message_id and (now - self._last_edit_time) >= self._BUMP_INTERVAL:
-                        should_bump = True
+                                else:
+                                    logger.warning("StatusCard edit failed (bump_count=%d)", self._bump_count)
+                                    self._bump_count += 1
+                                    if self._bump_count >= self._bump_threshold:
+                                        future = asyncio.run_coroutine_threadsafe(
+                                            self._send_new_message(card_text), self._loop
+                                        )
+                                        future.result(timeout=10.0)
+                                        self._last_card_text = card_text
+                                        self._last_edit_time = time.monotonic()
+                                        self._bump_count = 0
+                                        self._clear_pending_bump()
+                    else:
+                        now = time.monotonic()
+                        if self._message_id and (now - self._last_edit_time) >= self._BUMP_INTERVAL:
+                            should_bump = True
 
-                # Periodic bump (text unchanged)
-                if should_bump and self._message_id and card_text == self._last_card_text:
-                    try:
+                    # Periodic bump (text unchanged)
+                    if should_bump and self._message_id and card_text == self._last_card_text:
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                self._delete_func(self._chat_id, self._message_id), self._loop
+                            )
+                            future.result(timeout=5.0)
+                        except Exception:
+                            pass
+                        self._message_id = None
                         future = asyncio.run_coroutine_threadsafe(
-                            self._delete_func(self._chat_id, self._message_id), self._loop
+                            self._send_new_message(card_text), self._loop
                         )
-                        future.result(timeout=5.0)
-                    except Exception:
-                        pass
-                    self._message_id = None
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._send_new_message(card_text), self._loop
-                    )
-                    sent_new = future.result(timeout=10.0)
-                    if sent_new:
-                        self._last_card_text = card_text
-                        self._last_edit_time = time.monotonic()
-                        self._bump_count = 0
-                    self._clear_pending_bump()
+                        sent_new = future.result(timeout=10.0)
+                        if sent_new:
+                            self._last_card_text = card_text
+                            self._last_edit_time = time.monotonic()
+                            self._bump_count = 0
+                        self._clear_pending_bump()
             except Exception as e:
                 logger.warning("Status card poll error: %s", e)
 
@@ -693,6 +699,21 @@ class StatusCard:
                 logger.warning("Status card delete old msg failed: %s", e)
         result = await self._send_new_message(text)
         return result
+
+    async def _bump_message_locked(self, text: str) -> bool:
+        """Bump variant for use inside _send_lock — deletes old + sends new."""
+        if self._message_id:
+            try:
+                await self._delete_func(self._chat_id, self._message_id)
+            except Exception as e:
+                logger.warning("Status card delete old msg failed: %s", e)
+        self._message_id = None
+        result = await self._send_new_message(text)
+        return result
+
+    async def _send_new_message_locked(self, text: str) -> bool:
+        """Send variant for use inside _send_lock — sends new message."""
+        return await self._send_new_message(text)
 
     async def _send_or_edit(self, text: str) -> None:
         """Used for the final summary — edit existing message."""
