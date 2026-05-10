@@ -181,8 +181,11 @@ def detect_state(lines: list) -> StateResult:
     # INTERVIEW — interactive selector menu (not permission, not regular prompt)
     # Requires both: (1) nav/section indicators AND (2) ❯ cursor on a numbered option.
     # The ❯ cursor is mandatory to distinguish from Claude's numbered explanations.
+    # Uses recent_lines (10-line window) because the ❯ cursor can be >5 lines
+    # above the nav hints when option descriptions span multiple lines.
+    recent_text = "\n".join(recent_lines)
     if _INTERVIEW_NAV_RE.search(all_text) or _INTERVIEW_SECTION_RE.search(all_text):
-        if _INTERVIEW_OPTION_RE.search(all_text):
+        if _INTERVIEW_OPTION_RE.search(recent_text):
             return StateResult(state=SessionState.INTERVIEW)
 
     # TOOL_CALL — skip stale markers (❯ appears below ●)
