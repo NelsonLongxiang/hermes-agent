@@ -16,6 +16,8 @@ import html as _html
 import re
 from typing import Dict, List, Optional, Any
 
+from gateway.aml_renderer import is_aml_content, render_aml_telegram
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -1221,6 +1223,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            # ── AML rendering path ──
+            if is_aml_content(content):
+                aml_result = render_aml_telegram(content)
+                if aml_result is not None:
+                    return await self._send_aml(
+                        chat_id, aml_result, reply_to, metadata,
+                    )
+                # AML rendering failed — fall through to MarkdownV2 path
+
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(
@@ -1360,6 +1371,91 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             return SendResult(success=False, error=str(e), retryable=not is_timeout)
 
+    def _build_inline_keyboard(
+        self, aml_output: Dict[str, Any],
+    ) -> Optional[Any]:
+        """Build an InlineKeyboardMarkup from AML output, or None."""
+        keyboard_json = aml_output.get("keyboard")
+        if not keyboard_json or not isinstance(keyboard_json, dict):
+            return None
+        try:
+            rows = keyboard_json.get("inline_keyboard", [])
+            kb_rows = []
+            for row in rows:
+                kb_row = []
+                for btn in row:
+                    kb_row.append(InlineKeyboardButton(
+                        text=btn["text"],
+                        callback_data=btn.get("callback_data", ""),
+                    ))
+                kb_rows.append(kb_row)
+            return InlineKeyboardMarkup(kb_rows)
+        except Exception as exc:
+            logger.warning("[%s] Failed to build inline keyboard: %s", self.name, exc)
+            return None
+
+    async def _send_aml(
+        self,
+        chat_id: str,
+        aml_output: Dict[str, Any],
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an AML-rendered message via Telegram HTML parse mode."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        text = aml_output.get("text", "")
+        if not text or not text.strip():
+            return SendResult(success=True, message_id=None)
+
+        reply_markup = self._build_inline_keyboard(aml_output)
+
+        thread_id = self._metadata_thread_id(metadata)
+        effective_thread_id = self._message_thread_id_for_send(thread_id)
+        reply_to_id = int(reply_to) if reply_to else None
+
+        try:
+            chunks = self.truncate_message(
+                text, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
+
+            message_ids = []
+            for i, chunk in enumerate(chunks):
+                should_thread = (i == 0) if reply_to_id else False
+                rid = reply_to_id if should_thread else None
+
+                msg = None
+                for _attempt in range(2):
+                    try:
+                        msg = await self._bot.send_message(
+                            chat_id=int(chat_id),
+                            text=chunk,
+                            parse_mode=ParseMode.HTML,
+                            reply_to_message_id=rid,
+                            message_thread_id=effective_thread_id,
+                            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+                            **self._link_preview_kwargs(),
+                        )
+                        break
+                    except Exception as send_err:
+                        if _attempt == 0 and "timed out" not in str(send_err).lower():
+                            await asyncio.sleep(1)
+                            continue
+                        raise
+                if msg:
+                    message_ids.append(str(msg.message_id))
+
+            return SendResult(
+                success=True,
+                message_id=message_ids[0] if message_ids else None,
+                raw_response={"message_ids": message_ids},
+            )
+
+        except Exception as e:
+            logger.error("[%s] Failed to send AML message: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1371,6 +1467,19 @@ class TelegramAdapter(BasePlatformAdapter):
         """Edit a previously sent Telegram message."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        # On final stream edit, re-render AML content as HTML.
+        if finalize:
+            try:
+                if is_aml_content(content):
+                    aml_result = render_aml_telegram(content)
+                    if aml_result:
+                        return await self._edit_aml_message(
+                            chat_id, message_id, aml_result,
+                        )
+            except Exception as exc:
+                logger.debug("[%s] AML final-edit failed, fallback to MarkdownV2: %s", self.name, exc)
+
         try:
             formatted = self.format_message(content)
             try:
@@ -1446,6 +1555,50 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def _edit_aml_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        aml_output: Dict[str, Any],
+    ) -> SendResult:
+        """Edit an existing message to AML-rendered HTML (stream final edit)."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        text = aml_output.get("text", "")
+        if not text or not text.strip():
+            return SendResult(success=True, message_id=message_id)
+
+        reply_markup = self._build_inline_keyboard(aml_output)
+
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return SendResult(success=True, message_id=message_id)
+            logger.warning("[%s] AML HTML edit failed, fallback to plain text: %s", self.name, e)
+            # Best-effort: send as plain text without parse_mode so the
+            # user sees something instead of raw AML markup.
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    text=text,
+                )
+                return SendResult(success=True, message_id=message_id)
+            except Exception as fb_err:
+                if "not modified" in str(fb_err).lower():
+                    return SendResult(success=True, message_id=message_id)
+                logger.error("[%s] AML fallback edit also failed: %s", self.name, fb_err)
+                return SendResult(success=False, error=str(fb_err))
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a previously sent Telegram message.
