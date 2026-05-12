@@ -367,7 +367,17 @@ CLAUDE_SESSION_SCHEMA = {
         "- Avoid frequent checks/interrupts — this breaks collaboration efficiency\n"
         "- Only cancel if Claude is truly stuck (no output for 10+ minutes)\n"
         "- Before cancelling, analyze why Claude hasn't responded\n"
-        "- If you must cancel, note the reason — repeated cancellations indicate micromanagement"
+        "- If you must cancel, note the reason — repeated cancellations indicate micromanagement\n\n"
+        "INTERVIEW MODE (status='interview'):\n"
+        "When wait_for_idle returns status='interview', Claude Code is showing an interactive\n"
+        "selection menu (numbered options with cursor). You MUST respond with\n"
+        "respond_interview or Claude will be stuck forever.\n"
+        "- The result includes 'options' (list of numbered choices) and 'question' (what's being asked).\n"
+        "- Read the options and question carefully, then choose the best answer based on the\n"
+        "  original task you gave Claude. Use your judgment — don't just pick option 1 blindly.\n"
+        "- Use respond_interview with option='1' to select option 1, 'enter' to confirm the\n"
+        "  highlighted choice, or 'escape' to cancel. You can also type custom text.\n"
+        "- After responding, call wait_for_idle again to continue the session."
     ),
     "parameters": {
         "type": "object",
@@ -472,7 +482,7 @@ CLAUDE_SESSION_SCHEMA = {
             # respond_interview
             "option": {
                 "type": "string",
-                "description": "Option for 'respond_interview' action. A number (e.g. '1') to select, 'enter' to confirm, 'escape' to cancel, or text to type.",
+                "description": "Option for 'respond_interview' action. IMPORTANT: analyze the interview context (question + options) from wait_for_idle result and choose the best answer for the task. A number (e.g. '1') to select that numbered option, 'enter' to confirm current selection, 'escape' to cancel, or text to type as custom input.",
             },
             # events
             "since_turn": {
