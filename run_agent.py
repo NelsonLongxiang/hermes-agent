@@ -337,6 +337,10 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
+# Tools that mutate files on disk.  Used by the per-turn verifier that
+# surfaces silently-failed file edits so the model can't over-claim success.
+_FILE_MUTATING_TOOLS = frozenset({"write_file", "patch"})
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
 
@@ -451,6 +455,152 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
+
+
+def _is_multimodal_tool_result(value: Any) -> bool:
+    """True if the value is a multimodal tool result envelope.
+
+    Multimodal handlers (e.g. tools/computer_use) return a dict with
+    `_multimodal=True`, a `content` key holding OpenAI-style content
+    parts, and an optional `text_summary` for string-only fallbacks.
+    """
+    return (
+        isinstance(value, dict)
+        and value.get("_multimodal") is True
+        and isinstance(value.get("content"), list)
+    )
+
+
+def _multimodal_text_summary(value: Any) -> str:
+    """Extract a plain text view of a multimodal tool result.
+
+    Used wherever downstream code needs a string — logging, previews,
+    persistence size heuristics, fall-back content for providers that
+    don't support multipart tool messages.
+    """
+    if _is_multimodal_tool_result(value):
+        if value.get("text_summary"):
+            return str(value["text_summary"])
+        parts = []
+        for p in value.get("content") or []:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(str(p.get("text", "")))
+        if parts:
+            return "\n".join(parts)
+        return "[multimodal tool result]"
+    if isinstance(value, str):
+        return value
+    try:
+        import json as _json
+        return _json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
+    """Mutate a multimodal tool-result envelope to append a subdir hint.
+
+    The hint is added to the first text part so the model sees it; image
+    parts are left untouched. `text_summary` is also updated for
+    string-fallback callers.
+    """
+    if not _is_multimodal_tool_result(value):
+        return
+    parts = value.get("content") or []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") == "text":
+            p["text"] = str(p.get("text", "")) + hint
+            break
+    else:
+        parts.insert(0, {"type": "text", "text": hint})
+        value["content"] = parts
+    if isinstance(value.get("text_summary"), str):
+        value["text_summary"] = value["text_summary"] + hint
+
+
+def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
+    """Return the file paths a ``write_file`` or ``patch`` call is targeting.
+
+    For ``write_file`` and ``patch`` in replace mode this is just ``args["path"]``.
+    For ``patch`` in V4A patch mode we parse the patch content for
+    ``*** Update File:`` / ``*** Add File:`` / ``*** Delete File:`` headers so
+    the verifier can track each file in a multi-file patch separately.
+    """
+    if tool_name not in _FILE_MUTATING_TOOLS:
+        return []
+    if tool_name == "write_file":
+        p = args.get("path")
+        return [str(p)] if p else []
+    # tool_name == "patch"
+    mode = args.get("mode") or "replace"
+    if mode == "replace":
+        p = args.get("path")
+        return [str(p)] if p else []
+    if mode == "patch":
+        body = args.get("patch") or ""
+        if not isinstance(body, str) or not body:
+            return []
+        import re as _re
+        paths: List[str] = []
+        for _m in _re.finditer(
+            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
+            body,
+            _re.MULTILINE,
+        ):
+            p = _m.group(1).strip()
+            if p:
+                paths.append(p)
+        return paths
+    return []
+
+
+def _extract_error_preview(result: Any, max_len: int = 180) -> str:
+    """Pull a one-line error summary out of a tool result for footer display."""
+    text = _multimodal_text_summary(result) if result is not None else ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    # Try to parse JSON and pull the ``error`` field — tool handlers return
+    # ``{"success": false, "error": "..."}``; raw string wins if parse fails.
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            import json as _json
+            data = _json.loads(stripped)
+            if isinstance(data, dict) and isinstance(data.get("error"), str):
+                text = data["error"]
+        except Exception:
+            pass
+    # Collapse whitespace, trim to max_len.
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        text = text[: max_len - 1] + "…"
+    return text
+
+
+def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip image blobs from a message for trajectory saving.
+
+    Returns a shallow copy with multimodal tool results replaced by their
+    text_summary, and image parts in content lists replaced by
+    `[screenshot]` placeholders. Keeps the message schema otherwise intact.
+    """
+    if not isinstance(msg, dict):
+        return msg
+    content = msg.get("content")
+    if _is_multimodal_tool_result(content):
+        return {**msg, "content": _multimodal_text_summary(content)}
+    if isinstance(content, list):
+        cleaned = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
+                cleaned.append({"type": "text", "text": "[screenshot]"})
+            else:
+                cleaned.append(p)
+        return {**msg, "content": cleaned}
+    return msg
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -10203,6 +10353,17 @@ class AIAgent:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
+                # Track file-mutation outcome for the turn-end verifier.
+                # `blocked` calls never actually ran — don't let a guardrail
+                # block count as either a failure or a success.
+                if not blocked:
+                    try:
+                        self._record_file_mutation_result(
+                            function_name, function_args, function_result, is_error,
+                        )
+                    except Exception as _ver_err:
+                        logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
                 if not blocked and self.tool_progress_callback:
                     try:
                         self.tool_progress_callback(
@@ -10602,6 +10763,18 @@ class AIAgent:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+
+            # Track file-mutation outcome for the turn-end verifier.  See
+            # the concurrent path for the rationale; both paths must feed
+            # the same state so the footer reflects every tool call in the
+            # turn, not just the parallel ones.
+            if not _execution_blocked:
+                try:
+                    self._record_file_mutation_result(
+                        function_name, function_args, function_result, _is_error_result,
+                    )
+                except Exception as _ver_err:
+                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
             if not _execution_blocked and self.tool_progress_callback:
                 try:
@@ -11227,6 +11400,14 @@ class AIAgent:
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+        # Per-turn file-mutation verifier state.  Keyed by resolved path;
+        # each failed ``write_file`` / ``patch`` call records the error
+        # preview.  Later successful writes to the same path remove the
+        # entry (the model recovered).  At end-of-turn, any entries still
+        # present are surfaced in an advisory footer so the model cannot
+        # over-claim success while the file is actually unchanged on disk.
+        self._turn_failed_file_mutations: Dict[str, Dict[str, Any]] = {}
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -14393,6 +14574,31 @@ class AIAgent:
             )
         else:
             logger.info(_diag_msg, *_diag_args)
+
+        # File-mutation verifier footer.
+        # If one or more ``write_file`` / ``patch`` calls failed during this
+        # turn and were never superseded by a successful write to the same
+        # path, append an advisory footer to the assistant response.  This
+        # catches the specific case — reported by Ben Eng (#15524-adjacent)
+        # — where a model issues a batch of parallel patches, half of them
+        # fail with "Could not find old_string", and the model summarises
+        # the turn claiming every file was edited.  The user then has to
+        # manually run ``git status`` to catch the lie.  With this footer
+        # the truth is surfaced on every turn, so over-claiming is
+        # structurally impossible past the model.
+        #
+        # Gate: only applied when a real text response exists for this
+        # turn and the user didn't interrupt.  Empty/interrupted turns
+        # already have other surface text that shouldn't be augmented.
+        if final_response and not interrupted:
+            try:
+                _failed = getattr(self, "_turn_failed_file_mutations", None) or {}
+                if _failed and self._file_mutation_verifier_enabled():
+                    footer = self._format_file_mutation_failure_footer(_failed)
+                    if footer:
+                        final_response = final_response.rstrip() + "\n\n" + footer
+            except Exception as _ver_err:
+                logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
         # Plugin hook: transform_llm_output
         # Fired once per turn after the tool-calling loop completes.

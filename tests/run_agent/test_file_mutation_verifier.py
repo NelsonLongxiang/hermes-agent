@@ -216,6 +216,7 @@ class TestRecordFileMutationResult:
 
         assert agent._turn_failed_file_mutations == {}
 
+
     def test_repeated_failure_keeps_first_error(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(
