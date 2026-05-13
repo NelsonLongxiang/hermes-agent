@@ -583,6 +583,8 @@ def _handle_claude_session(args, **kw):
         # check-and-set: name 查找 + 占位符注册在同一锁内，防止并发 start
         # 双重创建（TOCTOU fix）。
         _existing_resp = None
+        _old_mgr_to_stop = None  # 需要在锁外 stop 的旧 session
+        _old_sid_to_cleanup = None  # 需要在锁外清理注册表的旧 session_id
         with _sessions_lock:
             existing_sid = _name_index.get((gw_key, session_name_arg))
             if existing_sid == "__starting__":
@@ -592,17 +594,67 @@ def _handle_claude_session(args, **kw):
                     ensure_ascii=False,
                 )
             if existing_sid and existing_sid in _sessions and _sessions[existing_sid]._session_active:
-                _touch_active(gw_key, existing_sid, already_locked=True)
                 existing_mgr = _sessions[existing_sid]
-                _existing_resp = {
-                    "session_id": existing_sid,
-                    "tmux_session": existing_mgr._tmux.session_name if existing_mgr._tmux else None,
-                    "state": existing_mgr._sm.current_state,
-                    "permission_mode": existing_mgr._permission_mode,
-                    "claude_session_uuid": existing_mgr._claude_session_uuid,
-                    "note": f"Session '{session_name_arg}' already active",
-                    "name": session_name_arg,
-                }
+                # 检查关键参数是否变化：workdir/model/permission_mode/resume_uuid
+                old_workdir = getattr(existing_mgr, "_workdir", "")
+                old_model = getattr(existing_mgr, "_model", None)  # may not exist
+                old_perm = getattr(existing_mgr, "_permission_mode", "normal")
+                new_model = args.get("model")
+                new_perm = args.get("permission_mode", "normal")
+                has_resume = bool(args.get("resume_uuid"))
+
+                params_changed = (
+                    old_workdir != abs_workdir
+                    or old_perm != new_perm
+                    or has_resume
+                    or (new_model is not None and new_model != (old_model or None))
+                )
+
+                if params_changed:
+                    # 参数变化：需要 stop 旧 session 再 start 新的
+                    logger.info(
+                        "Session '%s' params changed (workdir=%s→%s, perm=%s→%s, resume=%s), auto-stopping old session",
+                        session_name_arg, old_workdir, abs_workdir, old_perm, new_perm, has_resume,
+                    )
+                    # 锁内只做轻量操作：清理注册表 + 预占，耗时 stop 延迟到锁外
+                    existing_mgr._status_callback = None
+                    # 立即清理注册表，释放 name 槽位
+                    _sessions.pop(existing_sid, None)
+                    keys_to_remove = []
+                    for k, v_list in _workdir_index.items():
+                        if existing_sid in v_list:
+                            updated_list = [sid for sid in v_list if sid != existing_sid]
+                            if updated_list:
+                                _workdir_index[k] = updated_list
+                            else:
+                                keys_to_remove.append(k)
+                    for k in keys_to_remove:
+                        _workdir_index.pop(k, None)
+                    name_keys = [k for k, v in _name_index.items() if v == existing_sid]
+                    for k in name_keys:
+                        _name_index.pop(k, None)
+                    if _active_session.get(gw_key) == existing_sid:
+                        _active_session.pop(gw_key, None)
+                    # 预占新槽位
+                    _name_index[(gw_key, session_name_arg)] = "__starting__"
+                    workdir_idx_key = (gw_key, abs_workdir)
+                    existing_list = _workdir_index.get(workdir_idx_key, [])
+                    _workdir_index[workdir_idx_key] = existing_list + ["__starting__"]
+                    # 记录待 stop 的实例（锁外执行）
+                    _old_mgr_to_stop = existing_mgr
+                    _old_sid_to_cleanup = existing_sid
+                else:
+                    # 参数没变：复用已有 session
+                    _touch_active(gw_key, existing_sid, already_locked=True)
+                    _existing_resp = {
+                        "session_id": existing_sid,
+                        "tmux_session": existing_mgr._tmux.session_name if existing_mgr._tmux else None,
+                        "state": existing_mgr._sm.current_state,
+                        "permission_mode": existing_mgr._permission_mode,
+                        "claude_session_uuid": existing_mgr._claude_session_uuid,
+                        "note": f"Session '{session_name_arg}' already active",
+                        "name": session_name_arg,
+                    }
             else:
                 # 预占槽位，防止并发 start 时双重创建
                 _name_index[(gw_key, session_name_arg)] = "__starting__"
@@ -610,7 +662,14 @@ def _handle_claude_session(args, **kw):
                 existing_list = _workdir_index.get(workdir_idx_key, [])
                 _workdir_index[workdir_idx_key] = existing_list + ["__starting__"]
 
-        # 已有活跃会话：在锁外处理 message（避免持锁执行 send 阻塞全局注册表）
+        # 锁外执行耗时操作：stop 旧 session（tmux kill + observer stop）
+        if _old_mgr_to_stop is not None:
+            try:
+                _old_mgr_to_stop.stop()
+            except Exception as e:
+                logger.warning("Auto-stop old session '%s' (sid=%s) failed: %s", session_name_arg, _old_sid_to_cleanup[:8] if _old_sid_to_cleanup else "?", e)
+
+        # 已有活跃会话（参数未变）：在锁外处理 message
         if _existing_resp is not None:
             if args.get("message"):
                 try:

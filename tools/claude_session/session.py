@@ -316,6 +316,7 @@ class ClaudeSession:
             self._session_active = True
             self._session_start_time = time.monotonic()
             self._session_ready_time = time.monotonic()  # Mark session as fully initialized
+            self._model = model  # Persist for restart detection
             self._update_state(SessionState.IDLE)
 
             # Start status card first (sets self._status_callback for observer)
@@ -528,6 +529,8 @@ class ClaudeSession:
         PATROL_INTERVAL = int(os.environ.get("HERMES_CLAUDE_SESSION_PATROL_INTERVAL", "300"))
         # STALL_THRESHOLD: consecutive seconds with no buffer growth → consider stalled
         STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STALL_THRESHOLD", "1800"))
+        # STATE_STALL_THRESHOLD: seconds in same non-terminal state with no growth → state stall
+        STATE_STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STATE_STALL_THRESHOLD", "600"))
         COMPACT_MIN_WAIT = 3600  # 1 hour minimum for compaction
         COMPACT_MAX_WAIT = 7200  # 2 hours maximum for compaction
         POLL_INTERVAL = 180  # 3 minutes - poll for state changes when thinking/calling
@@ -535,6 +538,8 @@ class ClaudeSession:
         deadline = time.monotonic() + timeout
         last_patrol_tokens = self._buf.total_count()
         last_growth_time = time.monotonic()
+        last_state_change_time = time.monotonic()
+        last_state_for_stall = self._state
         compact_detected = False
         compact_start = None
 
@@ -622,6 +627,30 @@ class ClaudeSession:
             if current_tokens > last_patrol_tokens:
                 last_growth_time = now
                 last_patrol_tokens = current_tokens
+
+            # Track state changes for state-stall detection
+            if state != last_state_for_stall:
+                last_state_for_stall = state
+                last_state_change_time = now
+
+            # State stall detection: same non-terminal state for too long with no output growth
+            # This catches cases where Claude appears stuck (e.g. THINKING for 10+ minutes with no progress)
+            non_terminal = state in (SessionState.THINKING, SessionState.TOOL_CALL)
+            if non_terminal and (now - last_state_change_time) > STATE_STALL_THRESHOLD:
+                # Only trigger if also no output growth
+                if (now - last_growth_time) > STATE_STALL_THRESHOLD:
+                    logger.warning(
+                        "State stall: %s for %.0fs, no output growth for %.0fs",
+                        state, now - last_state_change_time, now - last_growth_time,
+                    )
+                    return {
+                        "status": "stalled",
+                        "state": state,
+                        "stalled_seconds": round(now - last_state_change_time, 1),
+                        "no_growth_seconds": round(now - last_growth_time, 1),
+                        "progress_info": self._check_progress(deadline - timeout),
+                        "hint": f"State {state} unchanged for {round((now - last_state_change_time) / 60, 1)} min with no output. Consider sending a follow-up or cancelling.",
+                    }
 
             # Fast poll: just check state and wait
             remaining = deadline - now

@@ -51,6 +51,7 @@ _PERMISSION_RE = re.compile(
 _STATUS_BAR_RE = re.compile(
     r"(bypass permissions (on|off)|shift\+tab to cycle|esc to interrupt|"
     r"⏵⏵|/model|/mcp|/ide for Visual Studio Code|"
+    r"\d+\s+MCP\s+servers?\s+failed|"
     r"[─━]{5,})",
     re.IGNORECASE,
 )
