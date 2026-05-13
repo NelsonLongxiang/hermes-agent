@@ -1225,7 +1225,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # ── AML rendering path ──
             if is_aml_content(content):
-                aml_result = render_aml_telegram(content)
+                aml_result = await render_aml_telegram(content)
                 if aml_result is not None:
                     return await self._send_aml(
                         chat_id, aml_result, reply_to, metadata,
@@ -1472,7 +1472,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if finalize:
             try:
                 if is_aml_content(content):
-                    aml_result = render_aml_telegram(content)
+                    aml_result = await render_aml_telegram(content)
                     if aml_result:
                         return await self._edit_aml_message(
                             chat_id, message_id, aml_result,

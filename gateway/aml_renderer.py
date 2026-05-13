@@ -6,11 +6,12 @@ to Telegram HTML via subprocess and sent with ParseMode.HTML instead of
 MarkdownV2.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
-import subprocess
+import shutil
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("gateway.aml_renderer")
@@ -34,6 +35,21 @@ _AML_PATTERN = re.compile(
 # Also detect inline $badge.color[...] and $color[...] patterns
 _INLINE_STYLE_PATTERN = re.compile(r"\$(?:badge|bg|icon)\.[a-z]+\[")
 
+# Cache: whether the AML CLI is available (None = not yet checked)
+_aml_cli_available: Optional[bool] = None
+
+
+def _check_aml_cli() -> bool:
+    """Check once whether the AML CLI is available."""
+    global _aml_cli_available
+    if _aml_cli_available is not None:
+        return _aml_cli_available
+    cli_path = os.environ.get("AML_CLI_PATH", "aml")
+    _aml_cli_available = shutil.which(cli_path) is not None
+    if not _aml_cli_available:
+        logger.debug("AML CLI not found in PATH — AML rendering disabled")
+    return _aml_cli_available
+
 
 def is_aml_content(text: str) -> bool:
     """Return True if *text* contains AML directives.
@@ -45,6 +61,8 @@ def is_aml_content(text: str) -> bool:
     """
     if not text:
         return False
+    if not _check_aml_cli():
+        return False
     if _AML_PATTERN.search(text):
         return True
     if _INLINE_STYLE_PATTERN.search(text):
@@ -52,25 +70,30 @@ def is_aml_content(text: str) -> bool:
     return False
 
 
-def render_aml_telegram(text: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+async def render_aml_telegram(text: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
     """Render AML *text* to Telegram format via the ``aml`` CLI.
+
+    Non-blocking: uses asyncio subprocess to avoid blocking the event loop.
 
     Returns a dict ``{"text": ..., "keyboard": ...}`` on success,
     or ``None`` on any failure (CLI not found, parse error, timeout).
     """
     try:
         cli_path = os.environ.get("AML_CLI_PATH", "aml")
-        result = subprocess.run(
-            [cli_path, "render", "--telegram"],
-            input=text,
-            capture_output=True,
-            text=True,
+        proc = await asyncio.create_subprocess_exec(
+            cli_path, "render", "--telegram",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=text.encode()),
             timeout=timeout,
         )
-        if result.returncode != 0:
-            logger.warning("AML CLI returned %d: %s", result.returncode, result.stderr.strip())
+        if proc.returncode != 0:
+            logger.warning("AML CLI returned %d: %s", proc.returncode, stderr.decode().strip())
             return None
-        output = json.loads(result.stdout)
+        output = json.loads(stdout.decode())
         if "text" not in output:
             logger.warning("AML CLI output missing 'text' field")
             return None
@@ -78,7 +101,7 @@ def render_aml_telegram(text: str, timeout: float = 5.0) -> Optional[Dict[str, A
     except FileNotFoundError:
         logger.debug("AML CLI not found in PATH — skipping AML rendering")
         return None
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         logger.warning("AML CLI timed out after %.1fs", timeout)
         return None
     except (json.JSONDecodeError, OSError) as exc:

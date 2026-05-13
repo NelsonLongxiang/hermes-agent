@@ -381,17 +381,7 @@ PLATFORM_HINTS = {
         "Just write MEDIA:/path/to/file directly in your response text — the gateway "
         "delivers it automatically. The send_message tool is only for pushing content "
         "to OTHER destinations (cron jobs, background scripts, proactive notifications). "
-        "Using it here causes target resolution failures.\n"
-        "输出结构化内容时使用 AML 标记，会自动渲染为富 UI 组件：\n"
-        "- @warn[标题] ... @/warn  警告容器\n"
-        "- @danger[标题] ... @/danger  严重告警\n"
-        "- @info[标题] ... @/info  信息卡片\n"
-        "- @ok[标题] ... @/ok  成功提示\n"
-        "- @metric 数值 标签 {color=green/red/yellow}  指标\n"
-        "- @progress N% 标签  进度条\n"
-        "- @btn[按钮]{action=操作}  操作按钮\n"
-        "- $badge.green[在线] / $red[错误]  内联徽章/颜色\n"
-        "仅在状态报告、仪表盘、系统告警等结构化场景使用 AML，普通对话保持纯文本。"
+        "Using it here causes target resolution failures."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "

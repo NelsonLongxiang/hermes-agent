@@ -5280,6 +5280,25 @@ class AIAgent:
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
+            # Append AML syntax hints only if the AML CLI is available
+            if platform_key == "telegram":
+                try:
+                    from gateway.aml_renderer import _check_aml_cli
+                    if _check_aml_cli():
+                        prompt_parts.append(
+                            "\n输出结构化内容时使用 AML 标记，会自动渲染为富 UI 组件：\n"
+                            "- @warn[标题] ... @/warn  警告容器\n"
+                            "- @danger[标题] ... @/danger  严重告警\n"
+                            "- @info[标题] ... @/info  信息卡片\n"
+                            "- @ok[标题] ... @/ok  成功提示\n"
+                            "- @metric 数值 标签 {color=green/red/yellow}  指标\n"
+                            "- @progress N% 标签  进度条\n"
+                            "- @btn[按钮]{action=操作}  操作按钮\n"
+                            "- $badge.green[在线] / $red[错误]  内联徽章/颜色\n"
+                            "仅在状态报告、仪表盘、系统告警等结构化场景使用 AML，普通对话保持纯文本。"
+                        )
+                except Exception:
+                    pass
         elif platform_key:
             # Check plugin registry for platform-specific LLM guidance
             try:
