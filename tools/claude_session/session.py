@@ -883,31 +883,14 @@ class ClaudeSession:
             with self._lock:
                 self._tmux.send_special_key("Escape")
         elif option.isdigit() and int(option) > 0:
-            # Read current cursor position under lock
+            # Type the number directly — Claude Code's ink select component
+            # supports number key shortcuts (pressing '1' selects option 1).
+            # This is more reliable than Up/Down arrow navigation which can
+            # lose keystrokes during tmux rendering.
             with self._lock:
-                pane = self._tmux.capture_pane()
-                lines = clean_lines(pane)
-                current_selected = None
-                for line in lines[-20:]:
-                    m = re.match(r"\s*❯\s*(\d+)\.", line.strip())
-                    if m:
-                        current_selected = int(m.group(1))
-                        break
-
-            # NOTE: Navigation keys sent outside lock is intentional.
-            # When respond_interview is called, wait_for_idle has already returned INTERVIEW
-            # to Hermes, so no other thread is writing to tmux. The lock is only needed for
-            # reading the current cursor position (capture_pane).
-            # Navigate outside lock (involves multiple sleeps)
-            if current_selected is not None:
-                target = int(option)
-                diff = target - current_selected
-                key = "Down" if diff > 0 else "Up"
-                for _ in range(abs(diff)):
-                    self._tmux.send_special_key(key)
-                    time.sleep(0.1)
-
-            self._tmux.send_special_key("Enter")
+                self._tmux.send_keys(option)
+                time.sleep(0.15)
+                self._tmux.send_special_key("Enter")
         else:
             # Type custom text
             with self._lock:
