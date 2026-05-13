@@ -870,6 +870,10 @@ class ClaudeSession:
         if not self._session_active:
             raise SessionNotActiveError("No active session")
 
+        # Refresh state before checking — observer cache may be stale
+        # (interview menus with multi-line options can evade observer detection)
+        self._refresh_state()
+
         if self._state != SessionState.INTERVIEW:
             raise SessionNotActiveError(
                 f"Not in INTERVIEW state (current: {self._state})"
