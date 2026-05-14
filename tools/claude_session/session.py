@@ -277,14 +277,21 @@ class ClaudeSession:
                 if permission_mode == "skip":
                     time.sleep(1)
                     pane = self._tmux.capture_pane()
-                    if "permission" in pane.lower() or "bypass" in pane.lower():
+                    # Only match the actual permission prompt, NOT the welcome screen
+                    # or status bar which also contain "bypass permissions" text.
+                    # The prompt asks "Do you want to proceed?" or shows permission choices.
+                    is_permission_prompt = (
+                        ("permission" in pane.lower() and ("proceed" in pane.lower() or "allow" in pane.lower() or "yes" in pane.lower()))
+                        or ("Do you want to proceed" in pane)
+                    )
+                    if is_permission_prompt:
                         self._tmux.send_special_key("Down")
                         time.sleep(0.3)
                         self._tmux.send_special_key("Enter")
                         time.sleep(1)
 
                 STARTUP_HEALTH_TIMEOUT = 30
-                if not self._wait_for_claude_startup(STARTUP_HEALTH_TIMEOUT):
+                if not self._wait_for_claude_startup(STARTUP_HEALTH_TIMEOUT, is_resume=actually_resuming):
                     logger.error("Claude Code failed to start in %s", session_name)
                     try:
                         self._tmux.kill_session()
@@ -621,6 +628,9 @@ class ClaudeSession:
         STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STALL_THRESHOLD", "1800"))
         # STATE_STALL_THRESHOLD: seconds in same non-terminal state with no growth → state stall
         STATE_STALL_THRESHOLD = float(os.environ.get("HERMES_CLAUDE_SESSION_STATE_STALL_THRESHOLD", "600"))
+        # THINKING_TIMEOUT: max seconds in THINKING state before considering it stalled
+        # Catches cases where the model API never responds (e.g. GLM-5 timeout)
+        THINKING_TIMEOUT = float(os.environ.get("HERMES_CLAUDE_SESSION_THINKING_TIMEOUT", "300"))
         COMPACT_MIN_WAIT = 3600  # 1 hour minimum for compaction
         COMPACT_MAX_WAIT = 7200  # 2 hours maximum for compaction
         POLL_INTERVAL = 180  # 3 minutes - poll for state changes when thinking/calling
@@ -751,6 +761,25 @@ class ClaudeSession:
                         "no_growth_seconds": round(now - last_growth_time, 1),
                         "progress_info": self._check_progress(deadline - timeout),
                         "hint": f"State {state} unchanged for {round((now - last_state_change_time) / 60, 1)} min with no output. Consider sending a follow-up or cancelling.",
+                    }
+
+            # THINKING timeout: model API may not respond (e.g. GLM-5 hangs)
+            # Uses _state_entered (set by _update_state) which tracks when THINKING first appeared
+            if state == SessionState.THINKING and self._state_entered:
+                thinking_duration = now - self._state_entered
+                if thinking_duration > THINKING_TIMEOUT:
+                    logger.warning(
+                        "Thinking timeout: THINKING for %.0fs (limit=%ds), model may be unresponsive",
+                        thinking_duration, int(THINKING_TIMEOUT),
+                    )
+                    return {
+                        "status": "stalled",
+                        "state": state,
+                        "stalled_seconds": round(thinking_duration, 1),
+                        "stall_type": "thinking_timeout",
+                        "model": getattr(self, "_model", None),
+                        "progress_info": self._check_progress(deadline - timeout),
+                        "hint": f"Model has been THINKING for {round(thinking_duration / 60, 1)} min with no response. The model API may be unresponsive. Consider stopping and retrying with a different model.",
                     }
 
             # Fast poll: just check state and wait
@@ -1547,11 +1576,13 @@ class ClaudeSession:
             pass
         return None
 
-    def _wait_for_claude_startup(self, timeout: int = 30) -> bool:
+    def _wait_for_claude_startup(self, timeout: int = 30, is_resume: bool = False) -> bool:
         """Wait for Claude Code to become usable."""
         deadline = time.monotonic() + timeout
         EMPTY_THRESHOLD = 3
         startup_attempts = 0
+        # For resume: allow non-IDLE states after settling (session may continue mid-task)
+        resume_settle_deadline = time.monotonic() + 5 if is_resume else None
 
         while time.monotonic() < deadline:
             try:
@@ -1580,12 +1611,19 @@ class ClaudeSession:
                     logger.info("Claude Code startup OK: IDLE")
                     return True
 
+                # During startup, THINKING/TOOL_CALL/PERMISSION may appear from
+                # the welcome screen spinner or animation — do NOT treat as ready.
+                # Only accept these states if we've already seen an IDLE (prompt).
+                # Skip and keep polling until the welcome screen clears.
                 if result.state in ("THINKING", "TOOL_CALL", "PERMISSION", "INTERVIEW"):
-                    pane_lower = pane.lower()
-                    if any(sig in pane_lower for sig in
-                           ("claude", "model", "thinking", "permission", "●", "❯")):
-                        logger.info("Claude Code startup OK: %s", result.state)
+                    # For resume: after 5s settling, accept non-IDLE states
+                    # (session may have been interrupted mid-task and continues executing)
+                    if resume_settle_deadline and time.monotonic() >= resume_settle_deadline:
+                        logger.info("Claude Code startup OK (resume): %s", result.state)
                         return True
+                    # Wait longer — welcome screen animation takes several seconds
+                    time.sleep(1.0)
+                    continue
 
                 if result.state in (SessionState.ERROR, SessionState.EXITED):
                     return False

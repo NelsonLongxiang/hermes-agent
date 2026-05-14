@@ -280,6 +280,12 @@ def _resolve_target_session(args: dict, gw_key: str):
     if name:
         with _sessions_lock:
             resolved_id = _name_index.get((gw_key, name))
+            # Cross-gateway fallback: search all gateway contexts for the name
+            if not resolved_id:
+                for (gk, n), sid in _name_index.items():
+                    if n == name and sid and sid != "__starting__":
+                        resolved_id = sid
+                        break
         if not resolved_id:
             return None, tool_error(f"No session named '{name}' in current gateway context.")
         mgr = _get_session(resolved_id, gateway_session_key=gw_key, strict=True)
