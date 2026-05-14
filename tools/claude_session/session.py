@@ -112,6 +112,11 @@ class ClaudeSession:
         # Status callback
         self._status_callback = None
 
+        # Send receipt tracking (Layer 1: echo, Layer 2: wait_for_idle receipt)
+        self._send_time: Optional[float] = None
+        self._send_seq: int = 0
+        self._send_needs_receipt: bool = False
+
         # Observer (optional side-channel)
         self._observer: Optional[SessionObserver] = None
         # Observer poll interval (default 5s — tight enough to catch short tool calls
@@ -443,7 +448,12 @@ class ClaudeSession:
             return {"cancelled": True, "state": self._state}
 
     def _send_text(self, text: str) -> dict:
-        """Internal: send text to tmux, handling multi-line."""
+        """Internal: send text to tmux, handling multi-line.
+
+        Layer 1 verification: lightweight echo check (pane content changed).
+        Does NOT retry. Claude-level receipt verification happens in
+        wait_for_idle's send receipt phase (Layer 2).
+        """
         is_multiline = "\n" in text
 
         with self._lock:
@@ -455,6 +465,9 @@ class ClaudeSession:
                 raise SessionExitedError("Claude Code has exited.")
 
             self._send_marker = self._buf.total_count()
+            self._send_seq += 1
+            self._send_time = time.monotonic()
+            self._send_needs_receipt = True
 
             if is_multiline:
                 self._tmux.send_keys(text, enter=False)
@@ -465,9 +478,85 @@ class ClaudeSession:
         if is_multiline:
             self._wait_for_paste_then_submit()
 
+        # Layer 1: echo check — did tmux pane content change?
+        echo_ok = self._verify_echo(timeout=1.5)
+
         # Refresh state
         self._refresh_state()
-        return {"sent": True, "state": self._state}
+        result = {
+            "sent": True,
+            "state": self._state,
+            "send_seq": self._send_seq,
+        }
+        if not echo_ok:
+            result["echo_status"] = "no_echo"
+            result["echo_hint"] = "Paste may not have reached tmux pane"
+        else:
+            result["echo_status"] = "echo_detected"
+        return result
+
+    def _verify_echo(self, timeout: float = 1.5) -> bool:
+        """Check that tmux pane content changed after send.
+
+        Only verifies tmux-level delivery (text appeared in pane).
+        Does NOT verify Claude received or processed the message.
+        """
+        baseline = self._send_marker
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pane = self._tmux.capture_pane()
+            lines = clean_lines(pane)
+            if lines:
+                self._buf.append_batch(lines)
+            if self._buf.total_count() > baseline:
+                return True
+            time.sleep(0.15)
+        return False
+
+    def _send_receipt_check(self, timeout: float = 10.0) -> Optional[dict]:
+        """Layer 2: verify Claude received the message by checking state transition.
+
+        Called at the start of wait_for_idle. Polls for up to `timeout` seconds.
+        Returns None if Claude left IDLE (message received).
+        Returns a send_unconfirmed dict if Claude stayed IDLE.
+
+        Note: Uses short-interval polling (0.5s) instead of _state_event because
+        observer only sets _state_event for terminal states, not THINKING/TOOL_CALL.
+        """
+        initial_state = self._state
+        receipt_deadline = time.monotonic() + timeout
+
+        while time.monotonic() < receipt_deadline:
+            pane = self._tmux.capture_pane()
+            lines = clean_lines(pane)
+            if lines:
+                self._buf.append_batch(lines)
+            result = detect_state(lines)
+            self._update_state(result.state)
+
+            if self._state != SessionState.IDLE:
+                # Claude left IDLE → message received
+                self._send_needs_receipt = False
+                logger.info("Send receipt confirmed: state=%s (seq=%d)", self._state, self._send_seq)
+                return None  # Continue to normal wait_for_idle
+
+            # Short poll — THINKING doesn't trigger _state_event
+            time.sleep(0.5)
+
+        # Timeout: Claude stayed IDLE
+        if initial_state == SessionState.IDLE:
+            self._send_needs_receipt = False
+            logger.warning("Send unconfirmed: Claude stayed IDLE for %.0fs (seq=%d)", timeout, self._send_seq)
+            return {
+                "status": "send_unconfirmed",
+                "state": self._state,
+                "send_seq": self._send_seq,
+                "elapsed_since_send": round(time.monotonic() - self._send_time, 1) if self._send_time else 0,
+                "hint": "Claude did not leave IDLE after send. Try: submit() to retry Enter, or cancel_input() + send() to resend.",
+            }
+
+        # Non-IDLE initial state → can't do receipt check, proceed normally
+        return None
 
     def _wait_for_paste_then_submit(self) -> None:
         """Wait for bracketed paste to land in tmux, then send Enter."""
@@ -519,7 +608,7 @@ class ClaudeSession:
         no turn tracking. Just poll → check state → return when done.
 
         Returns dict with status: "idle" | "permission" | "error" |
-        "disconnected" | "exited" | "timeout"
+        "disconnected" | "exited" | "timeout" | "send_unconfirmed"
         """
         if not self._session_active:
             raise SessionNotActiveError("No active session")
@@ -542,6 +631,16 @@ class ClaudeSession:
         last_state_for_stall = self._state
         compact_detected = False
         compact_start = None
+
+        # ===== Layer 2: Send Receipt Check =====
+        # If a recent send hasn't been confirmed yet, verify Claude received it.
+        # Claude typically leaves IDLE within 1-2s of receiving a message.
+        # If still IDLE after 10s, the message likely wasn't delivered.
+        if self._send_needs_receipt and self._send_time is not None:
+            receipt_result = self._send_receipt_check()
+            if receipt_result is not None:
+                return receipt_result
+        # ===== End Layer 2 =====
 
         while time.monotonic() < deadline:
             pane = self._tmux.capture_pane()
@@ -567,6 +666,7 @@ class ClaudeSession:
                 idle_confirmed = self._confirm_idle_stable(checks=3, interval=0.7)
                 if not idle_confirmed:
                     continue
+                self._send_needs_receipt = False
                 return {**self._build_idle_result(), "status": "idle"}
 
             if state == SessionState.PERMISSION:
