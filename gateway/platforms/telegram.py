@@ -479,6 +479,53 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, exc_info=True,
             )
 
+    @staticmethod
+    def _is_pool_timeout_error(error: Exception) -> bool:
+        """Check if an error is a connection pool exhaustion timeout.
+
+        Pool timeout means NO request was sent to Telegram — the connection
+        pool was full and no slot became available within pool_timeout.
+        This is distinct from a network-level TimedOut where the request
+        may have reached the server.
+        """
+        err_lower = str(error).lower()
+        return "pool timeout" in err_lower or "connection pool" in err_lower
+
+    async def _drain_general_connections(self) -> None:
+        """Reset the httpx connection pool used for general API requests.
+
+        Called reactively when the pool is exhausted (all connections occupied)
+        to recover from dead connections that accumulated through proxy
+        half-close issues.  At the point this fires, the pool is already full
+        and no new requests can acquire connections, so the drain does not
+        worsen the situation — in-flight requests that get interrupted will
+        be retried by their callers.
+        """
+        if not (self._app and self._app.bot):
+            return
+        try:
+            general_req = self._app.bot._request[1]  # noqa: SLF001
+        except Exception:
+            return
+        try:
+            await general_req.shutdown()
+        except Exception:
+            logger.debug(
+                "[%s] General request shutdown failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+        try:
+            await general_req.initialize()
+            logger.info(
+                "[%s] General request pool drained (pool timeout recovery)",
+                self.name,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] General request re-initialize failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -943,6 +990,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
+            # Override httpx Limits to cap idle keepalive connections.  PTB
+            # creates Limits(max_connections=pool_size) but leaves
+            # max_keepalive_connections at the default (None = unlimited).  On
+            # networks with flaky proxies (sing-box), dead connections can pile
+            # up in the idle pool; capping them prevents gradual exhaustion.
+            import httpx as _httpx
+            _pool_size = request_kwargs["connection_pool_size"]
+            _keepalive_limits = _httpx.Limits(
+                max_connections=_pool_size,
+                max_keepalive_connections=_env_int("HERMES_TELEGRAM_HTTP_MAX_KEEPALIVE", 64),
+                keepalive_expiry=_env_float("HERMES_TELEGRAM_HTTP_KEEPALIVE_EXPIRY", 30.0),
+            )
+
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -965,21 +1025,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 # polling reconnect + bot API bootstrap/delete_webhook calls.
                 request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips), "limits": _keepalive_limits},
                 )
                 get_updates_request = HTTPXRequest(
                     **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips), "limits": _keepalive_limits},
                 )
             elif proxy_url:
                 logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-                request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
-                get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
+                request = HTTPXRequest(**request_kwargs, proxy=proxy_url, httpx_kwargs={"limits": _keepalive_limits})
+                get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url, httpx_kwargs={"limits": _keepalive_limits})
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-                request = HTTPXRequest(**request_kwargs)
-                get_updates_request = HTTPXRequest(**request_kwargs)
+                request = HTTPXRequest(**request_kwargs, httpx_kwargs={"limits": _keepalive_limits})
+                get_updates_request = HTTPXRequest(**request_kwargs, httpx_kwargs={"limits": _keepalive_limits})
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
@@ -1330,7 +1390,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         # TimedOut is also a subclass of NetworkError but
                         # indicates the request may have reached the server —
                         # retrying risks duplicate message delivery.
+                        # Exception: pool timeout means no request was sent,
+                        # so draining and retrying is safe.
                         if _TimedOut and isinstance(send_err, _TimedOut):
+                            if self._is_pool_timeout_error(send_err):
+                                logger.warning(
+                                    "[%s] Pool timeout on send (attempt %d/3), draining general pool",
+                                    self.name, _send_attempt + 1,
+                                )
+                                await self._drain_general_connections()
+                                if _send_attempt < 2:
+                                    await asyncio.sleep(1)
+                                    continue
                             raise
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
@@ -1366,10 +1437,14 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             # TimedOut means the request may have reached Telegram —
             # mark as non-retryable so _send_with_retry() doesn't re-send.
+            # Exception: pool timeout means no request was sent — safe to retry.
             _to = locals().get("_TimedOut")
             err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
-            return SendResult(success=False, error=str(e), retryable=not is_timeout)
+            is_pool_timeout = self._is_pool_timeout_error(e)
+            if is_pool_timeout:
+                await self._drain_general_connections()
+            return SendResult(success=False, error=str(e), retryable=is_pool_timeout or not is_timeout)
 
     def _build_inline_keyboard(
         self, aml_output: Dict[str, Any],
@@ -1542,6 +1617,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
+                    if self._is_pool_timeout_error(retry_err):
+                        logger.warning(
+                            "[%s] Pool timeout on edit retry, draining general pool",
+                            self.name,
+                        )
+                        await self._drain_general_connections()
+                        return SendResult(success=False, error=str(retry_err), retryable=True)
                     logger.error(
                         "[%s] Edit retry failed after flood wait: %s",
                         self.name, retry_err,
@@ -1554,6 +1636,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
+            # Pool timeout means no request was sent — drain and mark retryable
+            # so the caller (stream consumer) can retry the edit.
+            if self._is_pool_timeout_error(e):
+                logger.warning(
+                    "[%s] Pool timeout on edit, draining general pool",
+                    self.name,
+                )
+                await self._drain_general_connections()
+                return SendResult(success=False, error=str(e), retryable=True)
             return SendResult(success=False, error=str(e))
 
     async def _edit_aml_message(

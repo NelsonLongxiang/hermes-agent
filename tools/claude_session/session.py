@@ -99,6 +99,7 @@ class ClaudeSession:
         # Gateway session isolation
         self._gateway_session_key: str = ""
         self._session_name: Optional[str] = None
+        self._model: Optional[str] = None
 
         # Prevent double permission response
         self._permission_responded = False
@@ -1016,13 +1017,22 @@ class ClaudeSession:
             with self._lock:
                 self._tmux.send_special_key("Escape")
         elif option.isdigit() and int(option) > 0:
-            # Type the number directly — Claude Code's ink select component
-            # supports number key shortcuts (pressing '1' selects option 1).
-            # This is more reliable than Up/Down arrow navigation which can
-            # lose keystrokes during tmux rendering.
+            target_num = int(option)
+            # Navigate to the target option using arrow keys.
+            # Claude Code's Ink select may not support number-key shortcuts in all versions,
+            # so we use Up/Down navigation: press Up many times to reach the top, then Down.
             with self._lock:
-                self._tmux.send_keys(option)
-                time.sleep(0.15)
+                # Press Up enough times to guarantee we're at the first option
+                # (assumes max ~20 options in a menu — generous upper bound)
+                for _ in range(20):
+                    self._tmux.send_special_key("Up")
+                time.sleep(0.1)
+                # Move down (target_num - 1) times to reach the target
+                for _ in range(target_num - 1):
+                    self._tmux.send_special_key("Down")
+                    time.sleep(0.05)
+                # Confirm selection
+                time.sleep(0.1)
                 self._tmux.send_special_key("Enter")
         else:
             # Type custom text
@@ -1170,9 +1180,10 @@ class ClaudeSession:
 
     def _auto_approve_permission(self) -> None:
         """Auto-approve permission in skip mode."""
-        if self._permission_responded:
-            self._permission_responded = False
-            return
+        with self._lock:
+            if self._permission_responded:
+                self._permission_responded = False
+                return
         self._in_auto_approve = True
         try:
             for _ in range(3):
@@ -1280,12 +1291,19 @@ class ClaudeSession:
         # 识别操作类型和目标
         for line in lines:
             stripped = line.strip()
-            # Edit/Write 操作
+            # Edit/Write/MultiEdit 操作
             m = re.match(r"●\s*(Edit|Write|MultiEdit)\s+(.+)", stripped)
             if m:
                 context["operation"] = m.group(1)
                 context["target"] = m.group(2).strip()
                 context["risk_level"] = self._assess_risk(m.group(1), m.group(2))
+                break
+            # Create 操作（创建文件/目录）
+            m = re.match(r"●\s*Create\s+(.+)", stripped)
+            if m:
+                context["operation"] = "Create"
+                context["target"] = m.group(1).strip()
+                context["risk_level"] = self._assess_risk("Create", m.group(1))
                 break
             # Bash 操作
             m = re.match(r"●\s*Bash\s*\((.+)\)", stripped)
@@ -1295,11 +1313,39 @@ class ClaudeSession:
                 context["risk_level"] = self._assess_risk("Bash", m.group(1))
                 break
             # 只读操作（低风险）
-            m = re.match(r"●\s*(Grep|Search|WebFetch|Read)\s*\((.+)\)", stripped)
+            m = re.match(r"●\s*(Grep|Search|WebFetch|Read|LS|List|Glob)\s*\((.+)\)", stripped)
             if m:
                 context["operation"] = m.group(1)
                 context["target"] = m.group(2).strip()
                 context["risk_level"] = "low"
+                break
+            # TodoWrite — 元数据操作，低风险
+            m = re.match(r"●\s*TodoWrite\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = "TodoWrite"
+                context["target"] = m.group(1).strip()
+                context["risk_level"] = "low"
+                break
+            # Task — 子任务委派
+            m = re.match(r"●\s*Task\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = "Task"
+                context["target"] = m.group(1).strip()
+                context["risk_level"] = self._assess_risk("Task", m.group(1))
+                break
+            # NotebookEdit — notebook 单元格编辑
+            m = re.match(r"●\s*NotebookEdit\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = "NotebookEdit"
+                context["target"] = m.group(1).strip()
+                context["risk_level"] = self._assess_risk("NotebookEdit", m.group(1))
+                break
+            # MCP 工具调用 (MCP::server::tool 格式)
+            m = re.match(r"●\s*MCP::(\S+?)::(\S+)\s*\((.+)\)", stripped)
+            if m:
+                context["operation"] = f"MCP::{m.group(1)}::{m.group(2)}"
+                context["target"] = m.group(3).strip()
+                context["risk_level"] = self._assess_risk("MCP", m.group(3))
                 break
 
         # 如果没有检测到具体操作，从权限文本推断
@@ -1365,31 +1411,102 @@ class ClaudeSession:
 
         return context
 
-    def _assess_risk(self, operation: str, target: str) -> str:
-        """评估操作风险等级"""
-        target_lower = target.lower()
+    # 系统目录 — 始终高风险
+    _SYSTEM_DIRS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/boot", "/System", "/Windows")
+    # 敏感用户目录 — 始终高风险
+    _SENSITIVE_DIRS = ("~/.ssh", "~/.gnupg", "~/.kube", "~/.aws")
+    # 非破坏性 Bash 命令 — 低风险
+    _SAFE_BASH_PREFIXES = (
+        "cat ", "ls ", "head ", "tail ", "wc ", "grep ", "find ", "echo ",
+        "test ", "mkdir -p ", "which ", "type ", "file ", "stat ",
+        "du ", "df ", "pwd", "whoami", "hostname", "uname ",
+        "python -c \"import", "python3 -c \"import",  # read-only python
+        "git status", "git log", "git diff", "git branch", "git remote",
+    )
 
-        # 高风险模式
+    def _assess_risk(self, operation: str, target: str) -> str:
+        """评估操作风险等级，考虑 workdir 上下文。"""
+        target_lower = target.lower()
+        op_lower = operation.lower()
+
+        # 1. 绝对高风险模式（无论什么操作）
         high_risk_patterns = [
-            r"rm\s+-rf\b", r"\bdelete\b", r"\bremove\b", r"\bdrop\b",
+            r"rm\s+-rf\b", r"\bdelete\b.*\bforce\b", r"\bdrop\b",
             r"chmod\s+0?[0-7]{3}",
-            r"\bsystem\s+", r"/etc", r"/usr", r"\bsudo\b",
+            r"\bsudo\b", r"\bsu\b\s",
             r"\.\./", r"\.\.\\",
         ]
         for pattern in high_risk_patterns:
             if re.search(pattern, target_lower, re.IGNORECASE):
                 return "high"
 
-        # 中风险模式
-        medium_risk_patterns = [
-            r"chmod", r"chown", r"mv\s+", r"cp\s+",
-            r"~/", r"/home", r"\.config",
-        ]
-        for pattern in medium_risk_patterns:
-            if re.search(pattern, target_lower, re.IGNORECASE):
-                return "medium"
+        # 2. 系统目录和敏感目录 — 始终 high（路径前缀匹配，避免子字符串误报）
+        norm_target = os.path.normpath(target)
+        for sys_dir in self._SYSTEM_DIRS:
+            if norm_target == sys_dir or norm_target.startswith(sys_dir + os.sep):
+                return "high"
+        for sens_dir in self._SENSITIVE_DIRS:
+            if sens_dir in target or os.path.expanduser(sens_dir) in target:
+                return "high"
 
-        return "low"
+        # 3. 操作类型 + workdir 感知
+        is_in_workdir = self._is_in_workdir(target)
+
+        # 只读操作 — 始终 low
+        if op_lower in ("grep", "search", "webfetch", "read", "ls", "list", "glob", "todowrite"):
+            return "low"
+
+        # Bash — 根据命令内容判断
+        if op_lower == "bash":
+            return self._assess_bash_risk(target)
+
+        # Edit/Write/Create/MultiEdit/NotebookEdit — workdir 内 low，否则 medium
+        if op_lower in ("edit", "write", "multiedit", "create", "notebookedit"):
+            if is_in_workdir:
+                return "low"
+            return "medium"
+
+        # Task/MCP — 默认 medium
+        if op_lower in ("task", "mcp"):
+            if is_in_workdir:
+                return "low"
+            return "medium"
+
+        # 未识别操作 — 默认 medium
+        return "medium"
+
+    def _is_in_workdir(self, target: str) -> bool:
+        """检查目标路径是否在 session 的 workdir 内。"""
+        if not self._workdir or not target:
+            return False
+        # 展开相对路径
+        target_expanded = target
+        if not os.path.isabs(target):
+            target_expanded = os.path.join(self._workdir, target)
+        target_expanded = os.path.abspath(target_expanded)
+        return target_expanded.startswith(self._workdir + os.sep) or target_expanded == self._workdir
+
+    def _assess_bash_risk(self, command: str) -> str:
+        """评估 Bash 命令的风险等级。"""
+        cmd = command.strip().lower()
+
+        # 高风险命令
+        high_patterns = [
+            r"rm\s+-rf\b", r"\bsudo\b", r"dd\s+if=", r"mkfs\b",
+            r"curl\s+.*\|\s*sh", r"wget\s+.*\|\s*sh",
+            r">\s*/dev/sd", r"chmod\s+[0-7]{3,4}\s",
+        ]
+        for p in high_patterns:
+            if re.search(p, cmd, re.IGNORECASE):
+                return "high"
+
+        # 非破坏性命令 — low
+        for safe_prefix in self._SAFE_BASH_PREFIXES:
+            if cmd.startswith(safe_prefix.lower()):
+                return "low"
+
+        # workdir 内操作 — medium（如 pytest, npm test 等）
+        return "medium"
 
     def _get_output_since_send(self) -> str:
         lines = self._buf.since(self._send_marker)

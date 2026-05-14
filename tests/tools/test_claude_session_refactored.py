@@ -479,7 +479,7 @@ class TestRespondInterview:
         assert result["responded"] is True
 
     def test_respond_number_direct_typing(self):
-        """Typing a number directly selects that option (ink select shortcut)."""
+        """Typing a number navigates via arrow keys to that option."""
         s = ClaudeSession()
         s._session_active = True
         s._tmux = MagicMock()
@@ -488,9 +488,9 @@ class TestRespondInterview:
         with patch.object(s, '_refresh_state'):
             result = s.respond_interview("3")
 
-        # Should type "3" then press Enter (direct number shortcut)
-        s._tmux.send_keys.assert_called_once_with("3")
-        s._tmux.send_special_key.assert_called_once_with("Enter")
+        # Should send Up 20 times (reset to top), then Down 2 times (to option 3), then Enter
+        assert s._tmux.send_special_key.call_count == 23  # 20 Up + 2 Down + 1 Enter
+        s._tmux.send_special_key.assert_called_with("Enter")
         assert result["responded"] is True
 
     def test_respond_option_zero_rejected(self):
