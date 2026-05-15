@@ -290,7 +290,7 @@ class ClaudeSession:
                         self._tmux.send_special_key("Enter")
                         time.sleep(1)
 
-                STARTUP_HEALTH_TIMEOUT = 30
+                STARTUP_HEALTH_TIMEOUT = 60
                 if not self._wait_for_claude_startup(STARTUP_HEALTH_TIMEOUT, is_resume=actually_resuming):
                     logger.error("Claude Code failed to start in %s", session_name)
                     try:
