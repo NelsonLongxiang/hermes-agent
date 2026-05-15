@@ -52,6 +52,7 @@ _STATUS_BAR_RE = re.compile(
     r"(bypass permissions (on|off)|shift\+tab to cycle|esc to interrupt|"
     r"⏵⏵|/model|/mcp|/ide for Visual Studio Code|"
     r"\d+\s+MCP\s+servers?\s+failed|"
+    r"tmux focus-events|"
     r"[─━]{5,})",
     re.IGNORECASE,
 )
@@ -163,8 +164,8 @@ def detect_state(lines: list) -> StateResult:
     if not lines:
         return StateResult(state=SessionState.THINKING)
 
-    last_lines = lines[-5:] if len(lines) >= 5 else lines
-    all_text = "\n".join(last_lines)
+    last_lines = lines[-15:] if len(lines) >= 15 else lines
+    all_text = "\n".join(last_lines[-5:])
     recent_lines = lines[-10:] if len(lines) >= 10 else lines
 
     # ERROR (suppressed when tool markers are active)
