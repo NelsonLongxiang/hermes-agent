@@ -105,6 +105,7 @@ class ClaudeSession:
         self._permission_responded = False
         self._permission_auto_allow_low_risk = True  # auto-allow low-risk in normal mode
         self._in_auto_approve = False  # guard against recursive _auto_approve_permission
+        self._startup_error_count = 0  # Track ERROR/EXITED detections during startup
 
         # Initialization grace period — don't trust observer non-IDLE states during startup
         self._session_ready_time: Optional[float] = None  # None until fully initialized
@@ -1581,6 +1582,7 @@ class ClaudeSession:
         deadline = time.monotonic() + timeout
         EMPTY_THRESHOLD = 3
         startup_attempts = 0
+        self._startup_error_count = 0  # Reset for this startup attempt
         # For resume: allow non-IDLE states after settling (session may continue mid-task)
         resume_settle_deadline = time.monotonic() + 5 if is_resume else None
 
@@ -1626,7 +1628,19 @@ class ClaudeSession:
                     continue
 
                 if result.state in (SessionState.ERROR, SessionState.EXITED):
-                    return False
+                    error_count = getattr(self, "_startup_error_count", 0) + 1
+                    self._startup_error_count = error_count
+                    logger.warning(
+                        "Claude startup detected %s (attempt %d/3) — pane tail: %s",
+                        result.state, error_count,
+                        " | ".join(l.strip() for l in lines[-8:] if l.strip()),
+                    )
+                    if error_count >= 3:
+                        logger.error("Claude Code startup failed after %d ERROR/EXITED detections", error_count)
+                        return False
+                    # Transient errors (API timeout, network blip) may clear — wait and retry
+                    time.sleep(3.0)
+                    continue
 
             except Exception as e:
                 logger.warning("Startup poll error: %s", e)
