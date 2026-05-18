@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 from gateway.aml_renderer import is_aml_content, render_aml_telegram
@@ -296,6 +297,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._consecutive_send_timeouts: int = 0
+        self._last_send_failure_mono: float = 0.0
+        self._last_general_drain_mono: float = 0.0
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -550,6 +554,47 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] General request re-initialize failed (non-fatal)",
                 self.name, exc_info=True,
             )
+
+    _SEND_DRAIN_THRESHOLD = 2
+    _SEND_DRAIN_WINDOW_SEC = 60.0
+    _SEND_DRAIN_COOLDOWN_SEC = 30.0
+
+    def _maybe_drain_general_on_send_failure(self) -> None:
+        """Track consecutive send failures and drain general pool when threshold reached.
+
+        Uses a sliding time window: only failures within ``_SEND_DRAIN_WINDOW_SEC``
+        seconds accumulate.  A drain cooldown prevents thrashing when the network
+        is still down — once drained, the pool needs time for new connections to
+        establish before another drain would be useful.
+        """
+        now = time.monotonic()
+
+        # Reset if outside the time window
+        if now - self._last_send_failure_mono > self._SEND_DRAIN_WINDOW_SEC:
+            self._consecutive_send_timeouts = 0
+
+        self._consecutive_send_timeouts += 1
+        self._last_send_failure_mono = now
+
+        if self._consecutive_send_timeouts < self._SEND_DRAIN_THRESHOLD:
+            return
+
+        # Drain cooldown — don't drain more than once per _SEND_DRAIN_COOLDOWN_SEC
+        if now - self._last_general_drain_mono < self._SEND_DRAIN_COOLDOWN_SEC:
+            return
+
+        self._consecutive_send_timeouts = 0
+        self._last_general_drain_mono = now
+        logger.warning(
+            "[%s] %d consecutive send timeouts within %.0fs, draining general pool",
+            self.name, self._SEND_DRAIN_THRESHOLD, self._SEND_DRAIN_WINDOW_SEC,
+        )
+        # Fire-and-forget drain — errors are caught inside _drain_general_connections
+        asyncio.ensure_future(self._drain_general_connections())
+
+    def _reset_send_timeout_counter(self) -> None:
+        """Reset the consecutive send timeout counter (called on successful send)."""
+        self._consecutive_send_timeouts = 0
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.

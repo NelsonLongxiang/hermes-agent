@@ -92,3 +92,110 @@ class TestIsConnectTimeout:
     def test_none_is_not_connect_timeout(self):
         """None -> False."""
         assert TelegramAdapter._is_connect_timeout(None) is False
+
+
+# ── _maybe_drain_general_on_send_failure ────────────────────────────────
+
+
+def _make_mock_app_with_general():
+    """Build a mock Application with separable polling and general requests."""
+    mock_general_req = AsyncMock()
+    mock_general_req.shutdown = AsyncMock()
+    mock_general_req.initialize = AsyncMock()
+
+    mock_polling_req = AsyncMock()
+    mock_polling_req.shutdown = AsyncMock()
+    mock_polling_req.initialize = AsyncMock()
+
+    mock_bot = MagicMock()
+    mock_bot._request = (mock_polling_req, mock_general_req)
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot = mock_bot
+    return mock_app, mock_general_req
+
+
+class TestMaybeDrainGeneralOnSendFailure:
+    """Time-windowed consecutive-failure drain with cooldown."""
+
+    @staticmethod
+    def _pump_loop():
+        """Run the default event loop briefly so asyncio.ensure_future tasks execute."""
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(asyncio.sleep(0))
+
+    def test_no_drain_on_first_failure(self):
+        """A single send failure must NOT drain — could be a one-off timeout."""
+        adapter = _make_adapter()
+        mock_app, general_req = _make_mock_app_with_general()
+        adapter._app = mock_app
+
+        adapter._maybe_drain_general_on_send_failure()
+        self._pump_loop()
+        general_req.shutdown.assert_not_called()
+
+    def test_drain_after_consecutive_failures(self):
+        """Two consecutive failures within the window → drain."""
+        adapter = _make_adapter()
+        mock_app, general_req = _make_mock_app_with_general()
+        adapter._app = mock_app
+
+        adapter._maybe_drain_general_on_send_failure()  # 1st
+        adapter._maybe_drain_general_on_send_failure()  # 2nd → triggers drain
+        self._pump_loop()
+        general_req.shutdown.assert_called_once()
+        general_req.initialize.assert_called_once()
+
+    def test_no_drain_if_failures_outside_time_window(self):
+        """Failures far apart (outside 60s window) must not accumulate."""
+        adapter = _make_adapter()
+        mock_app, general_req = _make_mock_app_with_general()
+        adapter._app = mock_app
+
+        adapter._maybe_drain_general_on_send_failure()
+        # Simulate the previous failure was long ago
+        adapter._last_send_failure_mono = time.monotonic() - 120.0
+        adapter._maybe_drain_general_on_send_failure()  # outside window → count resets
+        self._pump_loop()
+        general_req.shutdown.assert_not_called()
+
+    def test_drain_cooldown_prevents_thrashing(self):
+        """After a drain, the next failure should not immediately drain again."""
+        adapter = _make_adapter()
+        mock_app, general_req = _make_mock_app_with_general()
+        adapter._app = mock_app
+
+        adapter._maybe_drain_general_on_send_failure()  # 1st
+        adapter._maybe_drain_general_on_send_failure()  # 2nd → drain
+        self._pump_loop()
+        assert general_req.shutdown.call_count == 1
+
+        # Reset count (as if send succeeded after drain), then fail again
+        adapter._consecutive_send_timeouts = 0
+        adapter._maybe_drain_general_on_send_failure()  # 1st after drain
+        adapter._maybe_drain_general_on_send_failure()  # 2nd → but cooldown blocks
+        self._pump_loop()
+        # Cooldown should prevent second drain — still only 1 shutdown call
+        assert general_req.shutdown.call_count == 1
+
+    def test_success_resets_counter(self):
+        """After a successful send (reset_send_timeout_counter), next failures start from 0."""
+        adapter = _make_adapter()
+        mock_app, general_req = _make_mock_app_with_general()
+        adapter._app = mock_app
+
+        adapter._maybe_drain_general_on_send_failure()  # count=1
+        adapter._reset_send_timeout_counter()             # reset
+        adapter._maybe_drain_general_on_send_failure()  # count=1 again (fresh)
+        self._pump_loop()
+        general_req.shutdown.assert_not_called()
+
+    def test_noop_without_app(self):
+        """Must not raise when _app is None."""
+        adapter = _make_adapter()
+        adapter._app = None
+        adapter._maybe_drain_general_on_send_failure()  # should not raise
