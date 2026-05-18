@@ -491,6 +491,31 @@ class TelegramAdapter(BasePlatformAdapter):
         err_lower = str(error).lower()
         return "pool timeout" in err_lower or "connection pool" in err_lower
 
+    @staticmethod
+    def _is_connect_timeout(error: Exception) -> bool:
+        """Return True if the error originates from a connect-level timeout.
+
+        ConnectTimeout means the TCP connection was never established -- no
+        HTTP data was sent to Telegram.  This is distinct from a ReadTimeout
+        where the request may have reached the server.
+
+        Only returns True when there is **clear evidence** in the exception
+        chain (httpcore.ConnectTimeout class name).  When in doubt, returns
+        False so the caller falls through to the existing conservative
+        behaviour (don't retry, don't drain).
+        """
+        if error is None:
+            return False
+        cause = error
+        visited = 0
+        while cause is not None and visited < 10:
+            cls_name = cause.__class__.__name__
+            if cls_name == "ConnectTimeout":
+                return True
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+            visited += 1
+        return False
+
     async def _drain_general_connections(self) -> None:
         """Reset the httpx connection pool used for general API requests.
 
