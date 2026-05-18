@@ -1462,10 +1462,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         # retrying risks duplicate message delivery.
                         # Exception: pool timeout means no request was sent,
                         # so draining and retrying is safe.
+                        # Exception: connect timeout means TCP was never
+                        # established — message definitely not sent.
                         if _TimedOut and isinstance(send_err, _TimedOut):
                             if self._is_pool_timeout_error(send_err):
                                 logger.warning(
                                     "[%s] Pool timeout on send (attempt %d/3), draining general pool",
+                                    self.name, _send_attempt + 1,
+                                )
+                                await self._drain_general_connections()
+                                if _send_attempt < 2:
+                                    await asyncio.sleep(1)
+                                    continue
+                            elif self._is_connect_timeout(send_err):
+                                logger.warning(
+                                    "[%s] Connect timeout on send (attempt %d/3), draining general pool and retrying",
                                     self.name, _send_attempt + 1,
                                 )
                                 await self._drain_general_connections()
@@ -1508,13 +1519,20 @@ class TelegramAdapter(BasePlatformAdapter):
             # TimedOut means the request may have reached Telegram —
             # mark as non-retryable so _send_with_retry() doesn't re-send.
             # Exception: pool timeout means no request was sent — safe to retry.
+            # Exception: connect timeout means TCP never connected — safe to retry.
             _to = locals().get("_TimedOut")
             err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_pool_timeout = self._is_pool_timeout_error(e)
-            if is_pool_timeout:
+            is_connect_timeout = self._is_connect_timeout(e)
+            if is_pool_timeout or is_connect_timeout:
                 await self._drain_general_connections()
-            return SendResult(success=False, error=str(e), retryable=is_pool_timeout or not is_timeout)
+            if is_timeout and not is_pool_timeout and not is_connect_timeout:
+                self._maybe_drain_general_on_send_failure()
+            else:
+                self._reset_send_timeout_counter()
+            retryable = is_pool_timeout or is_connect_timeout or not is_timeout
+            return SendResult(success=False, error=str(e), retryable=retryable)
 
     def _build_inline_keyboard(
         self, aml_output: Dict[str, Any],

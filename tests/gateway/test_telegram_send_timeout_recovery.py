@@ -199,3 +199,141 @@ class TestMaybeDrainGeneralOnSendFailure:
         adapter = _make_adapter()
         adapter._app = None
         adapter._maybe_drain_general_on_send_failure()  # should not raise
+
+
+# ── Connect-timeout send recovery ───────────────────────────────────────
+
+
+def _import_telegram_timed_out():
+    """Import telegram.error.TimedOut or a mock equivalent."""
+    try:
+        from telegram.error import TimedOut
+        return TimedOut
+    except ImportError:
+        class TimedOut(Exception):
+            pass
+        return TimedOut
+
+
+class TestSendConnectTimeoutRecovery:
+    """Connect-timeout on send should drain + mark retryable (message never sent)."""
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_returns_retryable(self):
+        """Connect-timeout send result should have retryable=True."""
+        adapter = _make_adapter()
+        mock_general_req = AsyncMock()
+        mock_general_req.shutdown = AsyncMock()
+        mock_general_req.initialize = AsyncMock()
+        mock_polling_req = AsyncMock()
+        mock_bot = MagicMock()
+        mock_bot._request = (mock_polling_req, mock_general_req)
+
+        # Build a TimedOut with ConnectTimeout in its chain
+        import httpcore
+        _TimedOut = _import_telegram_timed_out()
+        httpcore_err = httpcore.ConnectTimeout("connect timed out")
+        telegram_err = _TimedOut("Timed out")
+        telegram_err.__cause__ = httpcore_err
+
+        mock_bot.send_message = AsyncMock(side_effect=telegram_err)
+        mock_updater = MagicMock()
+        mock_updater.running = True
+        mock_app = MagicMock()
+        mock_app.updater = mock_updater
+        mock_app.bot = mock_bot
+        adapter._app = mock_app
+        adapter._bot = mock_bot
+
+        result = await adapter.send(chat_id="123", content="hello")
+        assert result.retryable is True
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_returns_not_retryable(self):
+        """Read-timeout (no ConnectTimeout in chain) should remain not-retryable."""
+        adapter = _make_adapter()
+        mock_general_req = AsyncMock()
+        mock_general_req.shutdown = AsyncMock()
+        mock_general_req.initialize = AsyncMock()
+        mock_polling_req = AsyncMock()
+        mock_bot = MagicMock()
+        mock_bot._request = (mock_polling_req, mock_general_req)
+
+        _TimedOut = _import_telegram_timed_out()
+        telegram_err = _TimedOut("Timed out")  # no __cause__ → not connect-timeout
+
+        mock_bot.send_message = AsyncMock(side_effect=telegram_err)
+        mock_updater = MagicMock()
+        mock_updater.running = True
+        mock_app = MagicMock()
+        mock_app.updater = mock_updater
+        mock_app.bot = mock_bot
+        adapter._app = mock_app
+        adapter._bot = mock_bot
+
+        result = await adapter.send(chat_id="123", content="hello")
+        assert result.retryable is False
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_triggers_general_drain(self):
+        """Connect-timeout should drain the general connection pool."""
+        adapter = _make_adapter()
+        mock_general_req = AsyncMock()
+        mock_general_req.shutdown = AsyncMock()
+        mock_general_req.initialize = AsyncMock()
+        mock_polling_req = AsyncMock()
+        mock_bot = MagicMock()
+        mock_bot._request = (mock_polling_req, mock_general_req)
+
+        import httpcore
+        _TimedOut = _import_telegram_timed_out()
+        httpcore_err = httpcore.ConnectTimeout("connect timed out")
+        telegram_err = _TimedOut("Timed out")
+        telegram_err.__cause__ = httpcore_err
+
+        mock_bot.send_message = AsyncMock(side_effect=telegram_err)
+        mock_updater = MagicMock()
+        mock_updater.running = True
+        mock_app = MagicMock()
+        mock_app.updater = mock_updater
+        mock_app.bot = mock_bot
+        adapter._app = mock_app
+        adapter._bot = mock_bot
+
+        await adapter.send(chat_id="123", content="hello")
+        mock_general_req.shutdown.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_triggers_counter_drain_on_consecutive(self):
+        """Two consecutive read-timeouts should trigger drain via the counter."""
+        adapter = _make_adapter()
+        mock_general_req = AsyncMock()
+        mock_general_req.shutdown = AsyncMock()
+        mock_general_req.initialize = AsyncMock()
+        mock_polling_req = AsyncMock()
+        mock_bot = MagicMock()
+        mock_bot._request = (mock_polling_req, mock_general_req)
+
+        _TimedOut = _import_telegram_timed_out()
+        telegram_err = _TimedOut("Timed out")  # read timeout (no connect)
+
+        mock_bot.send_message = AsyncMock(side_effect=telegram_err)
+        mock_updater = MagicMock()
+        mock_updater.running = True
+        mock_app = MagicMock()
+        mock_app.updater = mock_updater
+        mock_app.bot = mock_bot
+        adapter._app = mock_app
+        adapter._bot = mock_bot
+
+        # First send: counter goes to 1, no drain yet
+        await adapter.send(chat_id="123", content="hello1")
+        assert mock_general_req.shutdown.call_count == 0
+
+        # Second send: counter goes to 2, triggers drain
+        await adapter.send(chat_id="123", content="hello2")
+        # Fire-and-forget drain needs one loop tick to execute
+        await asyncio.sleep(0)
+        assert mock_general_req.shutdown.call_count >= 1
