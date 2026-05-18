@@ -642,6 +642,7 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
         await self._drain_polling_connections()
+        await self._drain_general_connections()
 
         try:
             await self._app.updater.start_polling(
@@ -1506,8 +1507,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
+                self._reset_send_timeout_counter()
                 message_ids.append(str(msg.message_id))
-            
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,

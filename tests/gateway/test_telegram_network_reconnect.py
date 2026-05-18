@@ -197,11 +197,12 @@ def _make_mock_app():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_drains_polling_request_only():
-    """During reconnect, only the polling request (_request[0]) must be cycled.
+async def test_reconnect_drains_both_pools():
+    """During reconnect, both polling and general request pools must be cycled.
 
-    The general request (_request[1]) must NOT be touched — doing so would
-    break concurrent send_message / edit_message calls.
+    When polling detects a network error, the general pool may also contain
+    stale connections (e.g. from a proxy interruption) that would cause
+    subsequent send_message calls to fail.  Both pools must be drained.
     """
     adapter = _make_adapter()
     adapter._polling_network_error_count = 1
@@ -214,13 +215,11 @@ async def test_reconnect_drains_polling_request_only():
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await adapter._handle_polling_network_error(Exception("Bad Gateway"))
 
-    # Polling request must be shut down and re-initialized
+    # Both pools must be drained
     mock_polling_req.shutdown.assert_called_once()
     mock_polling_req.initialize.assert_called_once()
-
-    # General request must NOT be touched
-    general_req.shutdown.assert_not_called()
-    general_req.initialize.assert_not_called()
+    general_req.shutdown.assert_called_once()
+    general_req.initialize.assert_called_once()
 
     # Reconnect must still succeed
     mock_app.updater.start_polling.assert_called_once()
