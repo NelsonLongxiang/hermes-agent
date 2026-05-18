@@ -100,6 +100,9 @@ def _make_adapter():
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
+    adapter._consecutive_send_timeouts = 0
+    adapter._last_send_failure_mono = 0.0
+    adapter._last_general_drain_mono = 0.0
     adapter.platform = Platform.TELEGRAM
     return adapter
 
