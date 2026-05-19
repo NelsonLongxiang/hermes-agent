@@ -51,6 +51,7 @@ from typing import Dict, Optional, Any, List, Union
 # gateway is a long-running daemon, so its boot cost matters less than
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from tools.claude_session_tool import register_gateway_adapter, unregister_gateway_adapter
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
@@ -16085,6 +16086,24 @@ class GatewayRunner:
                         _cleanup_msg_ids.append(str(mid))
                 _fut.add_done_callback(_track_status_id)
 
+        # Register observer and adapter for StatusCard.
+        _saved_gw_key = None
+        if _status_adapter and source.platform != Platform.WEBHOOK:
+            try:
+                from tools.claude_session_tool import _get_gateway_session_key
+                _saved_gw_key = _get_gateway_session_key()
+                register_gateway_adapter(
+                    gateway_session_key=_saved_gw_key,
+                    loop=_loop_for_step,
+                    send_func=_status_adapter.send,
+                    edit_func=_status_adapter.edit_message,
+                    delete_func=_status_adapter.delete_message,
+                    chat_id=_status_chat_id,
+                )
+            except Exception as _e:
+                logger.warning("Could not set up claude session status bridge: %s", _e)
+                _saved_gw_key = None
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -16742,6 +16761,12 @@ class GatewayRunner:
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                # Clean up claude session gateway adapter (turn-scoped)
+                if _saved_gw_key:
+                    try:
+                        unregister_gateway_adapter(gateway_session_key=_saved_gw_key)
+                    except Exception:
+                        pass
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.

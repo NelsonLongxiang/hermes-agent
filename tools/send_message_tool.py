@@ -123,7 +123,15 @@ SEND_MESSAGE_SCHEMA = {
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "to the home channel without listing first.\n\n"
+        "CRITICAL — when to use vs when NOT to use:\n"
+        "- DO use this tool: for cron job output, background script results, proactive "
+        "notifications, or any scenario where the AI is pushing content to a destination "
+        "OUTSIDE the current conversation.\n"
+        "- DO NOT use this tool to send files/media to the user in an active chat. "
+        "Instead, output MEDIA:/path/to/file directly in your text response — the "
+        "platform gateway handles delivery automatically. Using send_message for this "
+        "causes target resolution failures and duplicate sends."
     ),
     "parameters": {
         "type": "object",

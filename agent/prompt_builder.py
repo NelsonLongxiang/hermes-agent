@@ -441,7 +441,12 @@ PLATFORM_HINTS = {
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
-        "URLs in markdown format ![alt](url) and they will be sent as native photos."
+        "URLs in markdown format ![alt](url) and they will be sent as native photos.\n"
+        "**IMPORTANT: Do NOT use the send_message tool to send files in this chat.** "
+        "Just write MEDIA:/path/to/file directly in your response text — the gateway "
+        "delivers it automatically. The send_message tool is only for pushing content "
+        "to OTHER destinations (cron jobs, background scripts, proactive notifications). "
+        "Using it here causes target resolution failures."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
