@@ -78,6 +78,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS)",     "background desktop control via cua-driver"),
+    ("claude_session",   "🤖 Claude Code Session",       "tmux-based Claude Code management with state awareness"),
 ]
 
 # Toolsets that are OFF by default for new installs.
@@ -2691,6 +2692,42 @@ def _reconfigure_simple_requirements(ts_key: str):
             _print_info("    Kept current")
 
 
+def _post_setup_claude_session():
+    """Check dependencies and auto-configure environment for claude_session."""
+    import shutil as _shutil
+
+    print()
+    print(color("  🤖 Claude Code Session — Dependency Check", Colors.CYAN))
+
+    issues = []
+
+    if not _shutil.which("tmux"):
+        issues.append(("tmux", "apt install tmux / brew install tmux"))
+
+    if not _shutil.which("claude"):
+        issues.append(("Claude Code CLI", "npm install -g @anthropic-ai/claude-code"))
+
+    current_timeout = get_env_value("HERMES_STREAM_STALE_TIMEOUT")
+    if not current_timeout:
+        save_env_value("HERMES_STREAM_STALE_TIMEOUT", "300")
+        print(color("  ✓ Auto-configured HERMES_STREAM_STALE_TIMEOUT=300", Colors.GREEN))
+        print(color("    (Prevents 'Stream Stalled' errors during long tasks)", Colors.DIM))
+
+    if issues:
+        for name, hint in issues:
+            print(color(f"  ✗ {name} not found", Colors.RED))
+            print(color(f"    Install: {hint}", Colors.DIM))
+        print(color(
+            "  claude_session will not work until these are installed.",
+            Colors.YELLOW,
+        ))
+        print(color("  After installing, restart the gateway.", Colors.DIM))
+    else:
+        print(color("  ✓ All dependencies met", Colors.GREEN))
+
+    print()
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
 def tools_command(args=None, first_install: bool = False, config: dict = None):
@@ -2792,6 +2829,9 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             save_config(config)
             print(color(f"  ✓ Saved {pinfo['label']} tool configuration", Colors.GREEN))
             print()
+
+            if "claude_session" in new_enabled:
+                _post_setup_claude_session()
 
         return
 
@@ -2913,6 +2953,9 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             _save_platform_tools(config, pkey, new_enabled)
             save_config(config)
             print(color(f"  ✓ Saved {pinfo['label']} configuration", Colors.GREEN))
+
+            if "claude_session" in added:
+                _post_setup_claude_session()
         else:
             print(color(f"  No changes to {pinfo['label']}", Colors.DIM))
 

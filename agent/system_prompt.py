@@ -201,6 +201,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     platform_key = (agent.platform or "").lower().strip()
     if platform_key in PLATFORM_HINTS:
         stable_parts.append(PLATFORM_HINTS[platform_key])
+        # Append AML syntax hints only if the AML CLI is available
+        if platform_key == "telegram":
+            try:
+                from gateway.aml_renderer import _check_aml_cli
+                if _check_aml_cli():
+                    stable_parts.append(
+                        "AML markup is available. Use AML tags to render rich "
+                        "content: <b>bold</b>, <i>italic</i>, <code>code</code>, "
+                        "<pre>block</pre>, <a href=\"url\">link</a>. "
+                        "Prefer AML over markdown for structured output."
+                    )
+            except Exception:
+                pass
     elif platform_key:
         # Check plugin registry for platform-specific LLM guidance
         try:
