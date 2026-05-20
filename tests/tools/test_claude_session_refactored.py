@@ -92,8 +92,15 @@ class TestIdleDetection:
         result = detect_state(lines)
         assert result.state == SessionState.EXITED
 
-    def test_phantom_prompt_is_thinking(self):
+    def test_status_bar_prompt_is_idle(self):
+        """v2.1.126 renders ❯ + ── + status bar at IDLE — not phantom."""
         lines = ["─────────", "❯", "─────────", "⏵⏵ bypass permissions on"]
+        result = detect_state(lines)
+        assert result.state == SessionState.IDLE
+
+    def test_phantom_prompt_without_status_bar(self):
+        """Separator + prompt + separator without status bar = phantom (THINKING)."""
+        lines = ["─────────", "❯", "─────────"]
         result = detect_state(lines)
         assert result.state == SessionState.THINKING
 

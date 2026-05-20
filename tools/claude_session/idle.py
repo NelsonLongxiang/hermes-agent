@@ -56,6 +56,15 @@ _STATUS_BAR_RE = re.compile(
     r"[─━]{5,})",
     re.IGNORECASE,
 )
+# Status bar without decoration lines — used to distinguish real IDLE from phantom prompt.
+# Decoration lines (───) are ambiguous: they appear in both phantom prompts and real IDLE.
+_STATUS_BAR_CONTENT_RE = re.compile(
+    r"(bypass permissions (on|off)|shift\+tab to cycle|esc to interrupt|"
+    r"⏵⏵|/model|/mcp|/ide for Visual Studio Code|"
+    r"\d+\s+MCP\s+servers?\s+failed|"
+    r"tmux focus-events)",
+    re.IGNORECASE,
+)
 _DECORATION_RE = re.compile(r"^[─━]{5,}$")
 _ERROR_RE = re.compile(r"(Error:.*|Failed:.*|error:.*)", re.IGNORECASE)
 _DONE_TIME_RE = re.compile(r"^✻\s+\S+.*\bfor\s+\d+[hms]", re.IGNORECASE)
@@ -334,8 +343,17 @@ def _is_phantom_prompt(lines: list, last_lines: list) -> bool:
                 has_welcome = any(_WELCOME_SCREEN_RE.search(l) for l in lines)
                 global_idx = len(lines) - len(last_lines) + i
                 has_done = any(_DONE_TIME_RE.search(l) for l in lines[:global_idx])
-                if not (has_welcome or has_done):
-                    return True
+                if has_welcome or has_done:
+                    break
+                # Status bar content near the prompt means real IDLE (not phantom).
+                # Claude Code v2.1.126 renders: ❯ + ── + "bypass permissions on"
+                # This looks like phantom (2 separators) but is actually IDLE.
+                # Use _STATUS_BAR_CONTENT_RE (excludes decoration lines) to avoid
+                # false positives when the only "status bar" lines are ─── separators.
+                status_bar_window = last_lines[-3:] if len(last_lines) >= 3 else last_lines
+                if any(_STATUS_BAR_CONTENT_RE.search(l) for l in status_bar_window):
+                    break
+                return True
             break
     return False
 

@@ -335,6 +335,8 @@ TOOLSETS = {
             "web_search", "web_extract",
             # Terminal + process management
             "terminal", "process",
+            # Claude Code session management
+            "claude_session",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
