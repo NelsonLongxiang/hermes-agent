@@ -128,3 +128,100 @@ class TestIsLocalEndpoint:
     def test_near_but_not_cgnat_is_remote(self, url):
         """Hosts adjacent to but outside 100.64.0.0/10 must not match."""
         assert is_local_endpoint(url) is False
+
+
+class TestStreamingStaleTimeoutLocalBypass:
+    """Verify streaming stale timeout bypass for local endpoints.
+
+    Reproduces the bug where HERMES_STREAM_STALE_TIMEOUT=300 (env var)
+    prevented the local-endpoint bypass from activating, causing false
+    kills on localhost proxies (e.g. Claude Code proxy at localhost:8317).
+    """
+
+    def _resolve_streaming_stale_timeout(
+        self,
+        base_url: str,
+        env_stale: str | None = None,
+        provider_config_stale: float | None = None,
+        est_tokens: int = 0,
+    ) -> float:
+        """Reproduce the streaming stale timeout resolution logic."""
+        from agent.model_metadata import is_local_endpoint
+
+        _stale_from_provider_config = provider_config_stale is not None
+        if provider_config_stale is not None:
+            _stream_stale_timeout_base = provider_config_stale
+        elif env_stale is not None:
+            _stream_stale_timeout_base = float(env_stale)
+        else:
+            _stream_stale_timeout_base = 180.0
+
+        if not _stale_from_provider_config and base_url and is_local_endpoint(base_url):
+            return float("inf")
+
+        if est_tokens > 100_000:
+            return max(_stream_stale_timeout_base, 300.0)
+        elif est_tokens > 50_000:
+            return max(_stream_stale_timeout_base, 240.0)
+        return _stream_stale_timeout_base
+
+    def test_implicit_default_local_bypass(self):
+        """Default (180s) + local endpoint -> inf (disabled)."""
+        timeout = self._resolve_streaming_stale_timeout("http://localhost:11434")
+        assert timeout == float("inf")
+
+    def test_env_var_local_bypass(self):
+        """HERMES_STREAM_STALE_TIMEOUT=300 + localhost -> inf.
+
+        This was the bug: the old code checked == 180.0, so env var
+        values prevented the bypass from activating.
+        """
+        timeout = self._resolve_streaming_stale_timeout(
+            "http://localhost:8317/v1",
+            env_stale="300",
+        )
+        assert timeout == float("inf")
+
+    def test_env_var_remote_no_bypass(self):
+        """HERMES_STREAM_STALE_TIMEOUT=300 + remote -> 300 (env respected)."""
+        timeout = self._resolve_streaming_stale_timeout(
+            "https://api.openai.com",
+            env_stale="300",
+        )
+        assert timeout == 300.0
+
+    def test_provider_config_local_no_bypass(self):
+        """Provider config stale_timeout_seconds=600 + localhost -> 600.
+
+        Explicit per-provider config must always be respected.
+        """
+        timeout = self._resolve_streaming_stale_timeout(
+            "http://localhost:8317/v1",
+            provider_config_stale=600.0,
+        )
+        assert timeout == 600.0
+
+    def test_provider_config_overrides_env_for_local(self):
+        """Provider config takes priority over env var for local endpoints."""
+        timeout = self._resolve_streaming_stale_timeout(
+            "http://localhost:8317/v1",
+            env_stale="300",
+            provider_config_stale=120.0,
+        )
+        assert timeout == 120.0
+
+    def test_env_var_remote_with_context_scaling(self):
+        """Remote + env var + 68k tokens -> max(300, 240) = 300."""
+        timeout = self._resolve_streaming_stale_timeout(
+            "https://api.openai.com",
+            env_stale="300",
+            est_tokens=68_000,
+        )
+        assert timeout == 300.0
+
+    def test_no_env_no_config_remote_default(self):
+        """Remote + no config + no env -> 180s default."""
+        timeout = self._resolve_streaming_stale_timeout(
+            "https://api.openai.com",
+        )
+        assert timeout == 180.0

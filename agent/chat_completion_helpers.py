@@ -1900,14 +1900,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _stale_from_provider_config = _cfg_stale is not None
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
         _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-    # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
-    # for prefill on large contexts.  Disable the stale detector unless
-    # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+    # Local providers (Ollama, oMLX, llama-cpp, local proxies) can take
+    # very long for prefill.  Disable the stale detector unless the user
+    # explicitly configured it per-provider.  Env-var and implicit defaults
+    # are soft defaults meant for cloud providers — they should not cause
+    # false kills on local endpoints where long gaps are normal.
+    if not _stale_from_provider_config and agent.base_url and is_local_endpoint(agent.base_url):
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
