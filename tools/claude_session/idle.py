@@ -215,10 +215,9 @@ def detect_state(lines: list) -> StateResult:
 
     # IDLE — bare ❯ prompt (not permission selector, not phantom)
     # BUT: if spinner is active, Claude is actually THINKING, not idle
-    # Exclude done markers (e.g. "✻ Brewed for 3m 14s") from spinner detection
-    has_done_marker = any(_DONE_TIME_RE.search(l) for l in recent_lines)
-    # Spinner detection: any spinner char line that is NOT a done marker
-    has_spinner = not has_done_marker and any(
+    # Per-line exclusion: detect spinner on any line that is NOT a done marker
+    # (a done marker on line A should not suppress spinner on line B)
+    has_spinner = any(
         _SPINNER_CHAR_RE.search(l) and not _DONE_TIME_RE.search(l)
         for l in recent_lines
     )
@@ -354,6 +353,16 @@ def _is_phantom_prompt(lines: list, last_lines: list) -> bool:
                 if any(_STATUS_BAR_CONTENT_RE.search(l) for l in status_bar_window):
                     break
                 return True
+            # Fewer than 2 separators — normally means real prompt (not phantom).
+            # But during animation, a phantom ❯ may appear without the typical
+            # 2-separator layout. Only treat as phantom if the broader output
+            # contains Claude TUI elements (otherwise it's a bare shell prompt).
+            has_claude_tui = any(_CLAUDE_TUI_SIGNATURE_RE.search(l) for l in lines)
+            if has_claude_tui:
+                status_bar_window = last_lines[-3:] if len(last_lines) >= 3 else last_lines
+                if (not any(_STATUS_BAR_CONTENT_RE.search(l) for l in status_bar_window)
+                        and not any(_CLAUDE_TUI_SIGNATURE_RE.search(l) for l in status_bar_window)):
+                    return True
             break
     return False
 

@@ -821,14 +821,19 @@ class ClaudeSession:
             f"wait_for_idle timed out after {timeout}s",
             detail=f"state={self._state}, elapsed={round(elapsed, 1)}s",
         )
-        return err.to_dict() | {
+        full_output = self._get_output_since_send()
+        truncated = len(full_output) > self._OUTPUT_SINCE_SEND_MAX
+        timeout_result = err.to_dict() | {
             "status": "timeout",
             "state": self._state,
             "timeout_reached": True,
             "elapsed_seconds": round(elapsed, 1),
             "hint": "Timeout is normal for long tasks. Call wait_for_idle again with a larger timeout.",
-            "output_since_send": self._get_output_since_send(),
+            "output_since_send": full_output[:self._OUTPUT_SINCE_SEND_MAX],
         }
+        if truncated:
+            timeout_result["output_since_send_truncated"] = True
+        return timeout_result
 
     def wait_for_state(self, target_state: str, timeout: int = 60) -> dict:
         """Wait for a specific state."""
@@ -1271,21 +1276,31 @@ class ClaudeSession:
         This method polls `checks` times over `checks * interval` seconds and
         only returns True if ALL checks agree on IDLE.
         """
-        for _ in range(checks):
+        for check_idx in range(checks):
             time.sleep(interval)
             pane = self._tmux.capture_pane()
             lines = clean_lines(pane)
             result = detect_state(lines)
+            tail = [l[:80] for l in lines[-5:]] if lines else ["(empty)"]
+            logger.debug("confirm_idle_stable check %d/%d: state=%s tail=%s",
+                         check_idx + 1, checks, result.state, tail)
             if result.state != SessionState.IDLE:
                 self._update_state(result.state)
                 return False
         return True
 
+    _OUTPUT_SINCE_SEND_MAX = 500
+
     def _build_idle_result(self) -> dict:
-        return {
+        full_output = self._get_output_since_send()
+        truncated = len(full_output) > self._OUTPUT_SINCE_SEND_MAX
+        result = {
             "state": SessionState.IDLE,
-            "output_since_send": self._get_output_since_send(),
+            "output_since_send": full_output[:self._OUTPUT_SINCE_SEND_MAX],
         }
+        if truncated:
+            result["output_since_send_truncated"] = True
+        return result
 
     def _build_permission_result(self, lines: list = None) -> dict:
         result = {"state": SessionState.PERMISSION}

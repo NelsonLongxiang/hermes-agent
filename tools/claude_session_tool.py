@@ -353,37 +353,16 @@ def _switch_session(name: str, gateway_key: str) -> dict:
 CLAUDE_SESSION_SCHEMA = {
     "name": "claude_session",
     "description": (
-        "Interactive Claude Code session via tmux — PREFERRED way to delegate coding tasks to Claude Code.\n"
-        "Actions: start|send|type|submit|status|wait_for_idle|output|respond_permission|stop|history|events|diagnose|... (see parameters for full list)\n\n"
-        "WHEN TO USE claude_session (preferred over delegate_task/terminal for Claude Code):\n"
-        "- Complex multi-file coding tasks (refactoring, feature implementation)\n"
-        "- Tasks requiring real-time monitoring and mid-task intervention\n"
-        "- Long-running Claude Code sessions with state tracking\n"
-        "- Multiple named sessions for parallel development (name is REQUIRED for 'start')\n\n"
-        "WHEN NOT TO USE:\n"
-        "- Simple shell commands -> use terminal\n"
-        "- Non-Claude reasoning tasks -> use delegate_task\n"
-        "- One-shot quick questions -> use terminal with 'claude -p'\n\n"
-        "Provides real-time state awareness (IDLE/THINKING/TOOL_CALL/PERMISSION), "
-        "turn-level tracking, atomic send, and permission handling.\n"
-        "Load 'claude-session' skill for detailed workflows and troubleshooting.\n\n"
-        "COLLABORATION PRINCIPLES (IMPORTANT):\n"
-        "- Claude is a COOPERATOR, not a subordinate\n"
-        "- After delegating a task via send(), trust Claude to complete it autonomously\n"
-        "- Avoid frequent checks/interrupts — this breaks collaboration efficiency\n"
-        "- Only cancel if Claude is truly stuck (no output for 10+ minutes)\n"
-        "- Before cancelling, analyze why Claude hasn't responded\n"
-        "- If you must cancel, note the reason — repeated cancellations indicate micromanagement\n\n"
-        "INTERVIEW MODE (status='interview'):\n"
-        "When wait_for_idle returns status='interview', Claude Code is showing an interactive\n"
-        "selection menu (numbered options with cursor). You MUST respond with\n"
-        "respond_interview or Claude will be stuck forever.\n"
-        "- The result includes 'options' (list of numbered choices) and 'question' (what's being asked).\n"
-        "- Read the options and question carefully, then choose the best answer based on the\n"
-        "  original task you gave Claude. Use your judgment — don't just pick option 1 blindly.\n"
-        "- Use respond_interview with option='1' to select option 1, 'enter' to confirm the\n"
-        "  highlighted choice, or 'escape' to cancel. You can also type custom text.\n"
-        "- After responding, call wait_for_idle again to continue the session."
+        "Interactive Claude Code session via tmux — PREFERRED way to delegate coding tasks.\n"
+        "Actions: start|send|type|submit|status|wait_for_idle|output|respond_permission|"
+        "respond_interview|stop|history|events|list|switch|diagnose|doctor_fix\n\n"
+        "WHEN TO USE: Complex multi-file coding tasks, tasks needing real-time monitoring, "
+        "long-running sessions with state tracking, parallel named sessions (name REQUIRED for start).\n\n"
+        "WHEN NOT TO USE: Simple shell commands (-> terminal), non-Claude reasoning (-> delegate_task), "
+        "one-shot questions (-> terminal with 'claude -p').\n\n"
+        "Provides real-time state awareness (IDLE/THINKING/TOOL_CALL/PERMISSION/INTERVIEW), "
+        "atomic send, and permission handling.\n"
+        "Load 'claude-session' skill for detailed workflows, collaboration principles, and troubleshooting."
     ),
     "parameters": {
         "type": "object",
@@ -461,7 +440,7 @@ CLAUDE_SESSION_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max lines for 'output' action",
+                "description": "Max lines for 'output' action. Default: 50. Use 100-500 for detailed review.",
                 "minimum": 1,
             },
             # jsonl_output

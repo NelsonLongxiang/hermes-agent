@@ -1,0 +1,149 @@
+{
+  "enabled_toolsets": [
+    "hermes-cli"
+  ],
+  "num_tools": 30,
+  "system_prompt": {
+    "stable_tokens": 6916,
+    "context_tokens": 0,
+    "volatile_tokens": 29,
+    "total_tokens": 6945,
+    "stable_cacheable": true,
+    "context_cacheable": true,
+    "volatile_cacheable": false
+  },
+  "skills_prompt_tokens": 6133,
+  "tools_total_tokens": 13925,
+  "tools_per_tool": [
+    [
+      "cronjob",
+      1760
+    ],
+    [
+      "delegate_task",
+      1684
+    ],
+    [
+      "claude_session",
+      1463
+    ],
+    [
+      "terminal",
+      1077
+    ],
+    [
+      "session_search",
+      1055
+    ],
+    [
+      "skill_manage",
+      934
+    ],
+    [
+      "execute_code",
+      593
+    ],
+    [
+      "memory",
+      506
+    ],
+    [
+      "send_message",
+      481
+    ],
+    [
+      "search_files",
+      443
+    ],
+    [
+      "patch",
+      405
+    ],
+    [
+      "todo",
+      337
+    ],
+    [
+      "process",
+      329
+    ],
+    [
+      "clarify",
+      307
+    ],
+    [
+      "read_file",
+      237
+    ],
+    [
+      "text_to_speech",
+      225
+    ],
+    [
+      "browser_vision",
+      222
+    ],
+    [
+      "skill_view",
+      216
+    ],
+    [
+      "vision_analyze",
+      212
+    ],
+    [
+      "browser_console",
+      210
+    ],
+    [
+      "browser_navigate",
+      198
+    ],
+    [
+      "write_file",
+      181
+    ],
+    [
+      "browser_snapshot",
+      178
+    ],
+    [
+      "browser_type",
+      127
+    ],
+    [
+      "browser_click",
+      117
+    ],
+    [
+      "browser_press",
+      103
+    ],
+    [
+      "browser_scroll",
+      98
+    ],
+    [
+      "browser_get_images",
+      73
+    ],
+    [
+      "skills_list",
+      71
+    ],
+    [
+      "browser_back",
+      54
+    ]
+  ],
+  "claude_session_tokens": 1463,
+  "claude_session_pct": 10.5,
+  "per_turn_avg_tokens": 650.0,
+  "grand_total_no_history": 20870,
+  "grand_totals_with_history": {
+    "1_turns": 21720,
+    "5_turns": 24520,
+    "10_turns": 27570,
+    "15_turns": 30620
+  }
+}
