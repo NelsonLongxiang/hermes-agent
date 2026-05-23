@@ -290,6 +290,36 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
+    # Pending skill creates from background review — ask user to confirm
+    try:
+        from hermes_constants import get_hermes_home
+        _pending_path = get_hermes_home() / "pending_skill_creates.jsonl"
+        if _pending_path.exists():
+            import json as _json
+            _lines = _pending_path.read_text(encoding="utf-8").strip().splitlines()
+            if _lines:
+                _names = []
+                _valid_lines = []
+                for _line in _lines:
+                    try:
+                        _entry = _json.loads(_line)
+                        _names.append(_entry.get("name", "?"))
+                        _valid_lines.append(_line)
+                    except Exception:
+                        pass
+                if _names:
+                    volatile_parts.append(
+                        f"⚠️ Pending skill creates from background review awaiting your confirmation:\n"
+                        + "\n".join(f"  - {n}" for n in _names)
+                        + "\nAsk the user if they want to approve or reject these. "
+                        "If approved, use skill_manage(action='create') for each. "
+                        "Then delete ~/.hermes/pending_skill_creates.jsonl."
+                    )
+                    # Rewrite file with only valid entries (cleanup corrupt lines)
+                    _pending_path.write_text("\n".join(_valid_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),

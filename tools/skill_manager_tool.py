@@ -730,6 +730,35 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+        # SOUL gate: defer background-review skill creates to foreground
+        try:
+            from tools.skill_provenance import is_background_review
+            if is_background_review():
+                from hermes_constants import get_hermes_home
+                _soul = (get_hermes_home() / "SOUL.md").read_text(encoding="utf-8").lower()
+                if any(kw in _soul for kw in ("禁止随意创建技能", "禁止 self-improvement", "禁止随意更新技能", "do not auto-create skills", "forbid self-improvement")):
+                    # Defer: write to pending file for foreground confirmation
+                    _pending_path = get_hermes_home() / "pending_skill_creates.jsonl"
+                    _pending_entry = {
+                        "name": name,
+                        "content": content,
+                        "category": category,
+                        "reason": "background_review_deferred",
+                    }
+                    _pending_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_pending_path, "a", encoding="utf-8") as _pf:
+                        import json as _json
+                        _pf.write(_json.dumps(_pending_entry, ensure_ascii=False) + "\n")
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            f"SOUL.md defers background-review skill creation. "
+                            f"Skill '{name}' saved to pending queue. "
+                            f"User will be asked to confirm next session."
+                        ),
+                    }, ensure_ascii=False)
+        except Exception:
+            pass  # no SOUL.md or unreadable — allow by default
         result = _create_skill(name, content, category)
 
     elif action == "edit":
