@@ -1110,7 +1110,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
         disabled = _get_disabled_skill_names()
 
         # Check disabled skills across all dirs (local + external)
@@ -1118,7 +1118,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
             if not skills_dir.exists():
                 continue
             for skill_md in skills_dir.rglob("SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+                if is_excluded_skill_path(skill_md):
                     continue
                 slug, declared_name = _skill_slug_from_frontmatter(skill_md)
                 if not slug or not declared_name:
@@ -1137,6 +1137,8 @@ def _check_unavailable_skill(command_name: str) -> str | None:
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
             for skill_md in optional_dir.rglob("SKILL.md"):
+                if is_excluded_skill_path(skill_md):
+                    continue
                 slug, _declared = _skill_slug_from_frontmatter(skill_md)
                 if not slug:
                     continue
@@ -5896,6 +5898,12 @@ class GatewayRunner:
             if platform_registry.is_registered(platform.value):
                 adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
+                    # Adapters that need a back-reference to the gateway runner
+                    # (e.g. for cross-platform admin alerts) declare a
+                    # ``gateway_runner`` attribute. Inject it after creation so
+                    # plugin adapters don't need a custom factory signature.
+                    if hasattr(adapter, "gateway_runner"):
+                        adapter.gateway_runner = self
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -5936,15 +5944,6 @@ class GatewayRunner:
                 )
                 _notify_mode = "important"
             adapter._notifications_mode = _notify_mode
-            return adapter
-        
-        elif platform == Platform.DISCORD:
-            from gateway.platforms.discord import DiscordAdapter, check_discord_requirements
-            if not check_discord_requirements():
-                logger.warning("Discord: discord.py not installed")
-                return None
-            adapter = DiscordAdapter(config)
-            adapter.gateway_runner = self  # For cross-platform admin alerts on unauthorized slash
             return adapter
         
         elif platform == Platform.WHATSAPP:
