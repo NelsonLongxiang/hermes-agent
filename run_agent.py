@@ -394,6 +394,7 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -463,6 +464,7 @@ class AIAgent:
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
+            user_id_alt=user_id_alt,
             user_name=user_name,
             chat_id=chat_id,
             chat_name=chat_name,
@@ -1006,8 +1008,9 @@ class AIAgent:
             "on chatgpt.com/backend-api/codex (no stream events, no error). "
             "This is a known backend-side pattern that has affected ChatGPT "
             "Plus accounts intermittently. "
-            "Workaround: try `gpt-5.4-codex` on the same OAuth profile, "
+            "Workaround: try `gpt-5.4` on the same OAuth profile, or `gpt-5.3-codex`, "
             "or switch to a different model/provider in your fallback chain. "
+            "Some ChatGPT Codex accounts do not support `gpt-5.4-codex`. "
             "See hermes-agent#21444 for symptom history."
         )
 
@@ -2975,15 +2978,12 @@ class AIAgent:
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import (
-            _AI_GATEWAY_HEADERS,
             build_nvidia_nim_headers,
             build_or_headers,
         )
 
         if base_url_host_matches(base_url, "openrouter.ai"):
             self._client_kwargs["default_headers"] = build_or_headers()
-        elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
-            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
@@ -3787,8 +3787,6 @@ class AIAgent:
         known reasoning-capable model families and direct Nous Portal.
         """
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
-            return True
-        if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
             return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")

@@ -65,6 +65,39 @@ import os
 import sys
 
 
+# Mouse-tracking residue suppression — runs BEFORE every other import on the
+# TUI hot path so the terminal stops emitting SGR/X10 mouse reports while the
+# Python launcher is still doing imports (≈100–300ms in cooked + echo mode,
+# before the Node TUI takes stdin into raw mode). During that window any
+# incoming bytes are echoed straight back to the user's shell scrollback as
+# ``^[[<…M`` text. The TUI itself runs `resetTerminalModes()` again in
+# `entry.tsx`; this is just the earlier cousin. ``HERMES_TUI_NO_EARLY_DISABLE``
+# escapes the behaviour for diagnostics.
+def _suppress_mouse_residue_early() -> None:
+    if os.environ.get("HERMES_TUI_NO_EARLY_DISABLE") == "1":
+        return
+    if not (os.environ.get("HERMES_TUI") == "1" or "--tui" in sys.argv[1:]):
+        return
+    try:
+        # Skip when stdout is redirected (`hermes --tui … >log`, CI capture):
+        # the bytes can't reach the terminal anyway and would just pollute
+        # the log with raw CSI.
+        if not os.isatty(1):
+            return
+        # Disable every mouse-tracking variant we know about. Idempotent and
+        # safe to send even when no tracking is currently asserted.
+        os.write(
+            1,
+            b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+            b"\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[?2029l",
+        )
+    except OSError:
+        pass
+
+
+_suppress_mouse_residue_early()
+
+
 def _is_termux_startup_environment_fast() -> bool:
     """Tiny Termux check for pre-import startup shortcuts."""
     prefix = os.environ.get("PREFIX", "")
@@ -2374,8 +2407,6 @@ def select_provider_and_model(args=None):
     # Step 2: Provider-specific setup + model selection
     if selected_provider == "openrouter":
         _model_flow_openrouter(config, current_model)
-    elif selected_provider == "ai-gateway":
-        _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
@@ -2958,59 +2989,6 @@ def _model_flow_openrouter(config, current_model=""):
         save_config(cfg)
         deactivate_provider()
         print(f"Default model set to: {selected} (via OpenRouter)")
-    else:
-        print("No change.")
-
-
-def _model_flow_ai_gateway(config, current_model=""):
-    """Vercel AI Gateway provider: ensure API key, then pick model with pricing."""
-    from hermes_constants import AI_GATEWAY_BASE_URL
-    from hermes_cli.auth import (
-        PROVIDER_REGISTRY,
-        _prompt_model_selection,
-        _save_model_choice,
-        deactivate_provider,
-    )
-    from hermes_cli.config import get_env_value
-
-    # Route through _prompt_api_key so users can replace a stale/broken key
-    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand.
-    pconfig = PROVIDER_REGISTRY["ai-gateway"]
-    existing_key = get_env_value("AI_GATEWAY_API_KEY") or ""
-    if not existing_key:
-        print(
-            "Create API key here: https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway&title=AI+Gateway"
-        )
-        print("Add a payment method to get $5 in free credits.")
-        print()
-    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="ai-gateway")
-    if abort:
-        return
-
-    from hermes_cli.models import ai_gateway_model_ids, get_pricing_for_provider
-
-    models_list = ai_gateway_model_ids(force_refresh=True)
-    pricing = get_pricing_for_provider("ai-gateway", force_refresh=True)
-
-    selected = _prompt_model_selection(
-        models_list, current_model=current_model, pricing=pricing
-    )
-    if selected:
-        _save_model_choice(selected)
-
-        from hermes_cli.config import load_config, save_config
-
-        cfg = load_config()
-        model = cfg.get("model")
-        if not isinstance(model, dict):
-            model = {"default": model} if model else {}
-            cfg["model"] = model
-        model["provider"] = "ai-gateway"
-        model["base_url"] = AI_GATEWAY_BASE_URL
-        model["api_mode"] = "chat_completions"
-        save_config(cfg)
-        deactivate_provider()
-        print(f"Default model set to: {selected} (via Vercel AI Gateway)")
     else:
         print("No change.")
 
@@ -8438,6 +8416,14 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """
     from hermes_cli.config import detect_install_method
     method = detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        # Docker can't ``git fetch`` from within the container.  Surface the
+        # same long-form ``docker pull`` guidance ``hermes update`` (apply
+        # path) uses — telling the user to "reinstall via curl" or that
+        # ".git is missing" would point them at the wrong remediation.
+        from hermes_cli.config import format_docker_update_message
+        print(format_docker_update_message())
+        sys.exit(1)
     if method == "pip":
         from hermes_cli.config import recommended_update_command
         from hermes_cli.banner import check_via_pypi
@@ -8738,11 +8724,26 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
-    from hermes_cli.config import is_managed, managed_error
+    from hermes_cli.config import (
+        detect_install_method,
+        format_docker_update_message,
+        is_managed,
+        managed_error,
+    )
 
     if is_managed():
         managed_error("update Hermes Agent")
         return
+
+    # Docker users can't ``git pull`` — the image excludes ``.git`` from
+    # the build context.  Bail with a friendly explanation pointing at
+    # ``docker pull`` BEFORE any of the apply-path / check-path branches
+    # below get a chance to error out with misleading "Not a git
+    # repository" text.  See format_docker_update_message() for the full
+    # rationale and tag-pinning / config-persistence notes.
+    if detect_install_method(PROJECT_ROOT) == "docker":
+        print(format_docker_update_message())
+        sys.exit(1)
 
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
@@ -8983,6 +8984,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if commit_count == 0:
             _invalidate_update_cache()
+
+            # Even if origin is up to date, the fork may be behind upstream
+            if is_fork and branch == "main":
+                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
@@ -10790,6 +10796,22 @@ def cmd_dashboard(args):
             sys.exit(1)
         print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
 
+    # Discover and load plugins so any DashboardAuthProvider plugin
+    # (e.g. plugins/dashboard_auth/nous) registers BEFORE start_server's
+    # fail-closed gate check runs. The top-level argparse setup skips
+    # plugin discovery for built-in subcommands like ``dashboard`` to
+    # save ~500ms startup; we have to trigger it explicitly here because
+    # the dashboard's server-side runtime depends on plugin-registered
+    # providers (image_gen, web, dashboard_auth, …).
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as exc:
+        # Discovery failures must not block dashboard startup outright —
+        # log and proceed; the gate's fail-closed branch will surface
+        # the missing-provider state if it matters.
+        print(f"⚠ Plugin discovery failed: {exc}", file=sys.stderr)
+
     from hermes_cli.web_server import start_server
 
     embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
@@ -11359,6 +11381,19 @@ def main():
         "--replace",
         action="store_true",
         help="Replace any existing gateway instance (useful for systemd)",
+    )
+    gateway_run.add_argument(
+        "--no-supervise",
+        action="store_true",
+        help=(
+            "Inside the s6-overlay Docker image, normally `gateway run` is "
+            "automatically redirected to the supervised s6 service (so the "
+            "gateway gets auto-restart on crash, plus a supervised dashboard "
+            "if HERMES_DASHBOARD is set). Pass --no-supervise to opt out and "
+            "get the historical pre-s6 foreground behavior: the gateway is "
+            "the container's main process and the container exits with the "
+            "gateway's exit code. No effect outside an s6 container."
+        ),
     )
     _add_accept_hooks_flag(gateway_run)
     _add_accept_hooks_flag(gateway_parser)
@@ -12597,6 +12632,31 @@ Examples:
         help="Also delete the current copy and re-copy the bundled version",
     )
     skills_reset.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt when using --restore",
+    )
+
+    skills_repair_official = skills_subparsers.add_parser(
+        "repair-official",
+        help="Backfill or restore official optional skills from repo source",
+        description=(
+            "Repair official optional skill provenance. By default, only backfills "
+            "hub metadata for exact matches. Pass --restore to replace missing or "
+            "mutated active copies from optional-skills/, moving existing copies to "
+            "a restore backup first. Use name 'all' to repair every optional skill."
+        ),
+    )
+    skills_repair_official.add_argument(
+        "name", help="Official optional skill folder/frontmatter name, or 'all'"
+    )
+    skills_repair_official.add_argument(
+        "--restore",
+        action="store_true",
+        help="Restore from official optional source, backing up existing matching copies",
+    )
+    skills_repair_official.add_argument(
         "--yes",
         "-y",
         action="store_true",
