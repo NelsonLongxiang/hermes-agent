@@ -27,6 +27,8 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+# Local runtime vault — never commit (contains session UUIDs, paths, etc.)
+.vault/
 tmp/
 temp_vision_images/
 hermes-*/*
