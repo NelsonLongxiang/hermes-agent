@@ -115,18 +115,52 @@ def _save_session_registry(workdir: str, data: dict) -> None:
         logger.warning("Failed to save session registry to %s: %s", path, e)
 
 
-def _persist_session(workdir: str, name: str, claude_uuid: str) -> None:
-    """Persist a name→uuid mapping to the project's .vault/claude-session.json."""
+def _persist_session(workdir: str, name: str, claude_uuid: str, **kwargs) -> None:
+    """Persist a name→uuid mapping to the project's .vault/claude-session.json.
+    
+    Enriched fields: model, permission_mode, resume_count, last_resume_status,
+    jsonl_size, tmux_session, status.
+    """
     data = _load_session_registry(workdir)
+    now = datetime.now().isoformat()
+    existing = data.get(name, {})
+    
+    # Increment resume_count if this is an auto-resume
+    resume_count = existing.get("resume_count", 0)
+    if kwargs.get("auto_resumed"):
+        resume_count += 1
+    
     data[name] = {
         "claude_session_uuid": claude_uuid,
         "workdir": workdir,
-        "updated_at": datetime.now().isoformat(),
-        **({} if name not in data else {"created_at": data[name].get("created_at", datetime.now().isoformat())}),
+        "name": name,
+        # Time tracking
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+        "last_active_at": now,
+        # Usage tracking
+        "resume_count": resume_count,
+        "total_starts": existing.get("total_starts", 0) + 1,
+        # Session config
+        "model": kwargs.get("model", existing.get("model")),
+        "permission_mode": kwargs.get("permission_mode", existing.get("permission_mode")),
+        "tmux_session": kwargs.get("tmux_session", existing.get("tmux_session")),
+        # Resume metadata
+        "last_resume_status": kwargs.get("auto_resumed") and "auto_resumed" or kwargs.get("resume_status", existing.get("last_resume_status")),
+        "jsonl_size": kwargs.get("jsonl_size", existing.get("jsonl_size")),
+        # Status
+        "status": "active",
     }
-    if "created_at" not in data[name]:
-        data[name]["created_at"] = datetime.now().isoformat()
     _save_session_registry(workdir, data)
+
+
+def _update_session_status(workdir: str, name: str, status: str) -> None:
+    """Update session status in persistence (e.g. 'stopped', 'active')."""
+    data = _load_session_registry(workdir)
+    if name in data and isinstance(data[name], dict):
+        data[name]["status"] = status
+        data[name]["last_active_at"] = datetime.now().isoformat()
+        _save_session_registry(workdir, data)
 
 
 def _load_persisted_session(workdir: str, name: str) -> Optional[str]:
@@ -136,6 +170,11 @@ def _load_persisted_session(workdir: str, name: str) -> Optional[str]:
     if entry and isinstance(entry, dict):
         return entry.get("claude_session_uuid")
     return None
+
+
+def _load_persisted_sessions(workdir: str) -> dict:
+    """Load all persisted sessions for a workdir. Returns the full registry dict."""
+    return _load_session_registry(workdir)
 
 # Per-gateway-session status observers — bridges session status to Telegram.
 # Keyed by gateway_session_key so concurrent sessions route to the correct chat.
@@ -862,7 +901,14 @@ def _handle_claude_session(args, **kw):
                 # Persist name→uuid mapping to .vault/claude-session.json
                 claude_uuid = result.get("claude_session_uuid")
                 if claude_uuid and session_name_arg:
-                    _persist_session(abs_workdir, session_name_arg, claude_uuid)
+                    _persist_session(
+                        abs_workdir, session_name_arg, claude_uuid,
+                        model=args.get("model"),
+                        permission_mode=args.get("permission_mode", "normal"),
+                        tmux_session=result.get("tmux_session"),
+                        auto_resumed=result.get("auto_resumed", False),
+                        resume_status=result.get("auto_resumed") and "auto_resumed" or ("manual_resume" if result.get("resumed_from") else "new"),
+                    )
                 # Attach status observer for this gateway session (per-key isolation).
                 # Only set the bridge callback if StatusCard hasn't already set one.
                 # StatusCard's _status_callback sends real-time Telegram updates;
