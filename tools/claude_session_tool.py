@@ -940,6 +940,23 @@ def _handle_claude_session(args, **kw):
                 # 返回结果中附带 name
                 if session_name_arg:
                     result["name"] = session_name_arg
+                # Auto-inject persistence context so Hermes always sees peer sessions
+                try:
+                    _all_persisted = _load_session_registry(abs_workdir)
+                    if len(_all_persisted) > 1:
+                        _peers = {
+                            k: {"status": v.get("status"), "last_resume_status": v.get("last_resume_status")}
+                            for k, v in _all_persisted.items()
+                            if k != session_name_arg and isinstance(v, dict)
+                        }
+                        if _peers:
+                            result["persistence_context"] = {
+                                "peer_sessions": _peers,
+                                "hint": "Other persisted sessions in this workdir. "
+                                        "Use list_persisted for full details or switch to resume one."
+                            }
+                except Exception:
+                    pass  # non-critical enrichment
                 # send 逻辑在 try/except 之外，避免 send 异常触发 start 清理
                 if args.get("message"):
                     try:
