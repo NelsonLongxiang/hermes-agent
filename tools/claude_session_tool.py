@@ -414,6 +414,10 @@ CLAUDE_SESSION_SCHEMA = {
                 "type": "string",
                 "description": "Claude Code session UUID to resume (optional). If provided, starts with --resume to restore history.",
             },
+            "force_new": {
+                "type": "boolean",
+                "description": "For 'start': force creating a new session instead of auto-resuming an existing one with the same name.",
+            },
             # send / type / start
             "message": {
                 "type": "string",
@@ -709,6 +713,7 @@ def _handle_claude_session(args, **kw):
                 on_event=args.get("on_event", "notify"),
                 completion_queue=kw.get("completion_queue"),
                 resume_uuid=args.get("resume_uuid"),
+                force_new=args.get("force_new", False),
                 status_card_config=_status_card_config,
             )
 

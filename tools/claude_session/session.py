@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 PASTE_SUBMIT_DELAY_SECONDS = 2.0
 _PASTE_POLL_INTERVAL = 0.1
+JSONL_RESUME_SIZE_LIMIT = 20 * 1024 * 1024  # 20MB — skip auto-resume for oversized JSONL
 
 
 class _StateView:
@@ -164,6 +165,7 @@ class ClaudeSession:
         on_event: str = "notify",
         completion_queue=None,
         resume_uuid: Optional[str] = None,
+        force_new: bool = False,
         auto_responder: bool = False,  # Accepted for API compat, no-op in pipeline architecture
         auto_responder_config: Optional[dict] = None,  # Accepted for API compat, no-op
         status_card_config: Optional[dict] = None,
@@ -184,15 +186,33 @@ class ClaudeSession:
             if permission_mode not in ("normal", "skip"):
                 raise ValidationError(f"Invalid permission_mode: {permission_mode}")
 
-            self._claude_session_uuid = str(uuid.uuid4())
+            self._claude_session_uuid = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS,
+                f"hermes-session:{self._gateway_session_key}:{self._session_name}:{os.path.abspath(workdir)}"
+            ))
+
+            # Auto-detect resume: if same name+workdir had a previous session, resume it.
+            auto_resume_uuid = None
+            if not resume_uuid and not force_new:
+                jsonl_path = self._find_session_jsonl(workdir, self._claude_session_uuid)
+                if jsonl_path:
+                    jsonl_size = os.path.getsize(jsonl_path)
+                    if jsonl_size <= JSONL_RESUME_SIZE_LIMIT:
+                        auto_resume_uuid = self._claude_session_uuid
+                    else:
+                        logger.info(
+                            "JSONL too large (%d MB) for session %s, starting fresh",
+                            jsonl_size // 1024 // 1024, self._claude_session_uuid[:8],
+                        )
 
             actually_resuming = False
-            if resume_uuid:
-                jsonl_path = self._find_session_jsonl(workdir, resume_uuid)
+            effective_resume = resume_uuid or auto_resume_uuid
+            if effective_resume:
+                jsonl_path = self._find_session_jsonl(workdir, effective_resume)
                 if jsonl_path:
                     actually_resuming = True
                 else:
-                    logger.warning("resume_uuid=%s history not found, starting new", resume_uuid)
+                    logger.warning("resume_uuid=%s history not found, starting new", effective_resume)
 
             if actually_resuming:
                 self._state = SessionState.DISCONNECTED
@@ -264,7 +284,7 @@ class ClaudeSession:
 
                 claude_cmd = "claude"
                 if actually_resuming:
-                    claude_cmd += f" --resume {shlex.quote(resume_uuid)}"
+                    claude_cmd += f" --resume {shlex.quote(effective_resume)}"
                 else:
                     claude_cmd += f" --session-id {shlex.quote(self._claude_session_uuid)}"
                 if permission_mode == "skip":
@@ -367,7 +387,9 @@ class ClaudeSession:
                 "claude_session_uuid": self._claude_session_uuid,
             }
             if actually_resuming:
-                result["resumed_from"] = resume_uuid
+                result["resumed_from"] = effective_resume
+                if auto_resume_uuid:
+                    result["auto_resumed"] = True
             elif resume_uuid:
                 result["fallback_note"] = f"resume_uuid={resume_uuid} history not found"
             return result
