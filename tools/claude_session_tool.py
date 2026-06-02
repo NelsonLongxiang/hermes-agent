@@ -964,6 +964,32 @@ def _handle_claude_session(args, **kw):
         result = _list_sessions(gw_key)
         return json.dumps(result, ensure_ascii=False)
 
+    # ── list_persisted：列出 workdir 下持久化的会话（v4.4+）──
+    if action == "list_persisted":
+        workdir = args.get("workdir", ".")
+        abs_workdir = os.path.abspath(workdir)
+        try:
+            validated_wd = _validate_workdir(abs_workdir)
+        except ValueError as e:
+            return json.dumps({"error": str(e), "workdir": abs_workdir}, ensure_ascii=False)
+        persisted = _load_persisted_sessions(validated_wd)
+        # Cross-reference with active sessions in current gateway
+        active_names = set()
+        with _sessions_lock:
+            for (g, n), sid in _name_index.items():
+                if g == gw_key and sid in _sessions and _sessions[sid]._session_active:
+                    active_names.add(n)
+        # Enrich with active marker
+        for name, entry in persisted.items():
+            if isinstance(entry, dict):
+                entry["active_in_gateway"] = name in active_names
+        return json.dumps({
+            "workdir": validated_wd,
+            "vault_file": _session_file_path(validated_wd),
+            "count": len(persisted),
+            "sessions": persisted,
+        }, ensure_ascii=False)
+
     # ── switch：切换活跃会话 ──
     if action == "switch":
         name = args.get("name")
