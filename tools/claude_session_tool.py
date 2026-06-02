@@ -1023,15 +1023,14 @@ def _handle_claude_session(args, **kw):
                     except Exception:
                         pass
             if _resumable:
-                # Sort by last_active_at desc, keep top 10
-                _sorted = sorted(
-                    _resumable.items(),
-                    key=lambda x: x[1].get("last_active_at") or "",
-                    reverse=True,
-                )[:10]
+                # Partition: valid entries have last_active_at; rest go to end
+                _valid_r = [(k, v) for k, v in _resumable.items() if v.get("last_active_at")]
+                _no_ts_r = [(k, v) for k, v in _resumable.items() if not v.get("last_active_at")]
+                _valid_r.sort(key=lambda x: x[1]["last_active_at"], reverse=True)
+                _top10 = (_valid_r + _no_ts_r)[:10]
                 result["resumable"] = {
                     "total": len(_resumable),
-                    "sessions": dict(_sorted),
+                    "sessions": dict(_top10),
                     "hint": "These stopped sessions can be resumed with: "
                             "claude_session(action='start', name='<name>', workdir='<workdir>')",
                 }
