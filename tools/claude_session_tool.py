@@ -36,9 +36,9 @@ _sessions_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Session Persistence — claude-session.json in project .vault/ directory
+# Session Persistence — claude-session.json in project .claude/ directory
 # ---------------------------------------------------------------------------
-_VAULT_DIR = ".vault"
+_CLAUDE_DIR = ".claude"
 _SESSION_FILE = "claude-session.json"
 
 
@@ -58,11 +58,11 @@ def _validate_workdir(workdir: str) -> str:
 
 def _session_file_path(workdir: str) -> str:
     """Return the path to claude-session.json for a given workdir."""
-    return os.path.join(workdir, _VAULT_DIR, _SESSION_FILE)
+    return os.path.join(workdir, _CLAUDE_DIR, _SESSION_FILE)
 
 
 def _load_session_registry(workdir: str) -> dict:
-    """Load session registry from .vault/claude-session.json. Returns {} if not found."""
+    """Load session registry from .claude/claude-session.json. Returns {} if not found."""
     try:
         workdir = _validate_workdir(workdir)
     except ValueError as e:
@@ -89,7 +89,7 @@ def _load_session_registry(workdir: str) -> dict:
 
 
 def _save_session_registry(workdir: str, data: dict) -> None:
-    """Save session registry to .vault/claude-session.json. Creates .vault/ if needed."""
+    """Save session registry to .claude/claude-session.json. Creates .claude/ if needed."""
     try:
         workdir = _validate_workdir(workdir)
     except ValueError as e:
@@ -98,9 +98,9 @@ def _save_session_registry(workdir: str, data: dict) -> None:
     path = _session_file_path(workdir)
     vault_dir = os.path.dirname(path)
     try:
-        # Create vault dir if needed — check for existing symlink
+        # Create .claude dir if needed — check for existing symlink
         if os.path.islink(vault_dir) and not os.path.isdir(vault_dir):
-            logger.warning(".vault is a dangling symlink, refusing: %s", vault_dir)
+            logger.warning(".claude is a dangling symlink, refusing: %s", vault_dir)
             return
         os.makedirs(vault_dir, exist_ok=True)
         # Write with restricted permissions (owner-only: 600)
@@ -116,7 +116,7 @@ def _save_session_registry(workdir: str, data: dict) -> None:
 
 
 def _persist_session(workdir: str, name: str, claude_uuid: str, **kwargs) -> None:
-    """Persist a name→uuid mapping to the project's .vault/claude-session.json.
+    """Persist a name→uuid mapping to the project's .claude/claude-session.json.
     
     Enriched fields: model, permission_mode, resume_count, last_resume_status,
     jsonl_size, tmux_session, status.
@@ -901,7 +901,7 @@ def _handle_claude_session(args, **kw):
                     else:
                         _workdir_index[workdir_idx_key] = session_list + [sid]
                 _touch_active(gw_key, sid)
-                # Persist name→uuid mapping to .vault/claude-session.json
+                # Persist name→uuid mapping to .claude/claude-session.json
                 claude_uuid = result.get("claude_session_uuid")
                 if claude_uuid and session_name_arg:
                     _persist_session(
@@ -995,7 +995,7 @@ def _handle_claude_session(args, **kw):
                 entry["active_in_gateway"] = name in active_names
         return json.dumps({
             "workdir": validated_wd,
-            "vault_file": _session_file_path(validated_wd),
+            "vault_file": _session_file_path(validated_wd),  # legacy key name, kept for back-compat
             "count": len(persisted),
             "field_legend": {
                 "status": "Persisted status at last write (active|stopped). "
@@ -1064,7 +1064,7 @@ def _handle_claude_session(args, **kw):
                 # 清理 _active_session（如果指向刚停止的会话）
                 if _active_session.get(gw_key) == stopped_id:
                     _active_session.pop(gw_key, None)
-            # Update persistence: mark session as stopped in .vault/claude-session.json
+            # Update persistence: mark session as stopped in .claude/claude-session.json
             # so future list_persisted runs show accurate status.
             stopped_name = getattr(mgr, "_session_name", None) or name
             stopped_workdir = getattr(mgr, "_workdir", None)
