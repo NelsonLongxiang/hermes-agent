@@ -34,6 +34,66 @@ _name_index: dict[tuple[str, str], str] = {}  # (gateway_key, name) → session_
 _active_session: dict[str, str] = {}  # gateway_key → session_id (最近活跃)
 _sessions_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# Session Persistence — claude-session.json in project .vault/ directory
+# ---------------------------------------------------------------------------
+_VAULT_DIR = ".vault"
+_SESSION_FILE = "claude-session.json"
+
+
+def _session_file_path(workdir: str) -> str:
+    """Return the path to claude-session.json for a given workdir."""
+    return os.path.join(workdir, _VAULT_DIR, _SESSION_FILE)
+
+
+def _load_session_registry(workdir: str) -> dict:
+    """Load session registry from .vault/claude-session.json. Returns {} if not found."""
+    path = _session_file_path(workdir)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load session registry from %s: %s", path, e)
+        return {}
+
+
+def _save_session_registry(workdir: str, data: dict) -> None:
+    """Save session registry to .vault/claude-session.json. Creates .vault/ if needed."""
+    path = _session_file_path(workdir)
+    vault_dir = os.path.dirname(path)
+    try:
+        os.makedirs(vault_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning("Failed to save session registry to %s: %s", path, e)
+
+
+def _persist_session(workdir: str, name: str, claude_uuid: str) -> None:
+    """Persist a name→uuid mapping to the project's .vault/claude-session.json."""
+    data = _load_session_registry(workdir)
+    data[name] = {
+        "claude_session_uuid": claude_uuid,
+        "workdir": workdir,
+        "updated_at": datetime.now().isoformat(),
+        **({} if name not in data else {"created_at": data[name].get("created_at", datetime.now().isoformat())}),
+    }
+    if "created_at" not in data[name]:
+        data[name]["created_at"] = datetime.now().isoformat()
+    _save_session_registry(workdir, data)
+
+
+def _load_persisted_session(workdir: str, name: str) -> Optional[str]:
+    """Load a persisted claude_session_uuid for a given name. Returns None if not found."""
+    data = _load_session_registry(workdir)
+    entry = data.get(name)
+    if entry and isinstance(entry, dict):
+        return entry.get("claude_session_uuid")
+    return None
+
 # Per-gateway-session status observers — bridges session status to Telegram.
 # Keyed by gateway_session_key so concurrent sessions route to the correct chat.
 from typing import Callable
@@ -756,6 +816,10 @@ def _handle_claude_session(args, **kw):
                     else:
                         _workdir_index[workdir_idx_key] = session_list + [sid]
                 _touch_active(gw_key, sid)
+                # Persist name→uuid mapping to .vault/claude-session.json
+                claude_uuid = result.get("claude_session_uuid")
+                if claude_uuid and session_name_arg:
+                    _persist_session(abs_workdir, session_name_arg, claude_uuid)
                 # Attach status observer for this gateway session (per-key isolation).
                 # Only set the bridge callback if StatusCard hasn't already set one.
                 # StatusCard's _status_callback sends real-time Telegram updates;
