@@ -1,12 +1,15 @@
 ---
 name: claude-session
-description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux
-tags: ['claude-code', 'tmux', 'interactive', 'coding', 'delegation']
+description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux. Includes session persistence (auto-resume via .vault/claude-session.json) and list_persisted for cross-restart continuity.
+tags: ['claude-code', 'tmux', 'interactive', 'coding', 'delegation', 'persistence', 'auto-resume']
 triggers:
   - "claude session"
   - "coding task"
   - "delegation"
   - "interactive session"
+  - "resume session"
+  - "previous session"
+  - "persisted session"
 version: 4.3
 code_commit: f30e117cc + observer-signal + pending-bump + adaptive-paste + stale-adapter-clean
 required_environment_variables:
@@ -377,6 +380,56 @@ claude_session(action="switch", name="frontend")
 claude_session(action="diagnose")
 # 检查 tmux、Claude CLI、环境变量
 ```
+
+### list_persisted（持久化会话）
+```
+claude_session(action="list_persisted", workdir="/project")
+# 返回该 workdir 下 .vault/claude-session.json 中所有持久化的会话
+# 每条记录含 status（持久化时状态）+ active_in_gateway（当前 gateway 是否活跃）
+```
+
+---
+
+## Session Persistence（自动 resume 机制）
+
+**核心目的**：跨进程重启保留会话上下文，避免每次新建会话都从零开始。
+
+### 存储位置
+```
+<workdir>/.vault/claude-session.json
+```
+
+格式示例：
+```json
+{
+  "task-name": {
+    "claude_session_uuid": "034271e5-...",
+    "workdir": "/path/to/project",
+    "model": "sonnet",
+    "permission_mode": "skip",
+    "resume_count": 3,
+    "last_resume_status": "auto_resumed",
+    "status": "active",
+    "last_active_at": "2026-06-02T11:24:41"
+  }
+}
+```
+
+### 写入时机
+- `start` 成功：写入/更新条目，`status: "active"`
+- `stop` 成功：更新 `status: "stopped"`
+- 自动 resume：增加 `resume_count`，`last_resume_status: "auto_resumed"`
+
+### 读取时机
+- `claude_session(action="list_persisted", workdir=...)`：列出 workdir 下所有持久化会话
+- 启动同 `name` 的会话时：若存在条目，自动用 `claude_session_uuid` resume
+
+### 何时应该主动调用 list_persisted
+- 接手新 workdir，先查有没有可恢复的会话
+- 用户提到"上次"、"之前的会话"、"继续上次"
+- 不确定当前 workdir 有哪些命名会话
+
+⚠️ 注意：`status` 字段是**持久化时的状态**（最后写入时），不代表**当前进程是否活跃**。判断当前活跃用 `active_in_gateway: true` 字段。
 
 ---
 
