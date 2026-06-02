@@ -995,9 +995,48 @@ def _handle_claude_session(args, **kw):
                         _workdir_index.pop(workdir_idx_key, None)
         return json.dumps(result, ensure_ascii=False)
 
-    # ── list：列出当前 gateway 下的所有会话 ──
+    # ── list：列出当前 gateway 下的所有会话 + 可恢复的持久化会话 ──
     if action == "list":
         result = _list_sessions(gw_key)
+        # Enrich with resumable persisted sessions not currently in gateway
+        try:
+            _active_names = {s.get("name") for s in result.get("sessions", []) if s.get("name")}
+            _resumable = {}
+            _scanned_workdirs = set()
+            # Scan workdirs of active sessions first
+            for s in result.get("sessions", []):
+                wd = s.get("workdir")
+                if wd and wd not in _scanned_workdirs:
+                    _scanned_workdirs.add(wd)
+                    try:
+                        _persisted = _load_session_registry(wd)
+                        for _name, _entry in _persisted.items():
+                            if (isinstance(_entry, dict)
+                                    and _name not in _active_names
+                                    and _entry.get("status") == "stopped"):
+                                _resumable[_name] = {
+                                    "workdir": wd,
+                                    "last_active_at": _entry.get("last_active_at"),
+                                    "resume_count": _entry.get("resume_count", 0),
+                                    "model": _entry.get("model"),
+                                }
+                    except Exception:
+                        pass
+            if _resumable:
+                # Sort by last_active_at desc, keep top 10
+                _sorted = sorted(
+                    _resumable.items(),
+                    key=lambda x: x[1].get("last_active_at") or "",
+                    reverse=True,
+                )[:10]
+                result["resumable"] = {
+                    "total": len(_resumable),
+                    "sessions": dict(_sorted),
+                    "hint": "These stopped sessions can be resumed with: "
+                            "claude_session(action='start', name='<name>', workdir='<workdir>')",
+                }
+        except Exception:
+            pass  # non-critical enrichment
         return json.dumps(result, ensure_ascii=False)
 
     # ── list_persisted：列出 workdir 下持久化的会话（v4.4+）──
