@@ -1051,6 +1051,15 @@ def _handle_claude_session(args, **kw):
                 # 清理 _active_session（如果指向刚停止的会话）
                 if _active_session.get(gw_key) == stopped_id:
                     _active_session.pop(gw_key, None)
+            # Update persistence: mark session as stopped in .vault/claude-session.json
+            # so future list_persisted runs show accurate status.
+            stopped_name = getattr(mgr, "_session_name", None) or name
+            stopped_workdir = getattr(mgr, "_workdir", None)
+            if stopped_name and stopped_workdir:
+                try:
+                    _update_session_status(stopped_workdir, stopped_name, "stopped")
+                except Exception as e:
+                    logger.debug("Failed to update persistence status for stopped session %s: %s", stopped_name, e)
         return json.dumps(result, ensure_ascii=False)
 
     # ── diagnose：不需要会话实例 ──
