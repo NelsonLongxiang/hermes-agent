@@ -146,7 +146,10 @@ def _persist_session(workdir: str, name: str, claude_uuid: str, **kwargs) -> Non
         "permission_mode": kwargs.get("permission_mode", existing.get("permission_mode")),
         "tmux_session": kwargs.get("tmux_session", existing.get("tmux_session")),
         # Resume metadata
-        "last_resume_status": kwargs.get("auto_resumed") and "auto_resumed" or kwargs.get("resume_status", existing.get("last_resume_status")),
+        "last_resume_status": (
+            "auto_resumed" if kwargs.get("auto_resumed")
+            else kwargs.get("resume_status", existing.get("last_resume_status"))
+        ),
         "jsonl_size": kwargs.get("jsonl_size", existing.get("jsonl_size")),
         # Status
         "status": "active",
@@ -907,7 +910,10 @@ def _handle_claude_session(args, **kw):
                         permission_mode=args.get("permission_mode", "normal"),
                         tmux_session=result.get("tmux_session"),
                         auto_resumed=result.get("auto_resumed", False),
-                        resume_status=result.get("auto_resumed") and "auto_resumed" or ("manual_resume" if result.get("resumed_from") else "new"),
+                        resume_status=(
+                            "auto_resumed" if result.get("auto_resumed")
+                            else ("manual_resume" if result.get("resumed_from") else "new")
+                        ),
                     )
                 # Attach status observer for this gateway session (per-key isolation).
                 # Only set the bridge callback if StatusCard hasn't already set one.
