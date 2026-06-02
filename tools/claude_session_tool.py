@@ -96,13 +96,13 @@ def _save_session_registry(workdir: str, data: dict) -> None:
         logger.warning("Workdir validation failed for save: %s", e)
         return
     path = _session_file_path(workdir)
-    vault_dir = os.path.dirname(path)
+    claude_dir = os.path.dirname(path)
     try:
         # Create .claude dir if needed — check for existing symlink
-        if os.path.islink(vault_dir) and not os.path.isdir(vault_dir):
-            logger.warning(".claude is a dangling symlink, refusing: %s", vault_dir)
+        if os.path.islink(claude_dir) and not os.path.isdir(claude_dir):
+            logger.warning(".claude is a dangling symlink, refusing: %s", claude_dir)
             return
-        os.makedirs(vault_dir, exist_ok=True)
+        os.makedirs(claude_dir, exist_ok=True)
         # Write with restricted permissions (owner-only: 600)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -995,7 +995,6 @@ def _handle_claude_session(args, **kw):
                 entry["active_in_gateway"] = name in active_names
         return json.dumps({
             "workdir": validated_wd,
-            "vault_file": _session_file_path(validated_wd),  # legacy key name, kept for back-compat
             "count": len(persisted),
             "field_legend": {
                 "status": "Persisted status at last write (active|stopped). "

@@ -1,6 +1,6 @@
 ---
 name: claude-session
-description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux. Includes session persistence (auto-resume via .vault/claude-session.json) and list_persisted for cross-restart continuity.
+description: Guide for using claude_session tool to delegate coding tasks to Claude Code via tmux. Includes session persistence (auto-resume via .claude/claude-session.json) and list_persisted for cross-restart continuity.
 tags: ['claude-code', 'tmux', 'interactive', 'coding', 'delegation', 'persistence', 'auto-resume']
 triggers:
   - "claude session"
@@ -384,7 +384,7 @@ claude_session(action="diagnose")
 ### list_persisted（持久化会话）
 ```
 claude_session(action="list_persisted", workdir="/project")
-# 返回该 workdir 下 .vault/claude-session.json 中所有持久化的会话
+# 返回该 workdir 下 .claude/claude-session.json 中所有持久化的会话
 # 每条记录含 status（持久化时状态）+ active_in_gateway（当前 gateway 是否活跃）
 ```
 
@@ -396,7 +396,7 @@ claude_session(action="list_persisted", workdir="/project")
 
 ### 存储位置
 ```
-<workdir>/.vault/claude-session.json
+<workdir>/.claude/claude-session.json
 ```
 
 格式示例：
