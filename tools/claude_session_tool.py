@@ -985,7 +985,11 @@ def _handle_claude_session(args, **kw):
             for (g, n), sid in _name_index.items():
                 if g == gw_key and sid in _sessions and _sessions[sid]._session_active:
                     active_names.add(n)
-        # Enrich with active marker
+        # Enrich with active marker. NOTE: 'status' reflects the persisted
+        # state at last write (active / stopped), NOT the current process
+        # state. Use 'active_in_gateway' for current liveness — a session
+        # with status='active' may not be running (e.g. after process restart
+        # or stop without the persistence write succeeding).
         for name, entry in persisted.items():
             if isinstance(entry, dict):
                 entry["active_in_gateway"] = name in active_names
@@ -993,6 +997,15 @@ def _handle_claude_session(args, **kw):
             "workdir": validated_wd,
             "vault_file": _session_file_path(validated_wd),
             "count": len(persisted),
+            "field_legend": {
+                "status": "Persisted status at last write (active|stopped). "
+                          "NOT a live process indicator.",
+                "active_in_gateway": "True if this session is currently "
+                                     "running in the active gateway context. "
+                                     "Use this for liveness checks.",
+                "last_active_at": "ISO timestamp of the most recent persistence write.",
+                "resume_count": "Number of times this session has been auto-resumed.",
+            },
             "sessions": persisted,
         }, ensure_ascii=False)
 
