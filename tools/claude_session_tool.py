@@ -940,21 +940,34 @@ def _handle_claude_session(args, **kw):
                 # 返回结果中附带 name
                 if session_name_arg:
                     result["name"] = session_name_arg
-                # Auto-inject persistence context so Hermes always sees peer sessions
+                # Auto-inject persistence context: top-5 recently active peers
                 try:
                     _all_persisted = _load_session_registry(abs_workdir)
-                    if len(_all_persisted) > 1:
-                        _peers = {
-                            k: {"status": v.get("status"), "last_resume_status": v.get("last_resume_status")}
-                            for k, v in _all_persisted.items()
-                            if k != session_name_arg and isinstance(v, dict)
+                    _peers = {
+                        k: v for k, v in _all_persisted.items()
+                        if k != session_name_arg and isinstance(v, dict)
+                    }
+                    if _peers:
+                        _top5 = sorted(
+                            _peers.items(),
+                            key=lambda x: x[1].get("last_active_at", ""),
+                            reverse=True,
+                        )[:5]
+                        result["persistence_context"] = {
+                            "total_peers": len(_peers),
+                            "recent_sessions": {
+                                k: {
+                                    "status": v.get("status"),
+                                    "last_resume_status": v.get("last_resume_status"),
+                                    "last_active_at": v.get("last_active_at"),
+                                }
+                                for k, v in _top5
+                            },
+                            "hint": (
+                                f"Top {len(_top5)} of {len(_peers)} persisted peers "
+                                "sorted by last_active_at. Use list_persisted for full list."
+                            ),
                         }
-                        if _peers:
-                            result["persistence_context"] = {
-                                "peer_sessions": _peers,
-                                "hint": "Other persisted sessions in this workdir. "
-                                        "Use list_persisted for full details or switch to resume one."
-                            }
                 except Exception:
                     pass  # non-critical enrichment
                 # send 逻辑在 try/except 之外，避免 send 异常触发 start 清理
