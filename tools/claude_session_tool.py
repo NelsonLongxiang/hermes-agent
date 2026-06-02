@@ -42,6 +42,20 @@ _VAULT_DIR = ".vault"
 _SESSION_FILE = "claude-session.json"
 
 
+def _validate_workdir(workdir: str) -> str:
+    """Validate and normalize workdir. Returns realpath. Raises on unsafe paths."""
+    # Resolve to absolute, real path (follows symlinks, eliminates ..)
+    real = os.path.realpath(workdir)
+    # Must exist and be a directory
+    if not os.path.isdir(real):
+        raise ValueError(f"workdir does not exist or is not a directory: {real}")
+    # Block sensitive system directories
+    blocked = ("/etc", "/proc", "/sys", "/dev", "/boot", "/root", "/usr", "/var")
+    if any(real == b or real.startswith(b + "/") for b in blocked):
+        raise ValueError(f"workdir in blocked system directory: {real}")
+    return real
+
+
 def _session_file_path(workdir: str) -> str:
     """Return the path to claude-session.json for a given workdir."""
     return os.path.join(workdir, _VAULT_DIR, _SESSION_FILE)
@@ -49,12 +63,26 @@ def _session_file_path(workdir: str) -> str:
 
 def _load_session_registry(workdir: str) -> dict:
     """Load session registry from .vault/claude-session.json. Returns {} if not found."""
+    try:
+        workdir = _validate_workdir(workdir)
+    except ValueError as e:
+        logger.warning("Workdir validation failed for load: %s", e)
+        return {}
     path = _session_file_path(workdir)
     if not os.path.isfile(path):
         return {}
+    # Verify no symlink tricks on the file itself
+    if os.path.islink(path):
+        logger.warning("Session file is a symlink, ignoring: %s", path)
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Sanity: top-level must be a dict of session entries
+        if not isinstance(data, dict):
+            logger.warning("Session file root is not a dict, ignoring: %s", path)
+            return {}
+        return data
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Failed to load session registry from %s: %s", path, e)
         return {}
@@ -62,12 +90,27 @@ def _load_session_registry(workdir: str) -> dict:
 
 def _save_session_registry(workdir: str, data: dict) -> None:
     """Save session registry to .vault/claude-session.json. Creates .vault/ if needed."""
+    try:
+        workdir = _validate_workdir(workdir)
+    except ValueError as e:
+        logger.warning("Workdir validation failed for save: %s", e)
+        return
     path = _session_file_path(workdir)
     vault_dir = os.path.dirname(path)
     try:
+        # Create vault dir if needed — check for existing symlink
+        if os.path.islink(vault_dir) and not os.path.isdir(vault_dir):
+            logger.warning(".vault is a dangling symlink, refusing: %s", vault_dir)
+            return
         os.makedirs(vault_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Write with restricted permissions (owner-only: 600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            os.close(fd)
+            raise
     except OSError as e:
         logger.warning("Failed to save session registry to %s: %s", path, e)
 
