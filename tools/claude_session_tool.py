@@ -948,11 +948,11 @@ def _handle_claude_session(args, **kw):
                         if k != session_name_arg and isinstance(v, dict)
                     }
                     if _peers:
-                        _top5 = sorted(
-                            _peers.items(),
-                            key=lambda x: x[1].get("last_active_at", ""),
-                            reverse=True,
-                        )[:5]
+                        # Partition: valid entries have last_active_at; rest go to end
+                        _valid = [(k, v) for k, v in _peers.items() if v.get("last_active_at")]
+                        _no_ts = [(k, v) for k, v in _peers.items() if not v.get("last_active_at")]
+                        _valid.sort(key=lambda x: x[1]["last_active_at"], reverse=True)
+                        _top5 = (_valid + _no_ts)[:5]
                         result["persistence_context"] = {
                             "total_peers": len(_peers),
                             "recent_sessions": {
