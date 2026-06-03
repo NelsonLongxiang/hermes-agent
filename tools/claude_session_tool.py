@@ -40,6 +40,48 @@ _sessions_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 _CLAUDE_DIR = ".claude"
 _SESSION_FILE = "claude-session.json"
+_GLOBAL_INDEX_FILE = os.path.expanduser("~/.hermes/claude-session-dirs.json")
+_global_index_lock = threading.Lock()
+
+
+def _register_workdir(workdir: str) -> None:
+    """Register a workdir in the global index for cross-session discovery."""
+    try:
+        with _global_index_lock:
+            dirs = set()
+            if os.path.isfile(_GLOBAL_INDEX_FILE):
+                try:
+                    with open(_GLOBAL_INDEX_FILE, "r") as f:
+                        dirs = set(json.load(f))
+                except Exception:
+                    pass
+            if workdir in dirs:
+                return
+            dirs.add(workdir)
+            os.makedirs(os.path.dirname(_GLOBAL_INDEX_FILE), exist_ok=True)
+            tmp = _GLOBAL_INDEX_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted(dirs), f)
+                f.write("\n")
+            os.replace(tmp, _GLOBAL_INDEX_FILE)
+            try:
+                os.chmod(_GLOBAL_INDEX_FILE, 0o600)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("Failed to register workdir %s: %s", workdir, e)
+
+
+def _get_known_workdirs() -> list:
+    """Return all workdirs that have ever hosted a persisted session."""
+    try:
+        if not os.path.isfile(_GLOBAL_INDEX_FILE):
+            return []
+        with _global_index_lock:
+            with open(_GLOBAL_INDEX_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        return []
 
 
 def _validate_workdir(workdir: str) -> str:
@@ -113,6 +155,8 @@ def _save_session_registry(workdir: str, data: dict) -> None:
             raise
     except OSError as e:
         logger.warning("Failed to save session registry to %s: %s", path, e)
+    else:
+        _register_workdir(workdir)
 
 
 def _persist_session(workdir: str, name: str, claude_uuid: str, **kwargs) -> None:
@@ -1007,6 +1051,24 @@ def _handle_claude_session(args, **kw):
             for s in result.get("sessions", []):
                 wd = s.get("workdir")
                 if wd and wd not in _scanned_workdirs:
+                    _scanned_workdirs.add(wd)
+                    try:
+                        _persisted = _load_session_registry(wd)
+                        for _name, _entry in _persisted.items():
+                            if (isinstance(_entry, dict)
+                                    and _name not in _active_names
+                                    and _entry.get("status") == "stopped"):
+                                _resumable[_name] = {
+                                    "workdir": wd,
+                                    "last_active_at": _entry.get("last_active_at"),
+                                    "resume_count": _entry.get("resume_count", 0),
+                                    "model": _entry.get("model"),
+                                }
+                    except Exception:
+                        pass
+            # Also scan globally known workdirs (for gateway restart scenario)
+            for wd in _get_known_workdirs():
+                if wd not in _scanned_workdirs:
                     _scanned_workdirs.add(wd)
                     try:
                         _persisted = _load_session_registry(wd)

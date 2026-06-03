@@ -263,12 +263,40 @@ class ClaudeSession:
                     result = detect_state(pane_lines)
                     if result.state == SessionState.IDLE:
                         logger.info("Reusing existing IDLE session %s", session_name)
-                    else:
-                        logger.warning("Session %s in %s state, rebuilding", session_name, result.state)
-                        self._tmux.kill_session()
-                        time.sleep(0.5)
-                        self._tmux.create_session(workdir=workdir)
+                    elif result.state == SessionState.EXITED:
+                        logger.info("Session %s EXITED (Claude gone), reinitializing", session_name)
                         needs_init = True
+                    else:
+                        # Wait for busy session to become IDLE before rebuilding
+                        _BUSY_WAIT_TIMEOUT = 30  # seconds
+                        _BUSY_WAIT_INTERVAL = 3
+                        logger.warning("Session %s in %s state, waiting up to %ds to settle",
+                                       session_name, result.state, _BUSY_WAIT_TIMEOUT)
+                        _waited = 0
+                        _settled = False
+                        while _waited < _BUSY_WAIT_TIMEOUT:
+                            time.sleep(_BUSY_WAIT_INTERVAL)
+                            _waited += _BUSY_WAIT_INTERVAL
+                            pane = self._tmux.capture_pane(lines=50)
+                            pane_lines = clean_lines(pane)
+                            check = detect_state(pane_lines)
+                            if check.state == SessionState.IDLE:
+                                logger.info("Session %s settled to IDLE after %ds", session_name, _waited)
+                                _settled = True
+                                break
+                            elif check.state == SessionState.EXITED:
+                                logger.info("Session %s EXITED while waiting", session_name)
+                                needs_init = True
+                                _settled = True
+                                break
+                        if not _settled:
+                            logger.warning("Session %s still %s after %ds, forcing rebuild",
+                                           session_name, result.state, _BUSY_WAIT_TIMEOUT)
+                        if not _settled or needs_init:
+                            self._tmux.kill_session()
+                            time.sleep(0.5)
+                            self._tmux.create_session(workdir=workdir)
+                            needs_init = True
 
             if needs_init:
                 current_uid = os.getuid()
