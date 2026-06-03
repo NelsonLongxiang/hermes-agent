@@ -73,13 +73,15 @@ def _register_workdir(workdir: str) -> None:
 
 
 def _get_known_workdirs() -> list:
-    """Return all workdirs that have ever hosted a persisted session."""
+    """Return all workdirs that have ever hosted a persisted session.
+    Filters out paths that no longer exist on disk."""
     try:
         if not os.path.isfile(_GLOBAL_INDEX_FILE):
             return []
         with _global_index_lock:
             with open(_GLOBAL_INDEX_FILE, "r") as f:
-                return json.load(f)
+                dirs = json.load(f)
+        return [d for d in dirs if os.path.isdir(d)]
     except Exception:
         return []
 
