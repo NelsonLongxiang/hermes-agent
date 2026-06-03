@@ -9,6 +9,7 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -333,6 +334,46 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+class _BotConcurrencyLimiter:
+    """Transparent proxy that wraps a Bot, applying a semaphore to all async API calls.
+
+    Prevents the httpx connection pool from being overwhelmed by unbounded
+    concurrent TG API calls.  Zero changes required at existing ``self._bot.*``
+    call sites — the proxy intercepts attribute access and wraps async
+    callables automatically.
+    """
+
+    __slots__ = ("_lim_wrapped", "_lim_semaphore", "_lim_cache")
+
+    def __init__(self, bot: Any, semaphore: asyncio.Semaphore) -> None:
+        object.__setattr__(self, "_lim_wrapped", bot)
+        object.__setattr__(self, "_lim_semaphore", semaphore)
+        object.__setattr__(self, "_lim_cache", {})
+
+    def __getattr__(self, name: str) -> Any:
+        cache = object.__getattribute__(self, "_lim_cache")
+        if name in cache:
+            return cache[name]
+        attr = getattr(object.__getattribute__(self, "_lim_wrapped"), name)
+        if callable(attr) and asyncio.iscoroutinefunction(attr):
+            sem = object.__getattribute__(self, "_lim_semaphore")
+
+            @functools.wraps(attr)
+            async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with sem:
+                    return await attr(*args, **kwargs)
+
+            cache[name] = _wrapper
+            return _wrapper
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_lim_wrapped"), name, value)
+
+    def __repr__(self) -> str:
+        return f"_BotConcurrencyLimiter({object.__getattribute__(self, '_lim_wrapped')!r})"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -456,6 +497,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
+        # Concurrency limiter for outgoing TG API calls — prevents the httpx
+        # connection pool from being overwhelmed by unbounded parallel sends.
+        _raw_conc = os.getenv("HERMES_TELEGRAM_API_CONCURRENCY", "").strip()
+        _conc = int(_raw_conc) if _raw_conc.isdigit() and int(_raw_conc) > 0 else 32
+        self._api_semaphore = asyncio.Semaphore(_conc)
+        # Pool health tracking — incremented on pool timeout, reset on success.
+        self._consecutive_pool_timeouts: int = 0
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -493,6 +541,41 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+
+    def _kill_zombie_gateway_processes(self) -> None:
+        """Kill leftover gateway processes that ``--replace`` missed.
+
+        Best-effort: scans for PIDs matching ``hermes gateway run`` and
+        sends SIGTERM to any that aren't us.  Prevents two instances
+        polling the same bot token simultaneously.
+        """
+        import signal as _signal
+        import subprocess as _subprocess
+
+        my_pid = os.getpid()
+        try:
+            result = _subprocess.run(
+                ["pgrep", "-f", "hermes gateway run"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    pid = int(line.strip())
+                except ValueError:
+                    continue
+                if pid != my_pid:
+                    logger.warning(
+                        "[%s] Killing zombie gateway process PID %d",
+                        self.name, pid,
+                    )
+                    try:
+                        os.kill(pid, _signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+        except Exception:
+            pass  # Best effort
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -943,6 +1026,64 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling request re-initialize failed (non-fatal)",
                 self.name, exc_info=True,
             )
+
+    async def _drain_request_connections(self) -> None:
+        """Reset the httpx connection pool used for general API requests.
+
+        Mirrors :meth:`_drain_polling_connections` but targets
+        ``Bot._request[1]`` (the general request pool used by
+        ``send_message``, ``edit_message_text``, etc.).  Triggered when
+        consecutive pool timeouts suggest the pool has accumulated stale
+        connections that ``is_closed()`` / ``has_expired()`` do not clean up.
+        """
+        if not (self._app and self._app.bot):
+            return
+        try:
+            # ``self._bot`` is a ``_BotConcurrencyLimiter`` proxy; reach
+            # through to the real bot for pool access.
+            real_bot = self._app.bot
+            req = real_bot._request[1]  # general request pool
+        except Exception:
+            return
+        try:
+            await req.shutdown()
+        except Exception:
+            logger.debug(
+                "[%s] Request pool shutdown failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+        try:
+            await req.initialize()
+            logger.info(
+                "[%s] Request pool drained and re-initialized after %d pool timeouts",
+                self.name, self._consecutive_pool_timeouts,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] Request pool re-initialize failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+
+    async def _pool_health_monitor(self) -> None:
+        """Background task that monitors TG request pool health.
+
+        Periodically checks ``_consecutive_pool_timeouts`` and triggers
+        :meth:`_drain_request_connections` when the count exceeds the
+        threshold, clearing stale httpcore connections that ``is_closed()``
+        and ``has_expired()`` fail to reclaim.
+        """
+        POOL_DRAIN_THRESHOLD = 5
+        CHECK_INTERVAL = 30
+
+        while not self.has_fatal_error:
+            await asyncio.sleep(CHECK_INTERVAL)
+            if self._consecutive_pool_timeouts >= POOL_DRAIN_THRESHOLD:
+                logger.warning(
+                    "[%s] Request pool saturated (%d consecutive pool timeouts), auto-draining",
+                    self.name, self._consecutive_pool_timeouts,
+                )
+                await self._drain_request_connections()
+                self._consecutive_pool_timeouts = 0
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
@@ -1517,6 +1658,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
+            # Kill any zombie gateway processes that --replace missed.
+            self._kill_zombie_gateway_processes()
+
             # Build the application
             builder = Application.builder().token(self.config.token)
             custom_base_url = self.config.extra.get("base_url")
@@ -1601,8 +1745,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
-            self._bot = self._app.bot
-            
+            self._bot = _BotConcurrencyLimiter(self._app.bot, self._api_semaphore)
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -1769,6 +1913,11 @@ class TelegramAdapter(BasePlatformAdapter):
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
+            # Start pool health monitor for auto-recovery from connection pool saturation.
+            health_task = asyncio.ensure_future(self._pool_health_monitor())
+            self._background_tasks.add(health_task)
+            health_task.add_done_callback(self._background_tasks.discard)
+
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
             # Failures here are non-fatal — the bot works fine without topics.
@@ -1791,6 +1940,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel background tasks (pool health monitor, reconnect probes, etc.)
+        await self.cancel_background_tasks()
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1978,6 +2130,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                             else:
                                 raise
+                        self._consecutive_pool_timeouts = 0
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
@@ -2064,6 +2217,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             raise
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
+                            if self._looks_like_pool_timeout(send_err):
+                                self._consecutive_pool_timeouts += 1
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
                                            self.name, _send_attempt + 1, wait, send_err)
                             await asyncio.sleep(wait)
