@@ -11,7 +11,7 @@ triggers:
   - "previous session"
   - "persisted session"
 version: 4.5
-code_commit: f30e117cc + observer-signal + pending-bump + adaptive-paste + stale-adapter-clean
+code_commit: see git history
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT
     prompt: "Stream stale timeout (秒，推荐 300)"
