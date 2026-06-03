@@ -9,6 +9,7 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -333,6 +334,46 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+class _BotConcurrencyLimiter:
+    """Transparent proxy that wraps a Bot, applying a semaphore to all async API calls.
+
+    Prevents the httpx connection pool from being overwhelmed by unbounded
+    concurrent TG API calls.  Zero changes required at existing ``self._bot.*``
+    call sites — the proxy intercepts attribute access and wraps async
+    callables automatically.
+    """
+
+    __slots__ = ("_lim_wrapped", "_lim_semaphore", "_lim_cache")
+
+    def __init__(self, bot: Any, semaphore: asyncio.Semaphore) -> None:
+        object.__setattr__(self, "_lim_wrapped", bot)
+        object.__setattr__(self, "_lim_semaphore", semaphore)
+        object.__setattr__(self, "_lim_cache", {})
+
+    def __getattr__(self, name: str) -> Any:
+        cache = object.__getattribute__(self, "_lim_cache")
+        if name in cache:
+            return cache[name]
+        attr = getattr(object.__getattribute__(self, "_lim_wrapped"), name)
+        if callable(attr) and asyncio.iscoroutinefunction(attr):
+            sem = object.__getattribute__(self, "_lim_semaphore")
+
+            @functools.wraps(attr)
+            async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with sem:
+                    return await attr(*args, **kwargs)
+
+            cache[name] = _wrapper
+            return _wrapper
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_lim_wrapped"), name, value)
+
+    def __repr__(self) -> str:
+        return f"_BotConcurrencyLimiter({object.__getattribute__(self, '_lim_wrapped')!r})"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -456,6 +497,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
+        # Concurrency limiter for outgoing TG API calls — prevents the httpx
+        # connection pool from being overwhelmed by unbounded parallel sends.
+        _raw_conc = os.getenv("HERMES_TELEGRAM_API_CONCURRENCY", "").strip()
+        _conc = int(_raw_conc) if _raw_conc.isdigit() and int(_raw_conc) > 0 else 32
+        self._api_semaphore = asyncio.Semaphore(_conc)
+        # Pool health tracking — incremented on pool timeout, reset on success.
+        self._consecutive_pool_timeouts: int = 0
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -493,6 +541,50 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+
+    def _kill_zombie_gateway_processes(self) -> None:
+        """Kill leftover gateway processes that ``--replace`` missed.
+
+        Best-effort: scans for PIDs matching ``hermes gateway run`` and
+        sends SIGTERM to any that aren't us.  Prevents two instances
+        polling the same bot token simultaneously.
+        """
+        import signal as _signal
+        import subprocess as _subprocess
+
+        _MUST_CONTAIN = ("hermes", "gateway", "run")
+        my_pid = os.getpid()
+        try:
+            result = _subprocess.run(
+                ["pgrep", "-f", "hermes"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    pid = int(line.strip())
+                except ValueError:
+                    continue
+                if pid == my_pid:
+                    continue
+                # Verify cmdline contains all required tokens to avoid false positives.
+                try:
+                    cmdline = _Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                if not all(tok in cmdline for tok in _MUST_CONTAIN):
+                    continue
+                logger.warning(
+                    "[%s] Killing zombie gateway process PID %d",
+                    self.name, pid,
+                )
+                try:
+                    os.kill(pid, _signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        except Exception:
+            pass  # Best effort
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -943,6 +1035,82 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling request re-initialize failed (non-fatal)",
                 self.name, exc_info=True,
             )
+
+    async def _drain_request_connections(self) -> None:
+        """Reset the httpx connection pool used for general API requests.
+
+        Mirrors :meth:`_drain_polling_connections` but targets the
+        general request pool (used by ``send_message``,
+        ``edit_message_text``, etc.).  Triggered when consecutive pool
+        timeouts suggest the pool has accumulated stale connections that
+        ``is_closed()`` / ``has_expired()`` do not clean up.
+        """
+        if not (self._app and self._app.bot):
+            return
+        try:
+            # ``self._bot`` is a ``_BotConcurrencyLimiter`` proxy; reach
+            # through to the real bot for pool access.
+            real_bot = self._app.bot
+            req = self._get_request_pool(real_bot)
+            if req is None:
+                return
+        except Exception:
+            return
+        try:
+            await req.shutdown()
+        except Exception:
+            logger.debug(
+                "[%s] Request pool shutdown failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+        try:
+            await req.initialize()
+            logger.info(
+                "[%s] Request pool drained and re-initialized after %d pool timeouts",
+                self.name, self._consecutive_pool_timeouts,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] Request pool re-initialize failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+
+    @staticmethod
+    def _get_request_pool(bot: Any) -> Any:
+        """Extract the httpx request pool from a python-telegram-bot Bot.
+
+        Handles different PTB versions gracefully — returns None if the
+        internal structure doesn't match expectations rather than crashing.
+        """
+        # PTB < 21: Bot.request is a BaseRequest subclass with .shutdown()/.initialize()
+        if hasattr(bot, "request") and hasattr(bot.request, "shutdown"):
+            return bot.request
+        # PTB >= 21: Bot._request is a tuple (request_conreator, pool)
+        req = getattr(bot, "_request", None)
+        if isinstance(req, tuple) and len(req) >= 2:
+            return req[1]
+        return None
+
+    async def _pool_health_monitor(self) -> None:
+        """Background task that monitors TG request pool health.
+
+        Periodically checks ``_consecutive_pool_timeouts`` and triggers
+        :meth:`_drain_request_connections` when the count exceeds the
+        threshold, clearing stale httpcore connections that ``is_closed()``
+        and ``has_expired()`` fail to reclaim.
+        """
+        POOL_DRAIN_THRESHOLD = 5
+        CHECK_INTERVAL = 30
+
+        while not self.has_fatal_error:
+            await asyncio.sleep(CHECK_INTERVAL)
+            if self._consecutive_pool_timeouts >= POOL_DRAIN_THRESHOLD:
+                logger.warning(
+                    "[%s] Request pool saturated (%d consecutive pool timeouts), auto-draining",
+                    self.name, self._consecutive_pool_timeouts,
+                )
+                await self._drain_request_connections()
+                self._consecutive_pool_timeouts = 0
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
@@ -1517,6 +1685,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
+            # Kill any zombie gateway processes that --replace missed.
+            self._kill_zombie_gateway_processes()
+
             # Build the application
             builder = Application.builder().token(self.config.token)
             custom_base_url = self.config.extra.get("base_url")
@@ -1601,8 +1772,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
-            self._bot = self._app.bot
-            
+            self._bot = _BotConcurrencyLimiter(self._app.bot, self._api_semaphore)
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -1769,6 +1940,11 @@ class TelegramAdapter(BasePlatformAdapter):
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
+            # Start pool health monitor for auto-recovery from connection pool saturation.
+            health_task = asyncio.ensure_future(self._pool_health_monitor())
+            self._background_tasks.add(health_task)
+            health_task.add_done_callback(self._background_tasks.discard)
+
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
             # Failures here are non-fatal — the bot works fine without topics.
@@ -1791,6 +1967,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel background tasks (pool health monitor, reconnect probes, etc.)
+        await self.cancel_background_tasks()
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1978,6 +2157,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                             else:
                                 raise
+                        self._consecutive_pool_timeouts = 0
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
@@ -2064,6 +2244,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             raise
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
+                            if self._looks_like_pool_timeout(send_err):
+                                self._consecutive_pool_timeouts += 1
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
                                            self.name, _send_attempt + 1, wait, send_err)
                             await asyncio.sleep(wait)
@@ -2680,55 +2862,31 @@ class TelegramAdapter(BasePlatformAdapter):
         text = content if len(content) <= self.MAX_MESSAGE_LENGTH else \
             self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]
 
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "draft_id": int(draft_id),
+            "text": text,
+        }
         thread_id = self._metadata_thread_id(metadata)
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
 
-        # Apply the same MarkdownV2 conversion the regular ``send`` path uses
-        # so the animated draft preview renders with identical formatting to
-        # the final message.  Without this, the draft streams as raw text and
-        # the final ``sendMessage`` (which DOES use MarkdownV2) snaps into
-        # formatted output, producing a jarring visual shift at the end of the
-        # response.  We try MarkdownV2 first and fall back to plain text if a
-        # malformed escape would be rejected — mirroring the (True, False)
-        # retry the streaming send loop uses — so a single bad token never
-        # kills draft streaming for the whole response.
-        for use_markdown in (True, False):
-            kwargs: Dict[str, Any] = {
-                "chat_id": int(chat_id),
-                "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text,
-            }
-            if use_markdown:
-                kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-
-            try:
-                ok = await self._bot.send_message_draft(**kwargs)
-                if ok:
-                    # Drafts have no message_id; we report success without one
-                    # so the caller knows the animation frame landed.
-                    return SendResult(success=True, message_id=None)
-                return SendResult(success=False, error="draft_rejected")
-            except Exception as e:
-                # A MarkdownV2 parse failure (BadRequest "can't parse entities")
-                # is recoverable: retry once as plain text.  Any other failure
-                # (chat doesn't allow drafts, transient hiccup) — or a failure
-                # on the plain-text attempt — propagates to the caller, which
-                # treats it as "fall back to edit-based for this response".
-                if use_markdown and self._is_bad_request_error(e):
-                    logger.debug(
-                        "[%s] sendMessageDraft MarkdownV2 rejected, retrying "
-                        "as plain text (chat=%s draft_id=%s): %s",
-                        self.name, chat_id, draft_id, e,
-                    )
-                    continue
-                logger.debug(
-                    "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
-                    self.name, chat_id, draft_id, e,
-                )
-                return SendResult(success=False, error=str(e))
-
-        return SendResult(success=False, error="draft_rejected")
+        try:
+            ok = await self._bot.send_message_draft(**kwargs)
+            if ok:
+                # Drafts have no message_id; we report success without one
+                # so the caller knows the animation frame landed.
+                return SendResult(success=True, message_id=None)
+            return SendResult(success=False, error="draft_rejected")
+        except Exception as e:
+            # Most likely: BadRequest because this bot/chat doesn't allow
+            # drafts, or a transient server hiccup.  The caller treats any
+            # failure as "fall back to edit-based for this response".
+            logger.debug(
+                "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
+                self.name, chat_id, draft_id, e,
+            )
+            return SendResult(success=False, error=str(e))
 
     async def _send_message_with_thread_fallback(self, **kwargs):
         """Send a Telegram message, retrying once without message_thread_id
@@ -5101,109 +5259,13 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=channel_prompt,
         )
 
-    def _media_message_type(self, msg: Message) -> MessageType:
-        """Classify a Telegram media message into a MessageType."""
-        if msg.sticker:
-            return MessageType.STICKER
-        if msg.photo:
-            return MessageType.PHOTO
-        if msg.video:
-            return MessageType.VIDEO
-        if msg.audio:
-            return MessageType.AUDIO
-        if msg.voice:
-            return MessageType.VOICE
-        return MessageType.DOCUMENT
-
-    async def _cache_observed_media(self, msg: Message, event: MessageEvent) -> None:
-        """Cache an unmentioned group attachment and annotate the observed text.
-
-        Passive group traffic, so downloads are bounded by the same
-        ``_max_doc_bytes`` limit as the addressed document path. Oversized or
-        unsupported attachments are noted in the transcript without downloading.
-        """
-        from gateway.platforms.base import cache_media_bytes
-
-        source, filename, mime, kind = self._observed_media_source(msg)
-        if source is None:
-            return
-
-        max_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
-        file_size = getattr(source, "file_size", None)
-        try:
-            size = int(file_size or 0)
-        except (TypeError, ValueError):
-            size = 0
-        if not (0 < size <= max_bytes):
-            limit_mb = max_bytes // (1024 * 1024)
-            event.text = self._append_observed_note(
-                event.text,
-                f"[Observed Telegram attachment too large or unverifiable. Maximum: {limit_mb} MB.]",
-            )
-            logger.info("[Telegram] Observed group attachment skipped (size=%s)", file_size)
-            return
-
-        try:
-            file_obj = await source.get_file()
-            data = bytes(await file_obj.download_as_bytearray())
-            if not filename:
-                filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
-            cached = cache_media_bytes(data, filename=filename, mime_type=mime, default_kind=kind)
-        except Exception as exc:
-            logger.warning("[Telegram] Failed to cache observed group media: %s", exc, exc_info=True)
-            return
-
-        if cached is None:
-            event.text = self._append_observed_note(
-                event.text, "[Observed Telegram attachment: unsupported type, not cached.]"
-            )
-            return
-
-        event.media_urls = [cached.path]
-        event.media_types = [cached.media_type]
-        if cached.kind == "image":
-            event.message_type = MessageType.PHOTO
-        elif cached.kind == "video":
-            event.message_type = MessageType.VIDEO
-        event.text = self._append_observed_note(event.text, cached.context_note())
-        logger.info("[Telegram] Cached observed group %s at %s", cached.kind, cached.path)
-
-    def _observed_media_source(self, msg: Message):
-        """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
-        if msg.photo:
-            return msg.photo[-1], "", "", "image"
-        if msg.video:
-            return msg.video, "", "video/mp4", "video"
-        if msg.voice:
-            return msg.voice, "voice.ogg", "audio/ogg", "audio"
-        if msg.audio:
-            return msg.audio, getattr(msg.audio, "file_name", "") or "", "", "audio"
-        if msg.document:
-            doc = msg.document
-            return doc, doc.file_name or "", (doc.mime_type or "").lower(), None
-        return None, "", "", None
-
-    @staticmethod
-    def _append_observed_note(existing: Optional[str], note: str) -> str:
-        if not note:
-            return existing or ""
-        if not existing:
-            return note
-        return f"{existing}\n\n{note}"
-
-    def _observe_unmentioned_group_message(
-        self,
-        message: Message,
-        msg_type: MessageType,
-        update_id: Optional[int] = None,
-        event: Optional[MessageEvent] = None,
-    ) -> None:
+    def _observe_unmentioned_group_message(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> None:
         """Append skipped group chatter to the target session without dispatching."""
         store = getattr(self, "_session_store", None)
         if not store:
             return
         try:
-            event = event or self._build_message_event(message, msg_type, update_id=update_id)
+            event = self._build_message_event(message, msg_type, update_id=update_id)
             shared_source = self._telegram_group_observe_shared_source(event.source)
             session_entry = store.get_or_create_session(shared_source)
             entry = {
@@ -5564,20 +5626,39 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
                 _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
-                if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
-                await self._cache_observed_media(_m, _event)
-                self._observe_unmentioned_group_message(
-                    _m, _event.message_type, update_id=update.update_id, event=_event
-                )
+                if _m.sticker:
+                    _observe_type = MessageType.STICKER
+                elif _m.photo:
+                    _observe_type = MessageType.PHOTO
+                elif _m.video:
+                    _observe_type = MessageType.VIDEO
+                elif _m.audio:
+                    _observe_type = MessageType.AUDIO
+                elif _m.voice:
+                    _observe_type = MessageType.VOICE
+                else:
+                    _observe_type = MessageType.DOCUMENT
+                self._observe_unmentioned_group_message(_m, _observe_type, update_id=update.update_id)
             return
 
         msg = update.message
-
-        msg_type = self._media_message_type(msg)
-
+        
+        # Determine media type
+        if msg.sticker:
+            msg_type = MessageType.STICKER
+        elif msg.photo:
+            msg_type = MessageType.PHOTO
+        elif msg.video:
+            msg_type = MessageType.VIDEO
+        elif msg.audio:
+            msg_type = MessageType.AUDIO
+        elif msg.voice:
+            msg_type = MessageType.VOICE
+        elif msg.document:
+            msg_type = MessageType.DOCUMENT
+        else:
+            msg_type = MessageType.DOCUMENT
+        
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
         
         # Add caption as text
