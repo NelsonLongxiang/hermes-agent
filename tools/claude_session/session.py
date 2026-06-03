@@ -292,7 +292,6 @@ class ClaudeSession:
                         if not _settled:
                             logger.warning("Session %s still %s after %ds, forcing rebuild",
                                            session_name, result.state, _BUSY_WAIT_TIMEOUT)
-                        if not _settled or needs_init:
                             self._tmux.kill_session()
                             time.sleep(0.5)
                             self._tmux.create_session(workdir=workdir)

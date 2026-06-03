@@ -1047,7 +1047,8 @@ def _handle_claude_session(args, **kw):
             _active_names = {s.get("name") for s in result.get("sessions", []) if s.get("name")}
             _resumable = {}
             _scanned_workdirs = set()
-            # Scan workdirs of active sessions first
+            # Collect all stopped sessions with (name, workdir) pairs first
+            _raw_entries = []
             for s in result.get("sessions", []):
                 wd = s.get("workdir")
                 if wd and wd not in _scanned_workdirs:
@@ -1058,12 +1059,7 @@ def _handle_claude_session(args, **kw):
                             if (isinstance(_entry, dict)
                                     and _name not in _active_names
                                     and _entry.get("status") == "stopped"):
-                                _resumable[_name] = {
-                                    "workdir": wd,
-                                    "last_active_at": _entry.get("last_active_at"),
-                                    "resume_count": _entry.get("resume_count", 0),
-                                    "model": _entry.get("model"),
-                                }
+                                _raw_entries.append((_name, wd, _entry))
                     except Exception:
                         pass
             # Also scan globally known workdirs (for gateway restart scenario)
@@ -1076,14 +1072,22 @@ def _handle_claude_session(args, **kw):
                             if (isinstance(_entry, dict)
                                     and _name not in _active_names
                                     and _entry.get("status") == "stopped"):
-                                _resumable[_name] = {
-                                    "workdir": wd,
-                                    "last_active_at": _entry.get("last_active_at"),
-                                    "resume_count": _entry.get("resume_count", 0),
-                                    "model": _entry.get("model"),
-                                }
+                                _raw_entries.append((_name, wd, _entry))
                     except Exception:
                         pass
+            # Build deduped dict — use @basename suffix for same-name collisions
+            _name_counts = {}
+            for _name, _wd, _ in _raw_entries:
+                _name_counts[_name] = _name_counts.get(_name, 0) + 1
+            for _name, _wd, _entry in _raw_entries:
+                _key = _name if _name_counts[_name] == 1 else f"{_name}@{os.path.basename(_wd)}"
+                _resumable[_key] = {
+                    "name": _name,
+                    "workdir": _wd,
+                    "last_active_at": _entry.get("last_active_at"),
+                    "resume_count": _entry.get("resume_count", 0),
+                    "model": _entry.get("model"),
+                }
             if _resumable:
                 # Partition: valid entries have last_active_at; rest go to end
                 _valid_r = [(k, v) for k, v in _resumable.items() if v.get("last_active_at")]
