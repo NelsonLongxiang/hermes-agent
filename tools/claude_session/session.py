@@ -300,7 +300,7 @@ class ClaudeSession:
             if needs_init:
                 current_uid = os.getuid()
                 if current_uid == 0:
-                    non_root_user = os.environ.get("SUDO_USER") or "longxiang"
+                    non_root_user = os.environ.get("SUDO_USER") or os.environ.get("USER", "user")
                     self._tmux.send_keys(f"su - {shlex.quote(non_root_user)}", enter=True)
                     time.sleep(1.5)
                     self._tmux.send_keys(f"cd {shlex.quote(workdir)}", enter=True)

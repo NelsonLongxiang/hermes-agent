@@ -10,7 +10,7 @@ triggers:
   - "resume session"
   - "previous session"
   - "persisted session"
-version: 4.3
+version: 4.5
 code_commit: f30e117cc + observer-signal + pending-bump + adaptive-paste + stale-adapter-clean
 required_environment_variables:
   - name: HERMES_STREAM_STALE_TIMEOUT

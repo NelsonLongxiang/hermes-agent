@@ -149,12 +149,8 @@ def _save_session_registry(workdir: str, data: dict) -> None:
         os.makedirs(claude_dir, exist_ok=True)
         # Write with restricted permissions (owner-only: 600)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            os.close(fd)
-            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError as e:
         logger.warning("Failed to save session registry to %s: %s", path, e)
     else:
