@@ -502,7 +502,7 @@ class TelegramAdapter(BasePlatformAdapter):
         _raw_conc = os.getenv("HERMES_TELEGRAM_API_CONCURRENCY", "").strip()
         _conc = int(_raw_conc) if _raw_conc.isdigit() and int(_raw_conc) > 0 else 32
         self._api_semaphore = asyncio.Semaphore(_conc)
-        # Pool health tracking — incremented on pool timeout, reset on success.
+        # Pool health tracking — incremented on any send failure, reset on success.
         self._consecutive_pool_timeouts: int = 0
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
@@ -2218,6 +2218,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
                             if self._looks_like_pool_timeout(send_err):
+                                self._consecutive_pool_timeouts += 1
+                            elif isinstance(send_err, _NetErr):
+                                # Track all network-level send failures (generic
+                                # timeout, connection reset, etc.) so the health
+                                # monitor can trigger a pool drain even when the
+                                # pool itself isn't the bottleneck.
                                 self._consecutive_pool_timeouts += 1
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
                                            self.name, _send_attempt + 1, wait, send_err)
