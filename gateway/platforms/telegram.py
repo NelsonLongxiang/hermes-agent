@@ -504,6 +504,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._api_semaphore = asyncio.Semaphore(_conc)
         # Pool health tracking — incremented on any send failure, reset on success.
         self._consecutive_pool_timeouts: int = 0
+        self._last_pool_drain_time: float = 0.0  # monotonic; cooldown guard
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -1071,19 +1072,36 @@ class TelegramAdapter(BasePlatformAdapter):
         :meth:`_drain_request_connections` when the count exceeds the
         threshold, clearing stale httpcore connections that ``is_closed()``
         and ``has_expired()`` fail to reclaim.
+
+        The counter is reset *before* the drain so that failures caused
+        by the drain itself (``ClosedResourceError`` / ``not initialized``)
+        don't immediately re-trigger a second drain.  A minimum cooldown
+        of 120 s between drains prevents the drain cycle from becoming a
+        self-sustaining failure loop.
         """
+        import time as _time
+
         POOL_DRAIN_THRESHOLD = 5
         CHECK_INTERVAL = 30
+        DRAIN_COOLDOWN = 120  # seconds between drains
 
         while not self.has_fatal_error:
             await asyncio.sleep(CHECK_INTERVAL)
-            if self._consecutive_pool_timeouts >= POOL_DRAIN_THRESHOLD:
-                logger.warning(
-                    "[%s] Request pool saturated (%d consecutive pool timeouts), auto-draining",
-                    self.name, self._consecutive_pool_timeouts,
-                )
-                await self._drain_request_connections()
-                self._consecutive_pool_timeouts = 0
+            if self._consecutive_pool_timeouts < POOL_DRAIN_THRESHOLD:
+                continue
+            now = _time.monotonic()
+            if now - self._last_pool_drain_time < DRAIN_COOLDOWN:
+                continue
+            count = self._consecutive_pool_timeouts
+            # Reset BEFORE draining so drain-induced failures don't
+            # immediately re-trigger.
+            self._consecutive_pool_timeouts = 0
+            self._last_pool_drain_time = now
+            logger.warning(
+                "[%s] Request pool saturated (%d consecutive send failures), auto-draining",
+                self.name, count,
+            )
+            await self._drain_request_connections()
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
