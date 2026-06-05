@@ -1782,10 +1782,16 @@ class FeishuAdapter(BasePlatformAdapter):
                     attempt + 1, self._WS_RECONNECT_MAX_ATTEMPTS, delay,
                 )
                 await asyncio.sleep(delay)
+            # Re-check after sleep — disconnect may have started while we waited.
+            if not self._running or self.has_fatal_error:
+                return
             try:
-                # Clean up the dead WS thread state (do NOT disable auto_reconnect)
+                # Clean up the dead WS thread state (do NOT call
+                # _disable_websocket_auto_reconnect — that would prevent
+                # the new SDK client from reconnecting on its own).
                 self._ws_future = None
                 self._ws_thread_loop = None
+                self._ws_client = None  # release old client references
                 # Create a fresh WS client and start a new thread
                 await self._connect_websocket()
                 logger.info("[Feishu] WS reconnection succeeded on attempt %d", attempt + 1)
