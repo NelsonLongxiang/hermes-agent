@@ -221,7 +221,7 @@ def _load_persisted_sessions(workdir: str) -> dict:
     """Load all persisted sessions for a workdir. Returns the full registry dict."""
     return _load_session_registry(workdir)
 
-# Per-gateway-session status observers — bridges session status to Telegram.
+# Per-gateway-session status observers — bridges session status to chat platforms.
 # Keyed by gateway_session_key so concurrent sessions route to the correct chat.
 from typing import Callable
 _status_observers: dict[str, Callable[[str, dict], None]] = {}  # gw_key → callback(session_id, info)
@@ -236,7 +236,7 @@ def register_status_observer(callback, gateway_session_key: str = ""):
     """Register a status observer for a specific gateway session.
 
     Called by gateway/run.py to bridge ClaudeSession status updates
-    to Telegram status messages. The callback receives (session_id, status_info).
+    to platform status messages. The callback receives (session_id, status_info).
 
     Uses per-gateway-session-key isolation so concurrent sessions (e.g. a DM
     and a group chat running in parallel) each route status updates to the
@@ -301,7 +301,7 @@ def unregister_gateway_adapter(gateway_session_key: str = ""):
 def _get_gateway_session_key() -> str:
     """读取当前 gateway session_key（并发安全）。
 
-    优先从 contextvars 读取（gateway 模式，每个 Telegram 群聊独立），
+    优先从 contextvars 读取（gateway 模式，每个聊天群独立），
     回退到 os.environ（CLI/cron 模式），都为空则返回空串（无隔离）。
     """
     if get_session_env is not None:
@@ -340,7 +340,7 @@ def _safe_call_observer(observer: Callable[[str, dict], None], session_id: str, 
 def _derive_session_name(workdir: str, gateway_session_key: str = "", name: Optional[str] = None) -> str:
     """基于 workdir + gateway session_key 生成确定性 tmux session 名。
 
-    gateway 模式下，同一 workdir 的不同 Telegram 群聊会得到不同的 tmux 名。
+    gateway 模式下，同一 workdir 的不同聊天群会得到不同的 tmux 名。
     CLI/cron 模式下（gateway_session_key 为空），退化为纯 workdir 哈希。
     格式：hermes-{sha256前8位}
 
@@ -400,7 +400,7 @@ def _get_session(session_id: str = None, gateway_session_key: str = "", strict: 
 
     Args:
         session_id: 目标会话 ID。None 时按 gateway_session_key 过滤后返回最近的会话。
-        gateway_session_key: 当前 gateway session key，用于隔离不同 Telegram 群聊。
+        gateway_session_key: 当前 gateway session key，用于隔离不同聊天群。
         strict: 为 True 时，指定了 session_id 但找不到则返回 None（不回退），
                 用于 stop/操作类 action 防止操作错误会话。
     """
@@ -959,7 +959,7 @@ def _handle_claude_session(args, **kw):
                     )
                 # Attach status observer for this gateway session (per-key isolation).
                 # Only set the bridge callback if StatusCard hasn't already set one.
-                # StatusCard's _status_callback sends real-time Telegram updates;
+                # StatusCard's _status_callback sends real-time status updates;
                 # the bridge callback routes to gateway's StatusMessageManager (now removed).
                 # Co-existence: if both exist, chain them.
 
