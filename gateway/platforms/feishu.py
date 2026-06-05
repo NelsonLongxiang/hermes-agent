@@ -1790,6 +1790,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # Clean up the dead WS thread state (do NOT disable auto_reconnect)
                 self._ws_future = None
                 self._ws_thread_loop = None
+                self._ws_client = None  # release old client references
                 # Create a fresh WS client and start a new thread
                 await self._connect_websocket()
                 logger.info("[Feishu] WS reconnection succeeded on attempt %d", attempt + 1)

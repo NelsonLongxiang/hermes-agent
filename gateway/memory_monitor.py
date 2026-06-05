@@ -91,6 +91,36 @@ def _get_rss_mb() -> Optional[int]:
         return None
 
 
+def _get_current_rss_mb() -> Optional[int]:
+    """Return the *current* RSS in MB (not the high-water mark).
+
+    Used for limit enforcement where accuracy matters — ``ru_maxrss``
+    never decreases within a process lifetime, so it would trigger
+    false-positive kills after a transient spike.
+    """
+    # On Linux, /proc/self/status has VmRSS which is the actual current RSS.
+    if sys.platform == "linux":
+        try:
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # "VmRSS:    123456 kB"
+                        kb = int(line.split()[1])
+                        return int(kb / 1024)
+        except Exception:
+            pass
+    # Fallback: psutil gives current RSS on all platforms.
+    try:
+        import psutil  # type: ignore
+
+        rss = psutil.Process(os.getpid()).memory_info().rss
+        return int(rss / _BYTES_TO_MB)
+    except Exception:
+        pass
+    # Last resort: ru_maxrss (high-water mark, less accurate for limits).
+    return _get_rss_mb()
+
+
 def log_memory_usage(prefix: str = "") -> None:
     """Log current memory usage in a grep-friendly ``[MEMORY] ...`` line.
 
@@ -144,7 +174,7 @@ def _check_rss_limits() -> None:
     hard limit calls ``os._exit(137)`` (mimics OOM-kill so service managers
     treat it as a crash and restart the gateway).
     """
-    rss = _get_rss_mb()
+    rss = _get_current_rss_mb()
     if rss is None:
         return
     if _RSS_SOFT_LIMIT_MB and rss > _RSS_SOFT_LIMIT_MB:
