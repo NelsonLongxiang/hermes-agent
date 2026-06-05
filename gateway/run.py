@@ -289,13 +289,13 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to high-noise chats.
 
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
+    Chat platforms (Telegram, Feishu, etc.) should receive concise, safe provider
     failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    pf = _gateway_platform_value(platform)
+    if pf not in ("telegram", "feishu"):
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -309,7 +309,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    pf = _gateway_platform_value(platform)
+    if pf not in ("telegram", "feishu"):
         return text
 
     text = _redact_gateway_user_facing_secrets(text)

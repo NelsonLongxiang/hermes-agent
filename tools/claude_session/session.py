@@ -126,7 +126,7 @@ class ClaudeSession:
         # like Bash/Read/Write which complete in 1-10s; 180s would miss them entirely)
         self._observer_poll_interval: float = float(os.environ.get("HERMES_CLAUDE_SESSION_OBSERVER_POLL_INTERVAL", "5"))
 
-        # Status card (optional Telegram real-time status)
+        # Status card (optional real-time status)
         self._status_card: Optional[StatusCard] = None
 
         # Output streamer (optional real-time output to chat)
@@ -1206,10 +1206,10 @@ class ClaudeSession:
                 logger.warning("Status callback error: %s", e)
 
     def _start_status_card(self, config: dict) -> None:
-        """Create and start a StatusCard for Telegram real-time status.
+        """Create and start a StatusCard for real-time session status.
 
         config keys:
-            chat_id (str): Telegram chat ID
+            chat_id (str): Platform chat ID
             loop: asyncio event loop from Gateway
             send_func: async callable(chat_id, content) -> SendResult
             edit_func: async callable(chat_id, message_id, content) -> SendResult
@@ -1250,7 +1250,7 @@ class ClaudeSession:
             )
             self._status_card.start()
 
-            # Wire observer updates to StatusCard for real-time Telegram updates
+            # Wire observer updates to StatusCard for real-time status updates
             def _observer_to_status_card(info: dict) -> None:
                 if self._status_card:
                     self._status_card.update_from_observer(info)

@@ -1,6 +1,6 @@
 """status_card.py — Real-time Claude session status card via Gateway adapter.
 
-Monitors the session JSONL file and continuously updates a Telegram message
+Monitors the session JSONL file and continuously updates a status message
 with the latest session state. Runs in a background thread, non-blocking.
 Uses Gateway adapter callbacks for sending — no independent Bot instance needed.
 
@@ -176,7 +176,7 @@ def _build_header(session_name: str, session_id: str, tmux_session: str = "") ->
 
 def format_status_card(state: dict, observer_state: dict = None, max_length: int = 500,
                        session_name: str = "", session_id: str = "", tmux_session: str = "") -> str:
-    """Format session state as a compact Telegram status card."""
+    """Format session state as a compact status card."""
     real_time = observer_state or {}
     # When observer reports a live state, prefer it over stale JSONL status.
     # This prevents "Starting session..." from sticking when the JSONL file
@@ -328,7 +328,7 @@ def _format_tool_detail(tool: str, tool_input: dict) -> str:
 # ------------------------------------------------------------------
 
 class StatusCard:
-    """Manages a persistent Telegram status message via Gateway adapter.
+    """Manages a persistent status message via Gateway adapter.
 
     Uses async callbacks (send/edit/delete) from the Gateway's platform
     adapter instead of creating its own Bot instance. This ensures the
@@ -481,7 +481,7 @@ class StatusCard:
                             if do_bump and self._message_id:
                                 await self._bump_message(card_text)
                             else:
-                                success = await self._edit_telegram(card_text)
+                                success = await self._edit_status(card_text)
                                 if not success:
                                     await self._send_new_message(card_text)
                         except Exception as e:
@@ -629,7 +629,7 @@ class StatusCard:
                                 self._clear_pending_bump()
                             else:
                                 future = asyncio.run_coroutine_threadsafe(
-                                    self._edit_telegram(card_text), self._loop
+                                    self._edit_status(card_text), self._loop
                                 )
                                 success = future.result(timeout=10.0)
                                 if success:
@@ -681,7 +681,7 @@ class StatusCard:
 
             self._stop_event.wait(timeout=self._poll_interval)
 
-    async def _edit_telegram(self, text: str) -> bool:
+    async def _edit_status(self, text: str) -> bool:
         """Edit the status message via Gateway adapter. Returns True on success."""
         if not self._message_id:
             return False

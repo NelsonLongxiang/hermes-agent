@@ -42,7 +42,7 @@ class SessionObserver:
 
     Non-blocking, non-essential. Use for:
     - Progress monitoring / logging
-    - Status callbacks to external systems (e.g. Telegram)
+    - Status callbacks to external systems (e.g. chat platforms)
     - Stalled-session detection
 
     Polling is adaptive: interval adjusts based on detected session state.

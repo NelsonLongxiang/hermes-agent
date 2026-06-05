@@ -871,7 +871,7 @@ def _handle_claude_session(args, **kw):
                         "StatusCard config: platform=%s chat_id=%s gw_key=%s adapters=%s",
                         _sc_platform, _sc_chat_id, gw_key, list(_gateway_adapters.keys()),
                     )
-                    if _sc_platform == "telegram" and _sc_chat_id:
+                    if _sc_chat_id:
                         # Read adapter from gateway registry (set by gateway/run.py)
                         with _gateway_adapters_lock:
                             _adapter_info = _gateway_adapters.get(gw_key)
