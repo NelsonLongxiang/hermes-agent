@@ -1752,6 +1752,51 @@ class FeishuAdapter(BasePlatformAdapter):
         finally:
             self._ws_client = None
 
+    _WS_RECONNECT_MAX_ATTEMPTS = 5
+    _WS_RECONNECT_BASE_DELAY = 2.0  # seconds, exponential backoff
+
+    def _trigger_ws_reconnect(self) -> None:
+        """Schedule a WS reconnection coroutine on the adapter's event loop.
+
+        Called via ``loop.call_soon_threadsafe`` from the done callback of
+        ``_ws_future`` when the WS thread exits unexpectedly.
+        """
+        if not self._running or self.has_fatal_error:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        task = loop.create_task(self._ws_reconnect_loop())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _ws_reconnect_loop(self) -> None:
+        """Attempt to reconnect the Feishu WebSocket with backoff."""
+        for attempt in range(self._WS_RECONNECT_MAX_ATTEMPTS):
+            if not self._running or self.has_fatal_error:
+                return
+            delay = self._WS_RECONNECT_BASE_DELAY * (2 ** attempt)
+            if attempt > 0:
+                logger.info(
+                    "[Feishu] WS reconnect attempt %d/%d in %.0fs",
+                    attempt + 1, self._WS_RECONNECT_MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                # Clean up the dead WS thread state (do NOT disable auto_reconnect)
+                self._ws_future = None
+                self._ws_thread_loop = None
+                # Create a fresh WS client and start a new thread
+                await self._connect_websocket()
+                logger.info("[Feishu] WS reconnection succeeded on attempt %d", attempt + 1)
+                return
+            except Exception as exc:
+                logger.warning("[Feishu] WS reconnect attempt %d failed: %s", attempt + 1, exc)
+        logger.error(
+            "[Feishu] WS reconnection exhausted %d attempts — Feishu is offline until gateway restart",
+            self._WS_RECONNECT_MAX_ATTEMPTS,
+        )
+
     async def _stop_webhook_server(self) -> None:
         if self._webhook_runner is None:
             return
@@ -4520,6 +4565,21 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+
+        def _on_ws_thread_done(fut: Any) -> None:
+            if not self._running or self.has_fatal_error:
+                return
+            if fut.cancelled():
+                logger.warning("[Feishu] WS thread was cancelled")
+                return
+            exc = fut.exception() if not fut.cancelled() else None
+            if exc:
+                logger.warning("[Feishu] WS thread exited with error: %s", exc)
+            else:
+                logger.warning("[Feishu] WS thread exited unexpectedly — scheduling reconnect")
+            loop.call_soon_threadsafe(self._trigger_ws_reconnect)
+
+        self._ws_future.add_done_callback(_on_ws_thread_done)
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:

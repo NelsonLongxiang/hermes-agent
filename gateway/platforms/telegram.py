@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import html as _html
 import re
 from datetime import datetime, timezone
@@ -505,6 +506,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Pool health tracking — incremented on any send failure, reset on success.
         self._consecutive_pool_timeouts: int = 0
         self._last_pool_drain_time: float = 0.0  # monotonic; cooldown guard
+        self._request_pool_config: Optional[Dict[str, Any]] = None  # for pool replacement
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -523,12 +525,15 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        self._approval_ts: Dict[int, float] = {}  # TTL tracking
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        self._slash_confirm_ts: Dict[str, float] = {}  # TTL tracking
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        self._clarify_ts: Dict[str, float] = {}  # TTL tracking
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -1029,41 +1034,51 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
     async def _drain_request_connections(self) -> None:
-        """Reset the httpx connection pool used for general API requests.
+        """Replace the httpx connection pool used for general API requests.
 
-        Mirrors :meth:`_drain_polling_connections` but targets
-        ``Bot._request[1]`` (the general request pool used by
-        ``send_message``, ``edit_message_text``, etc.).  Triggered when
-        consecutive pool timeouts suggest the pool has accumulated stale
-        connections that ``is_closed()`` / ``has_expired()`` do not clean up.
+        Creates a **new** ``HTTPXRequest`` instance and swaps it into
+        ``Bot._request[1]``, then shuts down the old pool.  This is more
+        effective than in-place ``shutdown()+initialize()`` because the old
+        pool's internal buffers, TLS state, and connection objects become
+        unreferenced and eligible for garbage collection.
         """
         if not (self._app and self._app.bot):
             return
         try:
-            # ``self._bot`` is a ``_BotConcurrencyLimiter`` proxy; reach
-            # through to the real bot for pool access.
             real_bot = self._app.bot
-            req = real_bot._request[1]  # general request pool
+            old_req = real_bot._request[1]  # general request pool
         except Exception:
             return
+        pool_cfg = self._request_pool_config
+        if pool_cfg is None:
+            return
         try:
-            await req.shutdown()
+            new_req = HTTPXRequest(**pool_cfg)
+            await new_req.initialize()
+            real_bot._request[1] = new_req
         except Exception:
             logger.debug(
-                "[%s] Request pool shutdown failed (non-fatal)",
+                "[%s] Pool replacement failed, falling back to in-place drain",
                 self.name, exc_info=True,
             )
+            try:
+                await old_req.shutdown()
+                await old_req.initialize()
+            except Exception:
+                logger.debug(
+                    "[%s] In-place drain also failed",
+                    self.name, exc_info=True,
+                )
+            return
+        # Old pool — best-effort shutdown; don't block on it.
         try:
-            await req.initialize()
-            logger.info(
-                "[%s] Request pool drained and re-initialized after %d pool timeouts",
-                self.name, self._consecutive_pool_timeouts,
-            )
+            await old_req.shutdown()
         except Exception:
-            logger.debug(
-                "[%s] Request pool re-initialize failed (non-fatal)",
-                self.name, exc_info=True,
-            )
+            pass
+        logger.info(
+            "[%s] Request pool fully replaced (old pool discarded) after %d consecutive failures",
+            self.name, self._consecutive_pool_timeouts,
+        )
 
     async def _pool_health_monitor(self) -> None:
         """Background task that monitors TG request pool health.
@@ -1102,6 +1117,44 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, count,
             )
             await self._drain_request_connections()
+
+    async def _periodic_state_cleanup(self) -> None:
+        """Evict stale entries from interactive state dictionaries.
+
+        Approval, clarify, and slash-confirm state entries are normally
+        cleared on user callback, but if the user never responds the entry
+        stays forever.  This task sweeps every 5 minutes and removes any
+        entry older than 30 minutes.
+        """
+        import time as _time
+
+        MAX_AGE = 1800  # 30 minutes
+        SWEEP_INTERVAL = 300  # 5 minutes
+
+        while not self.has_fatal_error:
+            await asyncio.sleep(SWEEP_INTERVAL)
+            now = _time.monotonic()
+            total_evicted = 0
+            for state_dict, ts_dict in [
+                (self._approval_state, self._approval_ts),
+                (self._clarify_state, self._clarify_ts),
+                (self._slash_confirm_state, self._slash_confirm_ts),
+            ]:
+                stale = [k for k, t in ts_dict.items() if now - t > MAX_AGE]
+                for k in stale:
+                    state_dict.pop(k, None)
+                    ts_dict.pop(k, None)
+                total_evicted += len(stale)
+            if total_evicted:
+                logger.debug(
+                    "[%s] State cleanup: evicted %d stale interactive entries",
+                    self.name, total_evicted,
+                )
+            # Also cap status_message_ids to prevent unbounded growth
+            if len(self._status_message_ids) > 200:
+                oldest_keys = list(self._status_message_ids.keys())[:50]
+                for k in oldest_keys:
+                    self._status_message_ids.pop(k, None)
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
@@ -1765,6 +1818,17 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = _BotConcurrencyLimiter(self._app.bot, self._api_semaphore)
 
+            # Store the request pool config for full replacement during drain.
+            if fallback_ips and not proxy_url and not disable_fallback:
+                self._request_pool_config = {
+                    **request_kwargs,
+                    "httpx_kwargs": {"transport": TelegramFallbackTransport(fallback_ips)},
+                }
+            elif proxy_url:
+                self._request_pool_config = {**request_kwargs, "proxy": proxy_url}
+            else:
+                self._request_pool_config = {**request_kwargs}
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -1935,6 +1999,11 @@ class TelegramAdapter(BasePlatformAdapter):
             health_task = asyncio.ensure_future(self._pool_health_monitor())
             self._background_tasks.add(health_task)
             health_task.add_done_callback(self._background_tasks.discard)
+
+            # Start periodic state cleanup to evict stale interactive entries.
+            cleanup_task = asyncio.ensure_future(self._periodic_state_cleanup())
+            self._background_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_tasks.discard)
 
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
@@ -3026,6 +3095,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Store session_key keyed by approval_id for the callback handler
             self._approval_state[approval_id] = session_key
+            self._approval_ts[approval_id] = time.monotonic()
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -3075,6 +3145,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
+            self._slash_confirm_ts[confirm_id] = time.monotonic()
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
@@ -3157,6 +3228,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._clarify_state[clarify_id] = session_key
+            self._clarify_ts[clarify_id] = time.monotonic()
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
@@ -3601,6 +3673,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 session_key = self._approval_state.pop(approval_id, None)
+                self._approval_ts.pop(approval_id, None)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
@@ -3667,6 +3740,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 session_key = self._slash_confirm_state.pop(confirm_id, None)
+                self._slash_confirm_ts.pop(confirm_id, None)
                 if not session_key:
                     await query.answer(text="This prompt has already been resolved.")
                     return
@@ -3824,6 +3898,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)
+                self._clarify_ts.pop(clarify_id, None)
                 try:
                     from tools.clarify_gateway import resolve_gateway_clarify
                     resolved = resolve_gateway_clarify(clarify_id, resolved_text)
