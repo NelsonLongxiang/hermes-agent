@@ -1031,11 +1031,17 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
 
 
 def _safe_getcwd() -> str:
-    """os.getcwd() with fallback to home when cwd has been deleted."""
+    """Return the current working directory, tolerating a deleted CWD.
+
+    ``os.getcwd()`` raises FileNotFoundError when the process's working
+    directory has been removed out from under it (e.g. a scratch workspace
+    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
+    user's home directory, so terminal setup never crashes on a stale CWD.
+    """
     try:
         return os.getcwd()
-    except (FileNotFoundError, OSError):
-        return os.path.expanduser("~")
+    except FileNotFoundError:
+        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
 def _get_env_config() -> Dict[str, Any]:
