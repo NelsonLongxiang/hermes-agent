@@ -258,6 +258,21 @@ def _handle_send(args):
     else:
         is_explicit = False
 
+    # Feishu: auto-attach thread_id when the agent is inside a topic/thread
+    # but only specified the group chat_id without a thread component.
+    # Only applies when the target chat matches the current session's chat.
+    if platform_name in ("feishu", "lark") and chat_id and not thread_id and is_explicit:
+        try:
+            from gateway.session_context import get_session_env
+            _session_chat = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+            if chat_id == _session_chat:
+                _session_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+                if _session_thread:
+                    thread_id = _session_thread
+                    logger.info("[send_message] Feishu: auto-attached thread_id=%s from session context", thread_id)
+        except Exception:
+            pass
+
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
         try:
