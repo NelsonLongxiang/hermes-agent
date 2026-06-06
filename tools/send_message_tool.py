@@ -139,7 +139,10 @@ SEND_MESSAGE_SCHEMA = {
         "- DO NOT use this tool to send files/media to the user in an active chat. "
         "Instead, output MEDIA:/path/to/file directly in your text response — the "
         "platform gateway handles delivery automatically. Using send_message for this "
-        "causes target resolution failures and duplicate sends."
+        "causes target resolution failures and duplicate sends.\n\n"
+        "FEISHU/LARK @-MENTION: When sending to Feishu/Lark, the 'mentions' parameter is REQUIRED. "
+        "Each entry is [open_id, display_name]. The tool prepends <at> tags automatically. "
+        "Without 'mentions', the call will be rejected with an error asking you to retry with the parameter."
     ),
     "parameters": {
         "type": "object",
@@ -156,6 +159,16 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+            },
+            "mentions": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 2
+                },
+                "description": "Feishu/Lark REQUIRED. Users to @-mention in group chats. Each entry is [open_id, display_name], e.g. [['ou_abc123', '张三'], ['ou_def456', '李四']]. Ignored on other platforms."
             }
         },
         "required": []
@@ -186,8 +199,38 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    mentions = args.get("mentions", [])
+
+    # Validate and sanitize mentions: [[open_id, name], ...]
+    _safe_mentions = []
+    for entry in (mentions or []):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        raw_id, raw_name = str(entry[0]).strip(), str(entry[1]).strip()
+        if raw_id.startswith("ou_") and all(c.isalnum() or c in "_-" for c in raw_id[3:]):
+            safe_name = (raw_name
+                         .replace("&", "&amp;").replace("<", "&lt;")
+                         .replace(">", "&gt;").replace('"', "&quot;"))
+            _safe_mentions.append((raw_id, safe_name))
+
+    # Programmatic @-mention: prepend <at> tags + space for Feishu/Lark
+    if _safe_mentions:
+        prefix = " ".join(f'<at user_id="{oid}">{name}</at>' for oid, name in _safe_mentions)
+        message = f"{prefix} {message}"
+
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    # Feishu/Lark: mentions parameter is REQUIRED for @-mention.
+    platform_name_raw = target.split(":", 1)[0].strip().lower()
+    is_feishu = platform_name_raw in ("feishu", "lark")
+    if is_feishu and not _safe_mentions:
+        return tool_error(
+            "Feishu/Lark requires the 'mentions' parameter with at least one "
+            "[open_id, display_name] entry for @-mentioning users. "
+            "Please retry the same send_message call with mentions added. "
+            "Example: mentions=[['ou_abc123', '张三']]"
+        )
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
