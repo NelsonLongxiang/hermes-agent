@@ -203,15 +203,22 @@ def _handle_send(args):
 
     # Validate and sanitize mentions: [[open_id, name], ...]
     _safe_mentions = []
-    for entry in (mentions or []):
+    _invalid_mentions = []
+    for i, entry in enumerate(mentions or []):
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            _invalid_mentions.append(f"entry[{i}]: not a [open_id, name] pair")
             continue
         raw_id, raw_name = str(entry[0]).strip(), str(entry[1]).strip()
-        if raw_id.startswith("ou_") and all(c.isalnum() or c in "_-" for c in raw_id[3:]):
-            safe_name = (raw_name
-                         .replace("&", "&amp;").replace("<", "&lt;")
-                         .replace(">", "&gt;").replace('"', "&quot;"))
-            _safe_mentions.append((raw_id, safe_name))
+        if not raw_name:
+            _invalid_mentions.append(f"entry[{i}]: missing display_name")
+            continue
+        if not raw_id.startswith("ou_") or not all(c.isalnum() or c in "_-" for c in raw_id[3:]):
+            _invalid_mentions.append(f"entry[{i}]: invalid open_id '{raw_id}' (must start with 'ou_')")
+            continue
+        safe_name = (raw_name
+                     .replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+        _safe_mentions.append((raw_id, safe_name))
 
     # Programmatic @-mention: prepend <at> tags + space for Feishu/Lark
     if _safe_mentions:
@@ -221,16 +228,24 @@ def _handle_send(args):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
-    # Feishu/Lark: mentions parameter is REQUIRED for @-mention.
+    # Feishu/Lark: mentions required for group chats; skip for P2P DMs (ou_ prefix).
     platform_name_raw = target.split(":", 1)[0].strip().lower()
     is_feishu = platform_name_raw in ("feishu", "lark")
-    if is_feishu and not _safe_mentions:
-        return tool_error(
-            "Feishu/Lark requires the 'mentions' parameter with at least one "
-            "[open_id, display_name] entry for @-mentioning users. "
-            "Please retry the same send_message call with mentions added. "
-            "Example: mentions=[['ou_abc123', '张三']]"
-        )
+    _target_ref = target.split(":", 1)[1].strip() if ":" in target else ""
+    _is_dm = _target_ref.startswith("ou_")
+    if is_feishu and not _is_dm:
+        if _invalid_mentions:
+            return tool_error(
+                "Invalid mentions entries: " + "; ".join(_invalid_mentions) + ". "
+                "Each entry must be [open_id, display_name] with open_id starting with 'ou_'."
+            )
+        if not _safe_mentions:
+            return tool_error(
+                "Feishu/Lark group chat requires the 'mentions' parameter with at least one "
+                "[open_id, display_name] entry for @-mentioning users. "
+                "Please retry the same send_message call with mentions added. "
+                "Example: mentions=[['ou_abc123', '张三']]"
+            )
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
