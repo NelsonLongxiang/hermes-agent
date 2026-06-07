@@ -1406,6 +1406,9 @@ def check_feishu_requirements() -> bool:
     return ensure_and_bind("platform.feishu", _import, globals(), prompt=False)
 
 
+# Module-level thread root cache shared across all FeishuAdapter instances
+_SHARED_THREAD_ROOT_CACHE: Dict[str, str] = {}
+
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
@@ -1442,6 +1445,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        # Cache: thread_id (omt_xxx) → latest inbound message_id (om_xxx) in that topic.
+        # Used by _send_raw_message to reply into the correct topic via the reply API.
+        self._thread_root_cache: Dict[str, str] = {}
         # Inbound events that arrived before the adapter loop was ready
         # (e.g. during startup/restart or network-flap reconnect). A single
         # drainer thread replays them as soon as the loop becomes available.
@@ -3527,11 +3533,12 @@ class FeishuAdapter(BasePlatformAdapter):
             or "<unknown>"
         )
         logger.info(
-            "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text=%r media=%d",
+            "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s thread_id=%s sender=%s:%s text=%r media=%d",
             "dm" if chat_type == "p2p" else "group",
             message_id,
             inbound_type.value,
             getattr(message, "chat_id", "") or "",
+            thread_id or "(none)",
             "bot" if is_bot else "user",
             sender_primary,
             text[:120],
@@ -3563,6 +3570,10 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
         )
+        # Cache thread_id → message_id mapping so outbound sends can reply into the topic.
+        if thread_id and message_id:
+            _SHARED_THREAD_ROOT_CACHE[thread_id] = message_id
+            logger.debug("[Feishu] Thread cache updated: %s → %s (total keys: %d)", thread_id, message_id, len(_SHARED_THREAD_ROOT_CACHE))
         await self._dispatch_inbound_event(normalized)
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
@@ -4877,22 +4888,38 @@ class FeishuAdapter(BasePlatformAdapter):
                 request.add_query("mentions", _mentions_json)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # the thread_id (omt_xxx = root message ID) as reply_to so the message
-        # lands in the correct topic via the reply API with reply_in_thread=True.
-        # Feishu create API does not accept "thread_id" as receive_id_type.
+        # For topic/thread messages that fell back from reply→create, we need
+        # to land the message inside the correct topic.  The thread_id is an
+        # omt_xxx which is NOT a valid message_id for the reply API (needs om_xxx).
+        # Strategy: find an om_xxx to use as reply target. Try in order:
+        # 1. metadata.reply_to_message_id (set by send_message_tool)
+        # 2. _thread_root_cache (populated from inbound messages)
+        # 3. session context HERMES_SESSION_MESSAGE_ID
         _thread_id = (metadata or {}).get("thread_id")
         if _thread_id:
-            body = self._build_reply_message_body(
-                content=payload,
-                msg_type=msg_type,
-                reply_in_thread=True,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_reply_message_request(_thread_id, body)
-            if _mentions_json:
-                request.add_query("mentions", _mentions_json)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            _reply_msg_id = (metadata or {}).get("reply_to_message_id", "")
+            if not _reply_msg_id or not _reply_msg_id.startswith("om_"):
+                _reply_msg_id = _SHARED_THREAD_ROOT_CACHE.get(_thread_id, "")
+            if not _reply_msg_id or not _reply_msg_id.startswith("om_"):
+                try:
+                    from gateway.session_context import get_session_env
+                    _reply_msg_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+                except Exception:
+                    pass
+            if _reply_msg_id and _reply_msg_id.startswith("om_"):
+                body = self._build_reply_message_body(
+                    content=payload,
+                    msg_type=msg_type,
+                    reply_in_thread=True,
+                    uuid_value=str(uuid.uuid4()),
+                )
+                request = self._build_reply_message_request(_reply_msg_id, body)
+                if _mentions_json:
+                    request.add_query("mentions", _mentions_json)
+                return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            else:
+                logger.error("[Feishu] Cannot send to thread %s: no valid message_id (om_xxx) available", _thread_id)
+                return SendResult(success=False, error=f"Cannot send to topic {_thread_id}: no message_id available")
         else:
             receive_id = chat_id
             receive_id_type = "chat_id"
@@ -4915,7 +4942,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
-        return bool(response and getattr(response, "success", lambda: False)())
+        val = getattr(response, "success", None)
+        if val is None:
+            return False
+        # success may be a bool (SendResult) or a callable (SDK response)
+        if callable(val):
+            return bool(val())
+        return bool(val)
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:

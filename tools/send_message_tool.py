@@ -619,6 +619,16 @@ async def _send_via_adapter(
                 metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
+                    # Attach session message_id (om_xxx) so Feishu adapter can reply
+                    # into the correct topic.  Without this, the adapter only has
+                    # the omt_xxx thread_id which is not accepted by the reply API.
+                    try:
+                        from gateway.session_context import get_session_env
+                        _msg_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+                        if _msg_id and _msg_id.startswith("om_"):
+                            metadata["reply_to_message_id"] = _msg_id
+                    except Exception:
+                        pass
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
                 if not metadata:
@@ -1706,6 +1716,13 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         metadata = {}
         if thread_id:
             metadata["thread_id"] = thread_id
+            try:
+                from gateway.session_context import get_session_env
+                _msg_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+                if _msg_id and _msg_id.startswith("om_"):
+                    metadata["reply_to_message_id"] = _msg_id
+            except Exception:
+                pass
         if mentions:
             metadata["mentions"] = mentions
         metadata = metadata or None
