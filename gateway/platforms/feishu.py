@@ -3457,8 +3457,8 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        _raw_thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None)
-        thread_id = _raw_thread_id if (_raw_thread_id and _raw_thread_id.startswith("omt_")) else None
+        raw_thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None)
+        thread_id = raw_thread_id if (raw_thread_id and raw_thread_id.startswith("omt_")) else None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)

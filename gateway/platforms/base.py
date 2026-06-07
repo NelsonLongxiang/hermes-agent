@@ -3657,11 +3657,9 @@ class BasePlatformAdapter(ABC):
             # the guard-less check in handle_message doesn't match a completed
             # task.  Must use a closure to capture session_key (the callback
             # only receives the task reference).
-            _key = session_key
-            _tasks = self._session_tasks
-            def _cleanup_session_task(t):
-                if _tasks.get(_key) is t:
-                    _tasks.pop(_key, None)
+            def _cleanup_session_task(t, _sk=session_key):
+                if self._session_tasks.get(_sk) is t:
+                    self._session_tasks.pop(_sk, None)
             task.add_done_callback(_cleanup_session_task)
         return True
 
@@ -4012,7 +4010,7 @@ class BasePlatformAdapter(ABC):
                 self.name, session_key,
             )
             if event.message_type == MessageType.PHOTO:
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                merge_pending_message_event(self._pending_messages, session_key, event, merge_text=False)
             elif self._is_queue_text_debounce_candidate(event):
                 await self._queue_text_debounce(session_key, event)
             else:

@@ -271,7 +271,7 @@ def _handle_send(args):
                     thread_id = _session_thread
                     logger.info("[send_message] Feishu: auto-attached thread_id=%s from session context", thread_id)
         except Exception:
-            pass
+            logger.debug("[send_message] Feishu thread_id auto-attach failed", exc_info=True)
 
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
