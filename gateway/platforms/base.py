@@ -3653,6 +3653,16 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+            # When the task finishes, remove its entry from _session_tasks so
+            # the guard-less check in handle_message doesn't match a completed
+            # task.  Must use a closure to capture session_key (the callback
+            # only receives the task reference).
+            _key = session_key
+            _tasks = self._session_tasks
+            def _cleanup_session_task(t):
+                if _tasks.get(_key) is t:
+                    _tasks.pop(_key, None)
+            task.add_done_callback(_cleanup_session_task)
         return True
 
     async def cancel_session_processing(
@@ -3674,7 +3684,7 @@ class BasePlatformAdapter(ABC):
         asyncio where the event loop's cancellation-propagation semantics
         differ subtly from a bare ``asyncio.run`` harness.
         """
-        task = self._session_tasks.pop(session_key, None)
+        task = self._session_tasks.get(session_key)
         if task is not None and not task.done():
             logger.debug(
                 "[%s] Cancelling active processing for session %s",
@@ -3700,6 +3710,12 @@ class BasePlatformAdapter(ABC):
                     session_key,
                     exc_info=True,
                 )
+        # Clear task mapping only after the task has exited (or was never
+        # running).  Keeping the entry while the task is still unwinding
+        # prevents handle_message from spawning a duplicate session when
+        # _active_sessions has already been released.
+        if task is None or task.done():
+            self._session_tasks.pop(session_key, None)
         if discard_pending:
             self._pending_messages.pop(session_key, None)
             self._discard_text_debounce(session_key)
@@ -3983,7 +3999,31 @@ class BasePlatformAdapter(ABC):
                     merge_text=event.message_type == MessageType.TEXT,
                 )
             return  # Don't process now - will be handled after current task finishes
-        
+
+        # Guard-less running task check: /stop may pop _active_sessions and
+        # _session_tasks before the background task actually exits.  If the
+        # task is still running (5s cancel timeout expired), queue the new
+        # message instead of spawning a second parallel session.
+        running_task = self._session_tasks.get(session_key)
+        if running_task and not running_task.done():
+            logger.info(
+                "[%s] Session %s has no guard but task still running — "
+                "queuing message instead of starting a new session",
+                self.name, session_key,
+            )
+            if event.message_type == MessageType.PHOTO:
+                merge_pending_message_event(self._pending_messages, session_key, event)
+            elif self._is_queue_text_debounce_candidate(event):
+                await self._queue_text_debounce(session_key, event)
+            else:
+                merge_pending_message_event(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=event.message_type == MessageType.TEXT,
+                )
+            return
+
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
         # starts would also pass the _active_sessions check and spawn a
