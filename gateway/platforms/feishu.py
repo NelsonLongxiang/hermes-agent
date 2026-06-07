@@ -4818,6 +4818,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not effective_reply_to and metadata:
             effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        # When thread_id is cleared (group topic-mode), still set
+        # reply_in_thread=True so the reply lands inside the topic
+        # rather than the main chat area.
+        if not reply_in_thread and effective_reply_to:
+            reply_in_thread = True
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
