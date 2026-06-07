@@ -4794,6 +4794,15 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        # Build mentions query param for Feishu API (SDK has no native support)
+        _mentions_json = None
+        _raw_mentions = (metadata or {}).get("mentions")
+        if _raw_mentions:
+            _mentions_json = json.dumps([
+                {"key": oid, "id": {"open_id": oid}, "name": name}
+                for oid, name in _raw_mentions
+            ])
+
         effective_reply_to = reply_to
         if not effective_reply_to and metadata:
             effective_reply_to = metadata.get("reply_to_message_id")
@@ -4806,6 +4815,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
+            if _mentions_json:
+                request.add_query("mentions", _mentions_json)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
         # For topic/thread messages that fell back from reply→create, use
@@ -4820,6 +4831,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
+            if _mentions_json:
+                request.add_query("mentions", _mentions_json)
         else:
             receive_id = chat_id
             receive_id_type = "chat_id"
@@ -4836,6 +4849,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request(receive_id_type, body)
+        if _mentions_json:
+            request.add_query("mentions", _mentions_json)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
