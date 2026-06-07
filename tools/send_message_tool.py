@@ -280,6 +280,19 @@ def _handle_send(args):
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                # After resolving a human-friendly name, retry thread_id auto-attach
+                # for Feishu (the first attempt above skipped because is_explicit was False)
+                if platform_name in ("feishu", "lark") and chat_id and not thread_id:
+                    try:
+                        from gateway.session_context import get_session_env
+                        _session_chat = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+                        if chat_id == _session_chat:
+                            _session_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+                            if _session_thread:
+                                thread_id = _session_thread
+                                logger.info("[send_message] Feishu: auto-attached thread_id=%s from session context (post-resolve)", thread_id)
+                    except Exception:
+                        logger.debug("[send_message] Feishu thread_id auto-attach (post-resolve) failed", exc_info=True)
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
