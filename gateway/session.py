@@ -649,7 +649,15 @@ def build_session_key(
 
     if source.chat_id:
         key_parts.append(source.chat_id)
-    if source.thread_id:
+    # Feishu group topic-mode: every message has an omt_ thread_id, but all
+    # topics share one context.  Skip thread_id for Feishu groups so the
+    # session key stays unified.  DM threads keep thread_id isolation.
+    _is_feishu_group = (
+        getattr(source, "platform", None) is not None
+        and source.platform.value == "feishu"
+        and getattr(source, "chat_type", None) == "group"
+    )
+    if source.thread_id and not _is_feishu_group:
         key_parts.append(source.thread_id)
 
     # In threads, default to shared sessions (all participants see the same
