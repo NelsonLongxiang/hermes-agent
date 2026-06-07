@@ -3457,8 +3457,16 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
+        # Feishu groups with topic-mode enabled assign omt_ thread_id to every
+        # message, which would create isolated sessions per topic.  For group
+        # chats, ignore thread_id so all messages share one context.  P2P chats
+        # keep topic isolation (omt_ are genuine threads there).
         raw_thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None)
-        thread_id = raw_thread_id if (raw_thread_id and raw_thread_id.startswith("omt_")) else None
+        _msg_chat_id = getattr(message, "chat_id", "") or ""
+        if raw_thread_id and raw_thread_id.startswith("omt_") and not _msg_chat_id.startswith("ou_"):
+            thread_id = None
+        else:
+            thread_id = raw_thread_id if (raw_thread_id and raw_thread_id.startswith("omt_")) else None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
