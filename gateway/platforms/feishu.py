@@ -1406,8 +1406,12 @@ def check_feishu_requirements() -> bool:
     return ensure_and_bind("platform.feishu", _import, globals(), prompt=False)
 
 
-# Module-level thread root cache shared across all FeishuAdapter instances
-_SHARED_THREAD_ROOT_CACHE: Dict[str, str] = {}
+# Module-level thread root cache shared across all FeishuAdapter instances.
+# Bounded to prevent unbounded growth; oldest entries evicted when full.
+# Thread-safe via _thread_root_cache_lock for concurrent inbound/outbound access.
+_SHARED_THREAD_ROOT_CACHE_MAX = 512
+_SHARED_THREAD_ROOT_CACHE: OrderedDict[str, str] = OrderedDict()
+_thread_root_cache_lock = threading.Lock()
 
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
@@ -3572,7 +3576,10 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         # Cache thread_id → message_id mapping so outbound sends can reply into the topic.
         if thread_id and message_id:
-            _SHARED_THREAD_ROOT_CACHE[thread_id] = message_id
+            with _thread_root_cache_lock:
+                _SHARED_THREAD_ROOT_CACHE[thread_id] = message_id
+                while len(_SHARED_THREAD_ROOT_CACHE) > _SHARED_THREAD_ROOT_CACHE_MAX:
+                    _SHARED_THREAD_ROOT_CACHE.popitem(last=False)
             logger.debug("[Feishu] Thread cache updated: %s → %s (total keys: %d)", thread_id, message_id, len(_SHARED_THREAD_ROOT_CACHE))
         await self._dispatch_inbound_event(normalized)
 
@@ -4899,7 +4906,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if _thread_id:
             _reply_msg_id = (metadata or {}).get("reply_to_message_id", "")
             if not _reply_msg_id or not _reply_msg_id.startswith("om_"):
-                _reply_msg_id = _SHARED_THREAD_ROOT_CACHE.get(_thread_id, "")
+                with _thread_root_cache_lock:
+                    _reply_msg_id = _SHARED_THREAD_ROOT_CACHE.get(_thread_id, "")
             if not _reply_msg_id or not _reply_msg_id.startswith("om_"):
                 try:
                     from gateway.session_context import get_session_env
