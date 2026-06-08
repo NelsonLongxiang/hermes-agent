@@ -4915,6 +4915,27 @@ class FeishuAdapter(BasePlatformAdapter):
                     _reply_msg_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
                 except Exception:
                     pass
+            # If still no om_xxx, try fetching the topic root message from
+            # Feishu API to warm the cache and get a valid reply target.
+            # This handles the restart scenario where in-memory cache is empty.
+            if not _reply_msg_id or not _reply_msg_id.startswith("om_"):
+                try:
+                    # omt_xxx *is* a message_id — fetch it to get its om_ parent
+                    req = self._build_get_message_request(_thread_id)
+                    resp = await asyncio.to_thread(self._client.im.v1.message.get, req)
+                    if resp and getattr(resp, "success", lambda: False)():
+                        items = getattr(getattr(resp, "data", None), "items", None) or []
+                        if items:
+                            root_msg_id = str(getattr(items[0], "message_id", "") or "")
+                            if root_msg_id.startswith("om_"):
+                                _reply_msg_id = root_msg_id
+                                with _thread_root_cache_lock:
+                                    _SHARED_THREAD_ROOT_CACHE[_thread_id] = root_msg_id
+                                    while len(_SHARED_THREAD_ROOT_CACHE) > _SHARED_THREAD_ROOT_CACHE_MAX:
+                                        _SHARED_THREAD_ROOT_CACHE.popitem(last=False)
+                                logger.info("[Feishu] Cache warmed for thread %s → %s via API lookup", _thread_id, root_msg_id)
+                except Exception:
+                    logger.debug("[Feishu] Failed to fetch topic root for %s", _thread_id, exc_info=True)
             if _reply_msg_id and _reply_msg_id.startswith("om_"):
                 body = self._build_reply_message_body(
                     content=payload,
