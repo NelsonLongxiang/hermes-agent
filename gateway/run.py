@@ -875,6 +875,10 @@ from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
+# Bot-to-bot dedup circuit breaker state (module-level for cross-session sharing).
+_bot_dedup_cache: dict[str, float] = {}
+_bot_dedup_last_sweep: float = 0.0
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -8106,6 +8110,82 @@ class GatewayRunner:
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
+
+        # ── Bot-to-bot message dedup circuit breaker ──
+        # Prevents infinite reply loops between agents in group chats.
+        # Two-layer strategy:
+        #   1. Bigram Jaccard similarity (≥0.8) for near-duplicate detection
+        #   2. Short-message rate limit (<30 chars, >3 in window) for
+        #      "✓ 🚢" style loops where similarity is unreliable
+        if not is_internal and source.chat_type in {"group", "forum"}:
+            try:
+                _raw = (event.text or "")[:500]
+                _sender_key = f"{source.user_id}:{source.chat_id}"
+                _now = time.monotonic()
+                _cb_window = float(os.getenv("HERMES_BOT_DEDUP_WINDOW", "180"))
+                _cb_threshold = float(os.getenv("HERMES_BOT_DEDUP_THRESHOLD", "0.8"))
+                _cb_rate_limit = int(os.getenv("HERMES_BOT_DEDUP_RATE_LIMIT", "3"))
+                _cb_short_len = int(os.getenv("HERMES_BOT_DEDUP_SHORT_LEN", "30"))
+
+                # Evict expired entries every 60s
+                if _now - _bot_dedup_last_sweep > 60:
+                    _bot_dedup_cache = {
+                        k: v for k, v in _bot_dedup_cache.items()
+                        if _now - v["ts"] < _cb_window
+                    }
+                    _bot_dedup_last_sweep = _now
+
+                # Count recent messages from same sender+chat (for rate limit)
+                _recent_count = sum(
+                    1 for v in _bot_dedup_cache.values()
+                    if v["sk"] == _sender_key and _now - v["ts"] < _cb_window
+                )
+
+                # Layer 2: short-message rate limit
+                if len(_raw) < _cb_short_len and _recent_count >= _cb_rate_limit:
+                    logger.info(
+                        "Bot dedup circuit breaker: rate-limiting short message "
+                        "from %s in %s (%d msgs in %.0fs window)",
+                        source.user_name or source.user_id,
+                        source.chat_id, _recent_count, _cb_window,
+                    )
+                    return None
+
+                # Layer 1: bigram Jaccard similarity
+                _in_bigrams = {
+                    _raw[i:i + 2] for i in range(len(_raw) - 1)
+                } if len(_raw) >= 2 else {_raw}
+
+                for _cache_key, _entry in _bot_dedup_cache.items():
+                    if _entry["sk"] != _sender_key:
+                        continue
+                    if _now - _entry["ts"] >= _cb_window:
+                        continue
+                    _cached = _entry["bigrams"]
+                    if not _in_bigrams or not _cached:
+                        continue
+                    _inter = len(_in_bigrams & _cached)
+                    _union = len(_in_bigrams | _cached)
+                    if _union == 0:
+                        continue
+                    _sim = _inter / _union
+                    if _sim >= _cb_threshold:
+                        logger.info(
+                            "Bot dedup circuit breaker: dropping near-duplicate "
+                            "from %s in %s (sim=%.2f, age=%.1fs)",
+                            source.user_name or source.user_id,
+                            source.chat_id, _sim, _now - _entry["ts"],
+                        )
+                        return None
+
+                # Not a duplicate — store for future checks
+                _bot_dedup_cache[f"{_sender_key}:{_now:.4f}"] = {
+                    "sk": _sender_key,
+                    "ts": _now,
+                    "bigrams": _in_bigrams,
+                }
+            except Exception:
+                pass  # dedup failure must never block message delivery
 
         # Check for commands
         command = event.get_command()
