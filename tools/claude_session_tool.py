@@ -876,12 +876,14 @@ def _handle_claude_session(args, **kw):
                         with _gateway_adapters_lock:
                             _adapter_info = _gateway_adapters.get(gw_key)
                         if _adapter_info:
+                            _sc_reply_to = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
                             _status_card_config = {
                                 "chat_id": _sc_chat_id,
                                 "loop": _adapter_info["loop"],
                                 "send_func": _adapter_info["send_func"],
                                 "edit_func": _adapter_info["edit_func"],
                                 "delete_func": _adapter_info["delete_func"],
+                                "reply_to": _sc_reply_to or None,
                             }
                             logger.info("StatusCard config built for gw_key=%s", gw_key)
                         else:

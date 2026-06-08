@@ -370,6 +370,7 @@ class StatusCard:
         session_name: str = "",
         session_id: str = "",
         tmux_session: str = "",
+        reply_to: Optional[str] = None,
     ):
         self._session_uuid = session_uuid
         self._session_name = session_name
@@ -380,6 +381,7 @@ class StatusCard:
         self._edit_func = edit_func
         self._delete_func = delete_func
         self._chat_id = str(chat_id)
+        self._reply_to = reply_to
         self._jsonl_path = get_jsonl_path(session_uuid)
         self._poll_interval = poll_interval
         self._max_card_length = max_card_length
@@ -702,6 +704,7 @@ class StatusCard:
             result = await self._send_func(
                 chat_id=self._chat_id,
                 content=text[:self._MAX_MSG_LEN],
+                reply_to=self._reply_to,
             )
             if getattr(result, "success", False) and getattr(result, "message_id", None):
                 old_id = self._message_id
