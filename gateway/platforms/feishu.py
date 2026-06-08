@@ -4880,8 +4880,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         # When thread_id is cleared (group topic-mode), still set
         # reply_in_thread=True so the reply lands inside the topic
-        # rather than the main chat area.
-        if not reply_in_thread and effective_reply_to:
+        # rather than the main chat area.  Skip for DMs to avoid
+        # accidentally creating topics in private chats.
+        if not reply_in_thread and effective_reply_to and not chat_id.startswith("ou_"):
             reply_in_thread = True
         if effective_reply_to:
             body = self._build_reply_message_body(
