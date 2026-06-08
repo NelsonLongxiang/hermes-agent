@@ -5129,13 +5129,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 # fall back to posting a new message directly to the chat.
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
+                    _thread_id = (metadata or {}).get("thread_id")
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
+                        if _thread_id:
                             logger.warning(
                                 "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
                                 "skipping top-level fallback to avoid creating a new topic",
                                 active_reply_to,
-                                (metadata or {}).get("thread_id"),
+                                _thread_id,
                                 code,
                             )
                             return response
@@ -5154,6 +5155,17 @@ class FeishuAdapter(BasePlatformAdapter):
                             reply_to=None,
                             metadata=metadata,
                         )
+                    elif _thread_id:
+                        # SendResult(success=False) with thread_id but no fallback code —
+                        # this is the "no valid message_id for topic" case.  Do NOT fall
+                        # back to chat-level create_message, which would land in the
+                        # group's main topic instead of the correct sub-topic.
+                        logger.warning(
+                            "[Feishu] Send to thread %s failed (no valid reply target); "
+                            "dropping message to avoid posting to group main topic",
+                            _thread_id,
+                        )
+                        return response
                 return response
             except Exception as exc:
                 last_error = exc
