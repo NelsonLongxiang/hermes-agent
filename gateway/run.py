@@ -9754,21 +9754,21 @@ class GatewayRunner:
             })
 
             # Heartbeat passive check: after agent replies, call heartbeat_tool
-            # to see if any skill has follow-up guidance. If so, trigger a
-            # follow-up turn so the agent acts on it.
+            # in a thread (LLM call inside) to avoid blocking the event loop.
             try:
                 from tools.heartbeat_tool import heartbeat_tool as _hb_tool
+                import asyncio as _aio
                 # Build messages list from agent history — avoids DB flush race.
                 _hb_messages = []
                 if history:
                     for h in history[-10:]:
                         _hb_messages.append({"role": h.get("role", ""), "content": h.get("content", "")})
                 _hb_messages.append({"role": "assistant", "content": response or ""})
-                _hb_result = _hb_tool(
-                    intent="",
-                    session_id=session_entry.session_id,
-                    messages=_hb_messages,
+                _hb_result = await _aio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _hb_tool(intent="", session_id=session_entry.session_id, messages=_hb_messages),
                 )
+                logger.info("[heartbeat] Passive result: %s", _hb_result)
                 if _hb_result.get("has_guidance"):
                     _hb_hints = _hb_result.get("hints", [])
                     _hb_names = [h["skill"] for h in _hb_hints]

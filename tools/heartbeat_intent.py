@@ -1,11 +1,10 @@
-"""Heartbeat intent recognition via lightweight LLM call.
+"""Heartbeat intent recognition via auxiliary_client.
 
 Analyzes recent conversation messages and returns a structured intent
 that decide() can match against rules — no keyword guessing.
 """
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -21,10 +20,12 @@ Analyze the conversation and return a JSON object with:
 
 Return ONLY the JSON, no explanation."""
 
-def classify_intent(messages: List[Dict[str, Any]], config: Optional[dict] = None) -> Dict[str, Any]:
+
+def classify_intent(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Call LLM to classify intent from conversation messages.
 
-    Returns structured dict or empty dict on failure.
+    Uses hermes auxiliary_client — proper provider resolution, timeout,
+    and connection pooling. Falls back to default on failure.
     """
     if not messages:
         return _default_intent()
@@ -42,29 +43,17 @@ def classify_intent(messages: List[Dict[str, Any]], config: Optional[dict] = Non
         return _default_intent()
 
     try:
-        from openai import OpenAI
-        from hermes_cli.config import load_config
+        from agent.auxiliary_client import call_llm
 
-        _cfg = load_config() or {}
-        _model_cfg = _cfg.get("model") or {}
-        if isinstance(_model_cfg, dict):
-            base_url = _model_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "http://localhost:8317/v1")
-            api_key = _model_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "sk-placeholder")
-            model = _model_cfg.get("default") or os.environ.get("HEARTBEAT_INTENT_MODEL", "GLM-5.1")
-        else:
-            base_url = os.environ.get("OPENAI_BASE_URL", "http://localhost:8317/v1")
-            api_key = os.environ.get("OPENAI_API_KEY", "sk-placeholder")
-            model = _model_cfg or "GLM-5.1"
-
-        client = OpenAI(base_url=base_url, api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
+        resp = call_llm(
+            task="heartbeat_intent",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": conv_text},
             ],
             temperature=0.1,
             max_tokens=200,
+            timeout=5,
         )
         text = resp.choices[0].message.content.strip()
         # Strip markdown code fences if present
