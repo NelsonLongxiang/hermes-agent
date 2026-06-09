@@ -1,0 +1,16 @@
+name: heartbeat-unanswered
+description: >
+  Detects user questions in the recent message window that the agent did
+  not visibly answer in the subsequent assistant turn. Emits a hint so
+  the next agent turn naturally follows up; appends an
+  unanswered-questions log to SKILL.md (when write_back is enabled) so
+  the same set is not re-asked across sessions.
+heartbeat:
+  enabled: true
+  trigger: agent_end
+  inject_as: system
+  write_back: true
+config:
+  window_size: 6
+  min_question_length: 6
+  dedup_ttl_turns: 3

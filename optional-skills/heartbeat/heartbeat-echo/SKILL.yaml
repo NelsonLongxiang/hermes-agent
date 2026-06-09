@@ -1,0 +1,10 @@
+name: heartbeat-echo
+description: >
+  Stub heartbeat skill for orchestrator validation. Returns a fixed hint
+  and (when write_back is enabled) appends a timestamped marker to
+  SKILL.md so the write_back pipeline is exercised end-to-end.
+heartbeat:
+  enabled: false
+  trigger: agent_end
+  inject_as: system
+  write_back: true

@@ -9762,6 +9762,8 @@ class GatewayRunner:
             if _followup_hints and not agent_result.get("already_sent"):
                 try:
                     _hint_text = "\n\n".join(_followup_hints)
+                    # Guard against infinite followup loops: pass a flag in
+                    # context so the handler can skip on followup turns.
                     _followup_result = await self._run_agent(
                         message=f"[heartbeat] 根据 system hint 主动跟进用户：\n\n{_hint_text}",
                         context_prompt=context_prompt,
@@ -9774,8 +9776,8 @@ class GatewayRunner:
                         channel_prompt=event.channel_prompt,
                     )
                     _fu_response = _followup_result.get("final_response") or ""
-                    if _fu_response:
-                        response = _fu_response
+                    if _fu_response and _fu_response != response:
+                        response = f"{response}\n\n{_fu_response}" if response else _fu_response
                 except Exception as _hb_err:
                     logger.debug("heartbeat followup turn failed: %s", _hb_err)
             

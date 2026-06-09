@@ -1,0 +1,8 @@
+name: heartbeat-orchestrator
+description: >
+  Heartbeat orchestrator. On every `agent:end`, discovers all
+  `heartbeat-*` skills under ~/.hermes/skills/, runs their `decide()`
+  in parallel, and merges the returned hints into the session as a
+  single `system`-role message. Each skill owns its own SKILL.md state.
+events:
+  - agent:end

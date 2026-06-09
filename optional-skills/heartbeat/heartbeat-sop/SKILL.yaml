@@ -1,0 +1,49 @@
+name: heartbeat-sop
+description: >
+  SOUL-aware heartbeat skill. After each agent turn, inspects the recent
+  message window against the SOUL workflow definitions and emits a hint
+  that guides the agent to proactively advance the workflow — e.g. prompt
+  for missing info, suggest the next step, or offer available commands.
+
+  Rules (evaluated in order, first match wins):
+    1. If the user just said hi / opened a conversation → offer available
+       SOUL commands (the menu).
+    2. If a TEMU refund appeal workflow is in progress and the agent's last
+       reply did NOT end with an explicit "waiting for confirmation" or a
+       question → remind the agent to present the rehearsal report and ask
+       for confirmation.
+    3. If an inbound-order workflow is in progress and the agent did not
+       preview the data → remind the agent to --dry-run first.
+    4. If the user's last message looks like an operational command but the
+       agent's reply did not mention loading the relevant skill → remind.
+    5. Otherwise → no hint (has_followup: false), stay silent.
+
+  The skill never invents workflows; it only mirrors what SOUL.md declares.
+heartbeat:
+  enabled: true
+  trigger: agent_end
+  inject_as: system
+  write_back: true
+config:
+  window_size: 6
+  # Minimum user-message length to consider as "serious" input
+  min_input_length: 2
+  # Keywords mapped to SOUL workflows
+  temu_keywords:
+    - 申诉
+    - 退款
+    - temu
+    - 售后
+    - po-
+  inbound_keywords:
+    - 入库
+    - 物流表格
+    - 领星
+    - logistics
+    - inbound
+  greeting_keywords:
+    - hi
+    - 你好
+    - 在吗
+    - 开始工作
+    - 哈喽
