@@ -1,0 +1,8 @@
+# dev-flow vault 数据（任务节点/资料）由各项目独立管理
+# 模板源在 dev-flow-skills 中跟踪，项目 vault 不跟踪
+tasks/
+lessons/
+references/
+maps/
+HOME.md
+.obsidian/
