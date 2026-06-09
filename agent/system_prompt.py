@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    HEARTBEAT_HINT_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -110,6 +111,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Heartbeat hint guidance: tells the model that `[hint: <name>]` system
+    # messages injected by the heartbeat-orchestrator hook are authoritative
+    # follow-up context.  Gated by config.yaml
+    # `agent.heartbeat_hint_guidance` (default True) so users with custom
+    # prompt layouts can opt out.  Goes in the cached stable tier so the
+    # model sees it on the very first turn of every session.
+    if getattr(agent, "_heartbeat_hint_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(HEARTBEAT_HINT_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

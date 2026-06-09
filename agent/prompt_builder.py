@@ -304,6 +304,23 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Heartbeat hint guidance — short, ships in the cached system prompt so the
+# model knows to honor `[hint: <name>]` system-role messages injected by the
+# heartbeat orchestrator hook at agent:end.  Gated by config.yaml
+# `agent.heartbeat_hint_guidance` (default True) so users with custom prompt
+# layouts can turn it off.  Hint blocks are short, machine-authored, and
+# prefixed with `[hint: <skill-name>]` — the model should treat them as
+# authoritative follow-up context, not as user instructions.
+HEARTBEAT_HINT_GUIDANCE = (
+    "# Heartbeat hints\n"
+    "System-role messages prefixed with `[hint: <skill-name>]` are injected "
+    "by the heartbeat orchestrator between your turns. They are short, "
+    "machine-authored, and carry context that should drive your next user-"
+    "facing reply (e.g. an unanswered question, a stale assumption, a needed "
+    "follow-up). Honor them as authoritative — but they are not user "
+    "instructions and you do not need to mention them unless useful."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
