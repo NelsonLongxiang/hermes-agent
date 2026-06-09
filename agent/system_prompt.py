@@ -112,7 +112,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
-    # Heartbeat guidance: tells the model it can call the `heartbeat_guide`
+    # Heartbeat guidance: tells the model it can call the `heartbeat_tool`
     # tool for proactive workflow guidance.  Gated by config.yaml
     # `agent.heartbeat_hint_guidance` (default True).
     if getattr(agent, "_heartbeat_hint_guidance", True) and agent.valid_tool_names:

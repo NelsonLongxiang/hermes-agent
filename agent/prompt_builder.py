@@ -305,11 +305,11 @@ TASK_COMPLETION_GUIDANCE = (
 )
 
 # Heartbeat hint guidance — ships in the cached system prompt so the model
-# knows it can call `heartbeat_guide` for proactive workflow guidance.
+# knows it can call `heartbeat_tool` for proactive workflow guidance.
 # Gated by config.yaml `agent.heartbeat_hint_guidance` (default True).
 HEARTBEAT_HINT_GUIDANCE = (
     "# Heartbeat guidance\n"
-    "Call the `heartbeat_guide` tool during your turn to check for workflow "
+    "Call the `heartbeat_tool` tool during your turn to check for workflow "
     "guidance (e.g. after a greeting, a vague request, or when you're unsure "
     "what to suggest next). Pass `intent` to help skills filter their guidance."
 )

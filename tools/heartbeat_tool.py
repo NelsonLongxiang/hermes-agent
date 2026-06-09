@@ -1,4 +1,4 @@
-"""Heartbeat guidance tool — lets the agent proactively request workflow hints.
+"""Heartbeat tool — lets the agent proactively request workflow hints.
 
 During a conversation turn, the agent can call this tool to check whether any
 heartbeat-* skill has guidance for the current context.
@@ -15,7 +15,7 @@ from tools.heartbeat_shared import discover_heartbeat_skills
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_GUIDE_SCHEMA = {
-    "name": "heartbeat_guide",
+    "name": "heartbeat_tool",
     "description": (
         "Check heartbeat skills for proactive guidance based on the current "
         "conversation context. Call this when you sense the user might need "
@@ -40,7 +40,7 @@ HEARTBEAT_GUIDE_SCHEMA = {
 }
 
 
-def heartbeat_guide(
+def heartbeat_tool(
     intent: str = "",
     session_id: Optional[str] = None,
     **kwargs,
@@ -86,7 +86,7 @@ def heartbeat_guide(
                 continue
             hints.append({"skill": name, "hint": text})
         except Exception as e:
-            logger.debug("heartbeat_guide: skill %s failed: %s", name, e)
+            logger.debug("heartbeat_tool: skill %s failed: %s", name, e)
 
     if not hints:
         return {"has_guidance": False, "hints": [], "message": "No guidance for current context."}
@@ -98,7 +98,7 @@ def heartbeat_guide(
     }
 
 
-def _check_heartbeat_guide_requirements(**kwargs) -> bool:
+def _check_heartbeat_tool_requirements(**kwargs) -> bool:
     """Always available — heartbeat skills are optional, tool works without them."""
     return True
 
@@ -107,14 +107,14 @@ def _check_heartbeat_guide_requirements(**kwargs) -> bool:
 try:
     from tools.registry import registry, tool_error
     registry.register(
-        name="heartbeat_guide",
+        name="heartbeat_tool",
         toolset="heartbeat",
         schema=HEARTBEAT_GUIDE_SCHEMA,
-        handler=lambda args, **kw: heartbeat_guide(
+        handler=lambda args, **kw: heartbeat_tool(
             intent=args.get("intent", ""),
             session_id=kw.get("session_id"),
         ),
-        check_fn=_check_heartbeat_guide_requirements,
+        check_fn=_check_heartbeat_tool_requirements,
         emoji="💓",
     )
 except ImportError:

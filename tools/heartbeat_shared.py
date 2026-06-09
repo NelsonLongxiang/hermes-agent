@@ -1,8 +1,7 @@
 """Shared utilities for heartbeat skills discovery.
 
 Used by:
-  - tools/heartbeat_guide_tool.py (active tool path)
-  - optional-skills/heartbeat/hook/handler.py (reference hook impl)
+  - tools/heartbeat_tool.py (active tool path)
 """
 import importlib.util
 import logging
