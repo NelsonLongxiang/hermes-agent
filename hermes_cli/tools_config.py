@@ -81,6 +81,7 @@ CONFIGURABLE_TOOLSETS = [
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS)",     "background desktop control via cua-driver"),
     ("claude_session",   "🤖 Claude Code Session",       "tmux-based Claude Code management with state awareness"),
+    ("heartbeat",        "💓 Heartbeat Guidance",        "proactive workflow guidance via heartbeat_tool"),
 ]
 
 

@@ -242,6 +242,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "heartbeat": {
+        "description": "Proactive workflow guidance via heartbeat_tool",
+        "tools": ["heartbeat_tool"],
+        "includes": []
+    },
+    
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],

@@ -9753,46 +9753,32 @@ class GatewayRunner:
                 "response": (response or "")[:500],
             })
 
-            # Heartbeat passive check: after agent replies, call heartbeat_tool
-            # in a thread (LLM call inside) to avoid blocking the event loop.
+            # Heartbeat passive check: trigger a followup turn so the agent
+            # calls heartbeat_tool itself — all intent/decide logic lives in
+            # the tool, not here.
             try:
-                from tools.heartbeat_tool import heartbeat_tool as _hb_tool
-                import asyncio as _aio
-                # Build messages list from agent history — avoids DB flush race.
-                _hb_messages = []
-                if history:
-                    for h in history[-10:]:
-                        _hb_messages.append({"role": h.get("role", ""), "content": h.get("content", "")})
-                _hb_messages.append({"role": "assistant", "content": response or ""})
-                _hb_result = await _aio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: _hb_tool(intent="", session_id=session_entry.session_id, messages=_hb_messages),
+                logger.info("[heartbeat] Passive: triggering followup for %s",
+                            session_entry.session_id[:12])
+                _followup_msg = (
+                    "[heartbeat] You MUST call the heartbeat_tool tool now. "
+                    "Do not use skill_view. Do not explain. "
+                    "Call heartbeat_tool and follow the hints it returns."
                 )
-                logger.info("[heartbeat] Passive result: %s", _hb_result)
-                if _hb_result.get("has_guidance"):
-                    _hb_hints = _hb_result.get("hints", [])
-                    _hb_names = [h["skill"] for h in _hb_hints]
-                    logger.info("[heartbeat] Passive check triggered for %s: %s",
-                                session_entry.session_id[:12], _hb_names)
-                    _followup_msg = (
-                        f"[heartbeat] Passive guidance available: {_hb_names}. "
-                        f"Call heartbeat_tool to get full hints and act on them."
-                    )
-                    _fu_result = await self._run_agent(
-                        message=_followup_msg,
-                        context_prompt="",
-                        history=history,
-                        source=source,
-                        session_id=session_entry.session_id,
-                        session_key=session_key,
-                        run_generation=run_generation,
-                        event_message_id=self._reply_anchor_for_event(event),
-                        channel_prompt=event.channel_prompt,
-                    )
-                    if _fu_result and isinstance(_fu_result, dict):
-                        _fu_text = _fu_result.get("response") or ""
-                        if _fu_text and _fu_text.strip() != (response or "").strip():
-                            response = f"{response}\n\n{_fu_text}"
+                _fu_result = await self._run_agent(
+                    message=_followup_msg,
+                    context_prompt="",
+                    history=history,
+                    source=source,
+                    session_id=session_entry.session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                )
+                if _fu_result and isinstance(_fu_result, dict):
+                    _fu_text = _fu_result.get("response") or ""
+                    if _fu_text and _fu_text.strip() != (response or "").strip():
+                        response = f"{response}\n\n{_fu_text}"
             except Exception as _hb_err:
                 logger.error("[heartbeat] Passive check failed: %s", _hb_err, exc_info=True)
 

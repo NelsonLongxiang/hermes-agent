@@ -148,19 +148,16 @@ def _check_heartbeat_tool_requirements(**kwargs) -> bool:
     return True
 
 
-# --- registration ---
-try:
-    from tools.registry import registry, tool_error
-    registry.register(
-        name="heartbeat_tool",
-        toolset="heartbeat",
-        schema=HEARTBEAT_GUIDE_SCHEMA,
-        handler=lambda args, **kw: heartbeat_tool(
-            intent=args.get("intent", ""),
-            session_id=kw.get("session_id"),
-        ),
-        check_fn=_check_heartbeat_tool_requirements,
-        emoji="💓",
-    )
-except ImportError:
-    pass
+# --- registration (top-level so discover_builtin_tools detects it) ---
+from tools.registry import registry, tool_error
+registry.register(
+    name="heartbeat_tool",
+    toolset="heartbeat",
+    schema=HEARTBEAT_GUIDE_SCHEMA,
+    handler=lambda args, **kw: heartbeat_tool(
+        intent=args.get("intent", ""),
+        session_id=kw.get("session_id"),
+    ),
+    check_fn=_check_heartbeat_tool_requirements,
+    emoji="💓",
+)
