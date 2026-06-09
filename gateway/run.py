@@ -9755,14 +9755,15 @@ class GatewayRunner:
 
             # Heartbeat followup: if any handler returned {"trigger_followup": True},
             # run one extra agent turn so the injected hint drives a visible reply.
-            _followup_requested = any(
-                isinstance(r, dict) and r.get("trigger_followup")
-                for r in (_end_results or [])
-            )
-            if _followup_requested and not agent_result.get("already_sent"):
+            _followup_hints = []
+            for r in (_end_results or []):
+                if isinstance(r, dict) and r.get("trigger_followup"):
+                    _followup_hints.extend(r.get("hints") or [])
+            if _followup_hints and not agent_result.get("already_sent"):
                 try:
+                    _hint_text = "\n\n".join(_followup_hints)
                     _followup_result = await self._run_agent(
-                        message="[heartbeat] 请根据最近的 system hint 主动跟进用户。",
+                        message=f"[heartbeat] 根据 system hint 主动跟进用户：\n\n{_hint_text}",
                         context_prompt=context_prompt,
                         history=history,
                         source=source,
