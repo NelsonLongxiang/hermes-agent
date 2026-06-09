@@ -1,68 +1,18 @@
-"""Heartbeat orchestrator — runs heartbeat-* skills after agent:end.
+"""Heartbeat orchestrator (reference impl) — runs heartbeat-* skills after agent:end.
 
-Discover every `heartbeat-*` skill under ~/.hermes/skills/. For each,
-call decide(ctx) concurrently (return_exceptions=True). Merge the
-returned hints as a single system-role message and append to the
-session. Each skill owns its own SKILL.md state writes.
+This hook is no longer active by default. The primary path is the
+`heartbeat_guide` tool (tools/heartbeat_guide_tool.py) which lets the agent
+call decide() proactively. This file remains as a reference for the
+hook-based passive approach.
 
-SKILL.yaml schema (heartbeat section):
-  enabled:     bool  — must be true to run
-  trigger:     str   — informational only (orchestrator fires on agent:end)
-  inject_as:   str   — informational only (orchestrator always uses system)
-  write_back:  bool  — when true, skill may return write_back: {append_md: str}
-                       and the orchestrator appends it to SKILL.md with a
-                       timestamp + marker.  Default false.
-
-Decide() return shape:
-  has_followup: bool
-  text:         str   — shown in injected hint
-  write_back:   dict  — optional.  When SKILL.yaml heartbeat.write_back
-                        is true and this is present, the orchestrator
-                        appends write_back["append_md"] to SKILL.md.
+Uses tools.heartbeat_shared.discover_heartbeat_skills() for skill discovery.
 """
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-import yaml
-
-from hermes_cli.config import get_hermes_home
-
-SKILLS_DIR = get_hermes_home() / "skills"
-
-
-def _discover_heartbeat_skills() -> list:
-    """Return list of (name, module, skill_yaml_dict, state_md_path)."""
-    found = []
-    if not SKILLS_DIR.exists():
-        return found
-    for skill_dir in sorted(SKILLS_DIR.iterdir()):
-        if not skill_dir.is_dir() or not skill_dir.name.startswith("heartbeat-"):
-            continue
-        manifest = skill_dir / "SKILL.yaml"
-        decide_py = skill_dir / "decide.py"
-        if not manifest.exists() or not decide_py.exists():
-            continue
-        try:
-            meta = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-            hb = (meta.get("heartbeat") or {})
-            if not hb.get("enabled", False):
-                continue
-            mod_name = f"heartbeat_skill_{skill_dir.name.replace('-', '_')}"
-            spec = importlib.util.spec_from_file_location(mod_name, decide_py)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = mod
-            spec.loader.exec_module(mod)
-            state_md = skill_dir / "SKILL.md"
-            skill_cfg = meta.get("config") or {}
-            found.append((skill_dir.name, mod, hb, state_md, skill_cfg))
-        except Exception as e:
-            print(f"[heartbeat] Failed to load {skill_dir.name}: {e}", flush=True)
-    return found
+from tools.heartbeat_shared import discover_heartbeat_skills
 
 
 async def _run_one(name, mod, hb, state_md, skill_cfg, ctx):
@@ -101,7 +51,7 @@ async def handle(event_type, context):
         if _m.get("role") == "user" and isinstance(_m.get("content"), str) \
                 and _m["content"].startswith("[heartbeat]"):
             return  # We're inside a followup turn — don't trigger again
-    skills = _discover_heartbeat_skills()
+    skills = discover_heartbeat_skills()
     if not skills:
         return
 

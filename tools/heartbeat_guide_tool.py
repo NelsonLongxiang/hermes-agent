@@ -7,15 +7,10 @@ The tool reuses the same decide() functions as the reference hook, so guidance
 logic stays in one place.  The agent passes the current session context and
 gets back structured hints it should act on.
 """
-import importlib.util
 import logging
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
-
-from hermes_cli.config import get_hermes_home
+from tools.heartbeat_shared import discover_heartbeat_skills
 
 logger = logging.getLogger(__name__)
 
@@ -45,40 +40,6 @@ HEARTBEAT_GUIDE_SCHEMA = {
 }
 
 
-def _discover_heartbeat_skills() -> list:
-    """Return list of (name, module, skill_yaml_dict, state_md_path, skill_cfg)."""
-    skills_dir = get_hermes_home() / "skills"
-    found = []
-    if not skills_dir.exists():
-        return found
-    for skill_dir in sorted(skills_dir.iterdir()):
-        if not skill_dir.is_dir() or not skill_dir.name.startswith("heartbeat-"):
-            continue
-        manifest = skill_dir / "SKILL.yaml"
-        decide_py = skill_dir / "decide.py"
-        if not manifest.exists() or not decide_py.exists():
-            continue
-        try:
-            meta = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-            hb = (meta.get("heartbeat") or {})
-            if not hb.get("enabled", False):
-                continue
-            mod_name = f"heartbeat_tool_{skill_dir.name.replace('-', '_')}"
-            if mod_name in sys.modules:
-                mod = sys.modules[mod_name]
-            else:
-                spec = importlib.util.spec_from_file_location(mod_name, decide_py)
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules[mod_name] = mod
-                spec.loader.exec_module(mod)
-            state_md = skill_dir / "SKILL.md"
-            skill_cfg = meta.get("config") or {}
-            found.append((skill_dir.name, mod, hb, state_md, skill_cfg))
-        except Exception as e:
-            logger.debug("heartbeat_guide: failed to load %s: %s", skill_dir.name, e)
-    return found
-
-
 def heartbeat_guide(
     intent: str = "",
     session_id: Optional[str] = None,
@@ -88,7 +49,7 @@ def heartbeat_guide(
     from hermes_state import SessionDB
 
     sid = session_id or ""
-    skills = _discover_heartbeat_skills()
+    skills = discover_heartbeat_skills()
     if not skills:
         return {"has_guidance": False, "hints": [], "message": "No heartbeat skills found."}
 
