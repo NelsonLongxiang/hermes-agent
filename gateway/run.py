@@ -9747,11 +9747,36 @@ class GatewayRunner:
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
 
-            # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
+            # Emit agent:end hook (emit_collect so handlers can request a followup turn)
+            _end_results = await self.hooks.emit_collect("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
+
+            # Heartbeat followup: if any handler returned {"trigger_followup": True},
+            # run one extra agent turn so the injected hint drives a visible reply.
+            _followup_requested = any(
+                isinstance(r, dict) and r.get("trigger_followup")
+                for r in (_end_results or [])
+            )
+            if _followup_requested and not agent_result.get("already_sent"):
+                try:
+                    _followup_result = await self._run_agent(
+                        message="[heartbeat] 请根据最近的 system hint 主动跟进用户。",
+                        context_prompt=context_prompt,
+                        history=history,
+                        source=source,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        event_message_id=self._reply_anchor_for_event(event),
+                        channel_prompt=event.channel_prompt,
+                    )
+                    _fu_response = _followup_result.get("final_response") or ""
+                    if _fu_response:
+                        response = _fu_response
+                except Exception as _hb_err:
+                    logger.debug("heartbeat followup turn failed: %s", _hb_err)
             
             # Check for pending process watchers (check_interval on background processes)
             try:
