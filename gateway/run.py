@@ -9747,40 +9747,12 @@ class GatewayRunner:
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
 
-            # Emit agent:end hook (emit_collect so handlers can request a followup turn)
-            _end_results = await self.hooks.emit_collect("agent:end", {
+            # Emit agent:end hook
+            await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
 
-            # Heartbeat followup: if any handler returned {"trigger_followup": True},
-            # run one extra agent turn so the injected hint drives a visible reply.
-            _followup_hints = []
-            for r in (_end_results or []):
-                if isinstance(r, dict) and r.get("trigger_followup"):
-                    _followup_hints.extend(r.get("hints") or [])
-            if _followup_hints and not agent_result.get("already_sent"):
-                try:
-                    _hint_text = "\n\n".join(_followup_hints)
-                    # Guard against infinite followup loops: pass a flag in
-                    # context so the handler can skip on followup turns.
-                    _followup_result = await self._run_agent(
-                        message=f"[heartbeat] 根据 system hint 主动跟进用户：\n\n{_hint_text}",
-                        context_prompt=context_prompt,
-                        history=history,
-                        source=source,
-                        session_id=session_entry.session_id,
-                        session_key=session_key,
-                        run_generation=run_generation,
-                        event_message_id=self._reply_anchor_for_event(event),
-                        channel_prompt=event.channel_prompt,
-                    )
-                    _fu_response = _followup_result.get("final_response") or ""
-                    if _fu_response and _fu_response != response:
-                        response = f"{response}\n\n{_fu_response}" if response else _fu_response
-                except Exception as _hb_err:
-                    logger.debug("heartbeat followup turn failed: %s", _hb_err)
-            
             # Check for pending process watchers (check_interval on background processes)
             try:
                 from tools.process_registry import process_registry
