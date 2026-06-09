@@ -9758,7 +9758,17 @@ class GatewayRunner:
             # follow-up turn so the agent acts on it.
             try:
                 from tools.heartbeat_tool import heartbeat_tool as _hb_tool
-                _hb_result = _hb_tool(intent="", session_id=session_entry.session_id)
+                # Build messages list from agent history — avoids DB flush race.
+                _hb_messages = []
+                if history:
+                    for h in history[-10:]:
+                        _hb_messages.append({"role": h.get("role", ""), "content": h.get("content", "")})
+                _hb_messages.append({"role": "assistant", "content": response or ""})
+                _hb_result = _hb_tool(
+                    intent="",
+                    session_id=session_entry.session_id,
+                    messages=_hb_messages,
+                )
                 if _hb_result.get("has_guidance"):
                     _hb_hints = _hb_result.get("hints", [])
                     _hb_names = [h["skill"] for h in _hb_hints]
@@ -9784,7 +9794,7 @@ class GatewayRunner:
                         if _fu_text and _fu_text.strip() != (response or "").strip():
                             response = f"{response}\n\n{_fu_text}"
             except Exception as _hb_err:
-                logger.debug("[heartbeat] Passive check failed: %s", _hb_err)
+                logger.error("[heartbeat] Passive check failed: %s", _hb_err, exc_info=True)
 
             # Check for pending process watchers (check_interval on background processes)
             try:

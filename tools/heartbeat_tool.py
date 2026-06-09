@@ -43,29 +43,43 @@ HEARTBEAT_GUIDE_SCHEMA = {
 def heartbeat_tool(
     intent: str = "",
     session_id: Optional[str] = None,
+    messages: Optional[List[Dict[str, Any]]] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Check heartbeat skills for guidance. Returns hints or empty result."""
-    from hermes_state import SessionDB
+    """Check heartbeat skills for guidance. Returns hints or empty result.
 
+    Args:
+        intent: Optional intent label (e.g. "greeting").
+        session_id: Session ID for DB lookup (if messages not provided).
+        messages: Pre-built message list (bypasses DB). Used by passive caller.
+    """
     sid = session_id or ""
     skills = discover_heartbeat_skills()
     if not skills:
         return {"has_guidance": False, "hints": [], "message": "No heartbeat skills found."}
 
-    # Build ctx for decide()
-    messages: List[Dict[str, Any]] = []
-    if sid:
-        try:
-            _db = SessionDB()
-            messages = _db.get_messages(sid) or []
-        except Exception:
-            pass
+    # Use provided messages, or fall back to DB
+    if messages is None:
+        messages = []
+        if sid:
+            try:
+                from hermes_state import SessionDB
+                _db = SessionDB()
+                messages = _db.get_messages(sid) or []
+            except Exception:
+                pass
+
+    # Intent recognition: LLM classifies the conversation
+    from tools.heartbeat_intent import classify_intent
+    intent_result = classify_intent(messages)
+    logger.info("[heartbeat_tool] Intent: %s → next: %s",
+                intent_result.get("intent"), intent_result.get("next_step"))
 
     ctx = {
         "session_id": sid,
         "messages": messages,
-        "intent": intent,
+        "intent": intent_result.get("intent", "other"),
+        "intent_result": intent_result,  # full structured intent for decide()
         "source": "tool",  # let decide() know this is an active tool call
     }
 
