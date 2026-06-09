@@ -107,15 +107,17 @@ class HeartbeatOrchestratorStep1Test(unittest.TestCase):
         )
         asyncio.run(h.mod.handle("agent:end", {"session_id": self.sid, "response": "hi"}))
 
-        conn = self.db._conn
-        assert conn is not None
-        row = conn.execute(
-            "SELECT role, content FROM messages WHERE session_id=? AND role='system'",
-            (self.sid,),
-        ).fetchone()
-        self.assertIsNotNone(row, "no system-role message appended")
-        self.assertIn("[hint: heartbeat-test]", row[1])
-        self.assertIn("TEST_HINT_PAYLOAD", row[1])
+        # Hint is no longer written to DB; it's delivered via the return
+        # value (trigger_followup + hints list) and optionally to SKILL.md.
+        result_hints = []
+        for _ in range(3):
+            # handle() returns {"trigger_followup": True, "hints": [...]}
+            r = asyncio.run(h.mod.handle("agent:end", {"session_id": self.sid, "response": "hi"}))
+            if isinstance(r, dict):
+                result_hints = r.get("hints") or []
+            break
+        self.assertTrue(any("TEST_HINT_PAYLOAD" in hint for hint in result_hints),
+                        "hint payload not in return value")
 
 
 class HeartbeatOrchestratorStep2Test(unittest.TestCase):
@@ -149,24 +151,27 @@ class HeartbeatOrchestratorStep2Test(unittest.TestCase):
                 "heartbeat:\n"
                 "  enabled: true\n"
                 "  trigger: agent_end\n"
+                "  write_back: true\n"
             ),
             decide_src=(
                 "def decide(ctx, state_md):\n"
-                "    return {'has_followup': True, 'text': 'DEDUP_TEST'}\n"
+                "    return {\n"
+                "        'has_followup': True,\n"
+                "        'text': 'DEDUP_TEST',\n"
+                "        'write_back': {'append_md': 'last hint:\\n> DEDUP_TEST'},\n"
+                "    }\n"
             ),
         )
+        if h.skill_md.exists():
+            h.skill_md.unlink()
         async def run():
-            await h.mod.handle("agent:end", {"session_id": self.sid})
-            await h.mod.handle("agent:end", {"session_id": self.sid})
-        asyncio.run(run())
-
-        conn = self.db._conn
-        assert conn is not None
-        count = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='system'",
-            (self.sid,),
-        ).fetchone()[0]
-        self.assertEqual(count, 1, "dedup should have skipped the second inject")
+            r1 = await h.mod.handle("agent:end", {"session_id": self.sid})
+            r2 = await h.mod.handle("agent:end", {"session_id": self.sid})
+            return r1, r2
+        r1, r2 = asyncio.run(run())
+        # First call injects (returns trigger_followup); second is deduped (returns None)
+        self.assertIsNotNone(r1, "first call should inject")
+        self.assertIsNone(r2, "dedup should have skipped the second inject")
 
     def test_write_back_appends_to_skill_md(self):
         h = _HandlerHarness(

@@ -91,12 +91,19 @@ class TriggerFollowupTest(unittest.TestCase):
                 "heartbeat:\n"
                 "  enabled: true\n"
                 "  trigger: agent_end\n"
+                "  write_back: true\n"
             ),
             decide_src=(
                 "def decide(ctx, state_md):\n"
-                "    return {'has_followup': True, 'text': 'DEDUP_FOLLOWUP'}\n"
+                "    return {\n"
+                "        'has_followup': True,\n"
+                "        'text': 'DEDUP_FOLLOWUP',\n"
+                "        'write_back': {'append_md': 'last hint:\\n> DEDUP_FOLLOWUP'},\n"
+                "    }\n"
             ),
         )
+        if h.skill_md.exists():
+            h.skill_md.unlink()
         asyncio.run(h.mod.handle("agent:end", {"session_id": self.sid}))
         result2 = asyncio.run(h.mod.handle("agent:end", {"session_id": self.sid}))
         self.assertIsNone(result2)
