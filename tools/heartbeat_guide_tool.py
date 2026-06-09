@@ -1,12 +1,11 @@
 """Heartbeat guidance tool — lets the agent proactively request workflow hints.
 
 During a conversation turn, the agent can call this tool to check whether any
-heartbeat-* skill has guidance for the current context.  This is the "active"
-path; the agent:end hook remains as a passive fallback.
+heartbeat-* skill has guidance for the current context.
 
-The tool reuses the same decide() functions as the hook, so guidance logic
-stays in one place.  The agent passes the current session context and gets
-back structured hints it should act on.
+The tool reuses the same decide() functions as the reference hook, so guidance
+logic stays in one place.  The agent passes the current session context and
+gets back structured hints it should act on.
 """
 import importlib.util
 import logging
@@ -82,14 +81,13 @@ def _discover_heartbeat_skills() -> list:
 
 def heartbeat_guide(
     intent: str = "",
-    db=None,
-    current_session_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """Check heartbeat skills for guidance. Returns hints or empty result."""
     from hermes_state import SessionDB
 
-    sid = current_session_id or ""
+    sid = session_id or ""
     skills = _discover_heartbeat_skills()
     if not skills:
         return {"has_guidance": False, "hints": [], "message": "No heartbeat skills found."}
@@ -98,7 +96,7 @@ def heartbeat_guide(
     messages: List[Dict[str, Any]] = []
     if sid:
         try:
-            _db = db or SessionDB()
+            _db = SessionDB()
             messages = _db.get_messages(sid) or []
         except Exception:
             pass
@@ -149,12 +147,11 @@ try:
     from tools.registry import registry, tool_error
     registry.register(
         name="heartbeat_guide",
-        toolset="session_search",
+        toolset="heartbeat",
         schema=HEARTBEAT_GUIDE_SCHEMA,
         handler=lambda args, **kw: heartbeat_guide(
             intent=args.get("intent", ""),
-            db=kw.get("db"),
-            current_session_id=kw.get("current_session_id"),
+            session_id=kw.get("session_id"),
         ),
         check_fn=_check_heartbeat_guide_requirements,
         emoji="💓",
