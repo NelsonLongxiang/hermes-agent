@@ -17898,6 +17898,7 @@ class GatewayRunner:
                     edit_func=_status_adapter.edit_message,
                     delete_func=_status_adapter.delete_message,
                     chat_id=_status_chat_id,
+                    thread_id=source.thread_id or "",
                 )
             except Exception as _e:
                 logger.warning("Could not set up claude session status bridge: %s", _e)

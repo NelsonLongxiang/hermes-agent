@@ -259,6 +259,7 @@ def register_gateway_adapter(
     edit_func,
     delete_func,
     chat_id: str,
+    thread_id: str = "",
 ):
     """Register Gateway adapter callbacks for StatusCard to use.
 
@@ -273,6 +274,7 @@ def register_gateway_adapter(
             "edit_func": edit_func,
             "delete_func": delete_func,
             "chat_id": chat_id,
+            "thread_id": thread_id or "",
             "timestamp": time.time(),
         }
 
@@ -877,6 +879,10 @@ def _handle_claude_session(args, **kw):
                             _adapter_info = _gateway_adapters.get(gw_key)
                         if _adapter_info:
                             _sc_reply_to = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                            _sc_thread_id = (
+                                _adapter_info.get("thread_id", "")
+                                or get_session_env("HERMES_SESSION_THREAD_ID", "")
+                            )
                             _status_card_config = {
                                 "chat_id": _sc_chat_id,
                                 "loop": _adapter_info["loop"],
@@ -884,6 +890,7 @@ def _handle_claude_session(args, **kw):
                                 "edit_func": _adapter_info["edit_func"],
                                 "delete_func": _adapter_info["delete_func"],
                                 "reply_to": _sc_reply_to or None,
+                                "thread_id": _sc_thread_id or None,
                             }
                             logger.info("StatusCard config built for gw_key=%s", gw_key)
                         else:

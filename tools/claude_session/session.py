@@ -1224,6 +1224,7 @@ class ClaudeSession:
         edit_func = config.get("edit_func")
         delete_func = config.get("delete_func")
         reply_to = config.get("reply_to")
+        thread_id = config.get("thread_id")
 
         if not chat_id or not loop or not send_func or not edit_func or not delete_func:
             logger.warning(
@@ -1249,6 +1250,7 @@ class ClaudeSession:
                 session_id=self._session_id or "",
                 tmux_session=self._tmux.session_name if self._tmux else "",
                 reply_to=reply_to,
+                thread_id=thread_id,
             )
             self._status_card.start()
 

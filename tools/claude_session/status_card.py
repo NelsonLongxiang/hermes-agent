@@ -371,6 +371,7 @@ class StatusCard:
         session_id: str = "",
         tmux_session: str = "",
         reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ):
         self._session_uuid = session_uuid
         self._session_name = session_name
@@ -382,6 +383,7 @@ class StatusCard:
         self._delete_func = delete_func
         self._chat_id = str(chat_id)
         self._reply_to = reply_to
+        self._thread_id = thread_id
         self._jsonl_path = get_jsonl_path(session_uuid)
         self._poll_interval = poll_interval
         self._max_card_length = max_card_length
@@ -701,10 +703,12 @@ class StatusCard:
     async def _send_new_message(self, text: str) -> bool:
         """Send a new status message via Gateway adapter. Returns True on success."""
         try:
+            _metadata = {"thread_id": self._thread_id} if self._thread_id else None
             result = await self._send_func(
                 chat_id=self._chat_id,
                 content=text[:self._MAX_MSG_LEN],
                 reply_to=self._reply_to,
+                metadata=_metadata,
             )
             if getattr(result, "success", False) and getattr(result, "message_id", None):
                 old_id = self._message_id
