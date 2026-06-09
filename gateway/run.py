@@ -9753,6 +9753,39 @@ class GatewayRunner:
                 "response": (response or "")[:500],
             })
 
+            # Heartbeat passive check: after agent replies, call heartbeat_tool
+            # to see if any skill has follow-up guidance. If so, trigger a
+            # follow-up turn so the agent acts on it.
+            try:
+                from tools.heartbeat_tool import heartbeat_tool as _hb_tool
+                _hb_result = _hb_tool(intent="", session_id=session_entry.session_id)
+                if _hb_result.get("has_guidance"):
+                    _hb_hints = _hb_result.get("hints", [])
+                    _hb_names = [h["skill"] for h in _hb_hints]
+                    logger.info("[heartbeat] Passive check triggered for %s: %s",
+                                session_entry.session_id[:12], _hb_names)
+                    _followup_msg = (
+                        f"[heartbeat] Passive guidance available: {_hb_names}. "
+                        f"Call heartbeat_tool to get full hints and act on them."
+                    )
+                    _fu_result = await self._run_agent(
+                        message=_followup_msg,
+                        context_prompt="",
+                        history=history,
+                        source=source,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        event_message_id=self._reply_anchor_for_event(event),
+                        channel_prompt=event.channel_prompt,
+                    )
+                    if _fu_result and isinstance(_fu_result, dict):
+                        _fu_text = _fu_result.get("response") or ""
+                        if _fu_text and _fu_text.strip() != (response or "").strip():
+                            response = f"{response}\n\n{_fu_text}"
+            except Exception as _hb_err:
+                logger.debug("[heartbeat] Passive check failed: %s", _hb_err)
+
             # Check for pending process watchers (check_interval on background processes)
             try:
                 from tools.process_registry import process_registry
