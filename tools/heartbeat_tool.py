@@ -70,6 +70,7 @@ def heartbeat_tool(
     }
 
     hints = []
+    write_backs = []  # (skill_name, state_md_path, append_md)
     for (name, mod, hb, state_md, skill_cfg) in skills:
         try:
             if skill_cfg:
@@ -85,11 +86,41 @@ def heartbeat_tool(
             if not text:
                 continue
             hints.append({"skill": name, "hint": text})
+            # Collect write_back payload
+            if hb.get("write_back", False):
+                wb = result.get("write_back") or {}
+                append_md = (wb.get("append_md") or "").strip()
+                if append_md:
+                    write_backs.append((name, state_md, append_md))
         except Exception as e:
             logger.debug("heartbeat_tool: skill %s failed: %s", name, e)
 
     if not hints:
         return {"has_guidance": False, "hints": [], "message": "No guidance for current context."}
+
+    # Dedup: check if the hint text is already in SKILL.md (same as last time)
+    for (_, state_md, _) in write_backs:
+        if state_md.exists():
+            try:
+                _last = state_md.read_text(encoding="utf-8")
+                _hint_body = hints[0]["hint"].strip()
+                if _hint_body and _hint_body in _last:
+                    return {"has_guidance": False, "hints": [], "message": "Deduped — same hint as last time."}
+            except Exception:
+                pass
+        break
+
+    # Write back to SKILL.md (overwrite mode — latest state only)
+    from datetime import datetime, timezone
+    for (name, state_md, append_md) in write_backs:
+        try:
+            _ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            state_md.parent.mkdir(parents=True, exist_ok=True)
+            with state_md.open("w", encoding="utf-8") as _f:
+                _f.write(f"<!-- heartbeat write_back {name} @ {_ts} -->\n")
+                _f.write(append_md + "\n")
+        except Exception as e:
+            logger.debug("heartbeat_tool: write_back failed for %s: %s", name, e)
 
     return {
         "has_guidance": True,
