@@ -9776,7 +9776,7 @@ class GatewayRunner:
                     channel_prompt=event.channel_prompt,
                 )
                 if _fu_result and isinstance(_fu_result, dict):
-                    _fu_text = _fu_result.get("response") or ""
+                    _fu_text = _fu_result.get("final_response") or ""
                     if _fu_text and _fu_text.strip() != (response or "").strip():
                         response = f"{response}\n\n{_fu_text}"
             except Exception as _hb_err:

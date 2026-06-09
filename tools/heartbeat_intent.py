@@ -31,11 +31,14 @@ def classify_intent(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         return _default_intent()
 
     # Build conversation summary (last 6 messages)
+    # Filter out heartbeat system injections so intent reflects real user messages
     window = messages[-6:]
     conv_text = ""
     for msg in window:
         role = msg.get("role", "")
         content = (msg.get("content") or "")[:200]
+        if role == "user" and content.startswith("[heartbeat]"):
+            continue
         if role in ("user", "assistant"):
             conv_text += f"{role}: {content}\n"
 
