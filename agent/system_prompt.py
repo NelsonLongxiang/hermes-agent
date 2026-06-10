@@ -99,6 +99,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # ACTION.md — interaction-behavior layer (immediately after identity).
+    # Same HERMES_HOME resolution as SOUL.md; None when file is absent.
+    if agent.load_soul_identity or not agent.skip_context_files:
+        _action_content = _r.load_action_md()
+        if _action_content:
+            stable_parts.append(_action_content)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

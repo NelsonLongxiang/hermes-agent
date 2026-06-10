@@ -1410,24 +1410,40 @@ def load_soul_md() -> Optional[str]:
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
+    return _load_hermes_home_md("SOUL.md")
+
+
+def load_action_md() -> Optional[str]:
+    """Load ACTION.md from HERMES_HOME and return its content, or None.
+
+    Used as the agent interaction-behavior layer (slot #2 in the system
+    prompt, immediately after SOUL.md).  Covers "how the agent interacts
+    with users" — service standards, reply discipline, workflow rules.
+    Profile-isolated via ``get_hermes_home()`` (same as SOUL.md).
+    """
+    return _load_hermes_home_md("ACTION.md")
+
+
+def _load_hermes_home_md(filename: str) -> Optional[str]:
+    """Shared loader for SOUL.md / ACTION.md from HERMES_HOME."""
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()
     except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+        logger.debug("Could not ensure HERMES_HOME before loading %s: %s", filename, e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
+    path = get_hermes_home() / filename
+    if not path.exists():
         return None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        content = path.read_text(encoding="utf-8").strip()
         if not content:
             return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
+        content = _scan_context_content(content, filename)
+        content = _truncate_content(content, filename)
         return content
     except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        logger.debug("Could not read %s from %s: %s", filename, path, e)
         return None
 
 
