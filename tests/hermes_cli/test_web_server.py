@@ -4,6 +4,7 @@ import os
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -242,6 +243,57 @@ class TestWebServerEndpoints:
         assert "version" in data
         assert "hermes_home" in data
         assert "active_sessions" in data
+
+    # ── GET /api/media (remote image display) ───────────────────────────
+
+    def test_get_media_serves_image_in_root(self):
+        """An image under the gateway's images dir is returned as a data URL."""
+        from hermes_constants import get_hermes_home
+
+        img_dir = get_hermes_home() / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img = img_dir / "shot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+        resp = self.client.get("/api/media", params={"path": str(img)})
+        assert resp.status_code == 200
+        assert resp.json()["data_url"].startswith("data:image/png;base64,")
+
+    def test_get_media_rejects_path_outside_roots(self, tmp_path):
+        """An image-extension file outside the media roots is forbidden."""
+        outside = tmp_path / "secret.png"
+        outside.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        resp = self.client.get("/api/media", params={"path": str(outside)})
+        assert resp.status_code == 403
+
+    def test_get_media_rejects_non_image_extension(self):
+        from hermes_constants import get_hermes_home
+
+        img_dir = get_hermes_home() / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        env = img_dir / "leak.env"
+        env.write_text("SECRET=1")
+
+        resp = self.client.get("/api/media", params={"path": str(env)})
+        assert resp.status_code == 415
+
+    def test_get_media_404_for_missing_file(self):
+        from hermes_constants import get_hermes_home
+
+        missing = get_hermes_home() / "images" / "nope.png"
+        resp = self.client.get("/api/media", params={"path": str(missing)})
+        assert resp.status_code == 404
+
+    def test_get_media_requires_auth(self):
+        from hermes_cli.web_server import _SESSION_HEADER_NAME
+
+        resp = self.client.get(
+            "/api/media",
+            params={"path": "/tmp/x.png"},
+            headers={_SESSION_HEADER_NAME: "wrong-token"},
+        )
+        assert resp.status_code == 401
 
     # ── Dashboard font override ─────────────────────────────────────────
 
@@ -587,6 +639,37 @@ class TestWebServerEndpoints:
             for r in results
         )
 
+    def test_get_session_messages_follows_compression_tip(self):
+        """Reading a compressed session by its old id should hydrate from the
+        live continuation, matching /resume behavior."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="desktop-root", source="cli")
+            db.append_message(session_id="desktop-root", role="user", content="before compression")
+            db.end_session("desktop-root", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "desktop-root"),
+            )
+            db.create_session(session_id="desktop-tip", source="cli", parent_session_id="desktop-root")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "desktop-tip"))
+            db.replace_messages("desktop-root", [])
+            db.append_message(session_id="desktop-tip", role="user", content="after compression")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/desktop-root/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["session_id"] == "desktop-tip"
+        assert [m["content"] for m in payload["messages"]] == ["after compression"]
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 
@@ -772,6 +855,69 @@ class TestWebServerEndpoints:
         assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
         assert calls == [(["update"], "hermes-update")]
 
+    def test_action_status_reaps_completed_process(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        waited = {"done": False}
+
+        class _Proc:
+            pid = 42424
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                waited["done"] = True
+
+        proc = _Proc()
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+        web_server._ACTION_PROCS["hermes-update"] = proc
+
+        resp = self.client.get("/api/actions/hermes-update/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["running"] is False
+        assert data["exit_code"] == 0
+        assert data["pid"] == 42424
+
+        # Process should have been reaped and moved to results.
+        assert waited["done"] is True
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert web_server._ACTION_RESULTS["hermes-update"] == {
+            "exit_code": 0,
+            "pid": 42424,
+        }
+
+    def test_action_status_ignores_wait_failure(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class _Proc:
+            pid = 99
+
+            def poll(self):
+                return 1
+
+            def wait(self, timeout=None):
+                raise OSError("already reaped")
+
+        proc = _Proc()
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+        web_server._ACTION_PROCS["hermes-update"] = proc
+
+        resp = self.client.get("/api/actions/hermes-update/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["exit_code"] == 1
+        # Still reaped despite wait() raising.
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert web_server._ACTION_RESULTS["hermes-update"] == {
+            "exit_code": 1,
+            "pid": 99,
+        }
+
+
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server
@@ -923,6 +1069,41 @@ class TestWebServerEndpoints:
         assert "MATTERMOST_ALLOW_ALL_USERS" in managed
         assert "GATEWAY_PROXY_URL" not in managed
         assert "GATEWAY_PROXY_URL" in _MESSAGING_KEYS_PAGE_KEYS
+
+    def test_model_set_requires_confirmation_for_expensive_model(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: SimpleNamespace(message="EXPENSIVE MODEL WARNING"),
+        )
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "nous",
+                "model": "openai/gpt-5.5-pro",
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["confirm_required"] is True
+        assert data["confirm_message"] == "EXPENSIVE MODEL WARNING"
+
+        confirmed = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "nous",
+                "model": "openai/gpt-5.5-pro",
+                "confirm_expensive_model": True,
+            },
+        )
+
+        assert confirmed.status_code == 200
+        assert confirmed.json()["ok"] is True
+
 
     def test_reveal_env_var(self, tmp_path):
         """POST /api/env/reveal should return the real unredacted value."""
@@ -1083,6 +1264,74 @@ class TestWebServerEndpoints:
         assert data["state"] == "not_configured"
         assert "DISCORD_BOT_TOKEN" in data["message"]
 
+    def test_telegram_onboarding_worker_request_uses_httpx(self, monkeypatch):
+        import httpx
+        import hermes_cli.web_server as ws
+
+        calls = {}
+
+        def fail_urlopen(*_args, **_kwargs):
+            raise AssertionError("Telegram onboarding should not use urllib")
+
+        class FakeHttpxClient:
+            def __init__(self, *args, **kwargs):
+                calls["client_kwargs"] = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                return False
+
+            def request(self, method, url, **kwargs):
+                calls["request"] = (method, url, kwargs)
+                return httpx.Response(
+                    201,
+                    json={"ok": True},
+                    request=httpx.Request(method, url),
+                )
+
+        monkeypatch.setenv("TELEGRAM_ONBOARDING_URL", "https://worker.example")
+        monkeypatch.setattr(ws.urllib.request, "urlopen", fail_urlopen)
+        monkeypatch.setattr(httpx, "Client", FakeHttpxClient)
+
+        payload = ws._telegram_onboarding_request_sync(
+            "POST",
+            "/v1/telegram/pairings",
+            body={"bot_name": "Hermes Agent"},
+            bearer_token="poll-secret",
+        )
+
+        assert payload == {"ok": True}
+        method, url, kwargs = calls["request"]
+        assert method == "POST"
+        assert url == "https://worker.example/v1/telegram/pairings"
+        assert kwargs["json"] == {"bot_name": "Hermes Agent"}
+        assert kwargs["headers"]["Accept"] == "application/json"
+        assert kwargs["headers"]["Authorization"] == "Bearer poll-secret"
+        assert kwargs["headers"]["Content-Type"] == "application/json"
+        assert kwargs["headers"]["User-Agent"].startswith("HermesDashboard/")
+
+    def test_telegram_onboarding_worker_request_maps_unexpected_errors(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("TELEGRAM_ONBOARDING_URL", "not a valid url")
+
+        with pytest.raises(ws.HTTPException) as exc:
+            ws._telegram_onboarding_request_sync(
+                "POST",
+                "/v1/telegram/pairings",
+                body={"bot_name": "Hermes Agent"},
+            )
+
+        assert exc.value.status_code == 502
+        assert (
+            exc.value.detail
+            == "Telegram setup service is unavailable. Try again shortly."
+        )
+
     def test_telegram_onboarding_start_strips_poll_token(self, monkeypatch):
         import hermes_cli.web_server as ws
 
@@ -1150,6 +1399,17 @@ class TestWebServerEndpoints:
             }
 
         monkeypatch.setattr(ws, "_telegram_onboarding_request_sync", fake_request)
+        ws._ACTION_PROCS.pop("gateway-restart", None)
+        restart_calls = []
+
+        class FakeRestartProc:
+            pid = 4242
+
+        def fake_spawn_action(subcommand, name):
+            restart_calls.append((subcommand, name))
+            return FakeRestartProc()
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fake_spawn_action)
 
         start = self.client.post("/api/messaging/telegram/onboarding/start", json={})
         assert start.status_code == 200
@@ -1171,12 +1431,137 @@ class TestWebServerEndpoints:
             "ok": True,
             "platform": "telegram",
             "bot_username": "hermes_pair_ready_bot",
-            "needs_restart": True,
+            "needs_restart": False,
+            "restart_started": True,
+            "restart_action": "gateway-restart",
+            "restart_pid": 4242,
         }
+        assert restart_calls == [(["gateway", "restart"], "gateway-restart")]
         env = load_env()
         assert env["TELEGRAM_BOT_TOKEN"] == "123456:SECRET"
         assert env["TELEGRAM_ALLOWED_USERS"] == "123456789"
         assert load_config()["platforms"]["telegram"]["enabled"] is True
+
+    def test_telegram_onboarding_apply_reports_restart_failure_after_save(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import load_config, load_env
+
+        with ws._telegram_onboarding_lock:
+            ws._telegram_onboarding_pairings.clear()
+
+        def fake_request(method, path, *, body=None, bearer_token=None):
+            if method == "POST":
+                return {
+                    "pairing_id": "pair-restart-fails",
+                    "poll_token": "poll-secret",
+                    "suggested_username": "hermes_pair_restart_fails_bot",
+                    "deep_link": "https://t.me/newbot/HermesSetupBot/hermes_pair_restart_fails_bot",
+                    "qr_payload": "https://t.me/newbot/HermesSetupBot/hermes_pair_restart_fails_bot",
+                    "expires_at": "2027-05-18T00:00:00.000Z",
+                }
+            assert method == "GET"
+            assert path == "/v1/telegram/pairings/pair-restart-fails"
+            assert bearer_token == "poll-secret"
+            return {
+                "status": "ready",
+                "bot_username": "hermes_pair_restart_fails_bot",
+                "owner_user_id": 123456789,
+                "token": "123456:SECRET",
+            }
+
+        monkeypatch.setattr(ws, "_telegram_onboarding_request_sync", fake_request)
+        ws._ACTION_PROCS.pop("gateway-restart", None)
+
+        def fail_spawn_action(subcommand, name):
+            assert subcommand == ["gateway", "restart"]
+            assert name == "gateway-restart"
+            raise RuntimeError("supervisor unavailable")
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fail_spawn_action)
+
+        start = self.client.post("/api/messaging/telegram/onboarding/start", json={})
+        assert start.status_code == 200
+        ready = self.client.get("/api/messaging/telegram/onboarding/pair-restart-fails")
+        assert ready.status_code == 200
+        assert ready.json()["status"] == "ready"
+
+        applied = self.client.post(
+            "/api/messaging/telegram/onboarding/pair-restart-fails/apply",
+            json={"allowed_user_ids": ["123456789"]},
+        )
+
+        assert applied.status_code == 200
+        applied_data = applied.json()
+        assert applied_data["ok"] is True
+        assert applied_data["needs_restart"] is True
+        assert applied_data["restart_started"] is False
+        assert "supervisor unavailable" in applied_data["restart_error"]
+        assert "token" not in applied_data
+        env = load_env()
+        assert env["TELEGRAM_BOT_TOKEN"] == "123456:SECRET"
+        assert env["TELEGRAM_ALLOWED_USERS"] == "123456789"
+        assert load_config()["platforms"]["telegram"]["enabled"] is True
+
+    def test_telegram_onboarding_apply_reuses_inflight_gateway_restart(
+        self, monkeypatch
+    ):
+        """A live in-flight gateway restart is reused instead of spawning a
+        second racing ``hermes gateway restart`` child (e.g. when a stale
+        cached frontend also fires its own restart call)."""
+        import hermes_cli.web_server as ws
+
+        with ws._telegram_onboarding_lock:
+            ws._telegram_onboarding_pairings.clear()
+
+        def fake_request(method, path, *, body=None, bearer_token=None):
+            if method == "POST":
+                return {
+                    "pairing_id": "pair-reuse",
+                    "poll_token": "poll-secret",
+                    "suggested_username": "hermes_pair_reuse_bot",
+                    "deep_link": "https://t.me/newbot/HermesSetupBot/hermes_pair_reuse_bot",
+                    "qr_payload": "https://t.me/newbot/HermesSetupBot/hermes_pair_reuse_bot",
+                    "expires_at": "2027-05-18T00:00:00.000Z",
+                }
+            return {
+                "status": "ready",
+                "bot_username": "hermes_pair_reuse_bot",
+                "owner_user_id": 123456789,
+                "token": "123456:SECRET",
+            }
+
+        monkeypatch.setattr(ws, "_telegram_onboarding_request_sync", fake_request)
+
+        class FakeRunningProc:
+            pid = 5151
+
+            def poll(self):
+                return None  # still running
+
+        monkeypatch.setitem(ws._ACTION_PROCS, "gateway-restart", FakeRunningProc())
+
+        def fail_spawn_action(subcommand, name):
+            raise AssertionError("must not spawn a second concurrent restart")
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fail_spawn_action)
+
+        start = self.client.post("/api/messaging/telegram/onboarding/start", json={})
+        assert start.status_code == 200
+        ready = self.client.get("/api/messaging/telegram/onboarding/pair-reuse")
+        assert ready.status_code == 200
+
+        applied = self.client.post(
+            "/api/messaging/telegram/onboarding/pair-reuse/apply",
+            json={"allowed_user_ids": ["123456789"]},
+        )
+
+        assert applied.status_code == 200
+        applied_data = applied.json()
+        assert applied_data["needs_restart"] is False
+        assert applied_data["restart_started"] is True
+        assert applied_data["restart_pid"] == 5151
 
     def test_telegram_onboarding_apply_requires_ready_pairing(self, monkeypatch):
         import hermes_cli.web_server as ws
@@ -3932,6 +4317,39 @@ class TestPtyWebSocket:
 
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
+
+    def test_resolve_chat_argv_applies_terminal_backend_config(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import hermes_cli.main as main_mod
+
+        config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "terminal:",
+                    "  backend: docker",
+                    "  docker_image: example/hermes-tools:latest",
+                    "  docker_extra_args:",
+                    "    - --network=host",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.delenv("TERMINAL_DOCKER_IMAGE", raising=False)
+        monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert env["TERMINAL_ENV"] == "docker"
+        assert env["TERMINAL_DOCKER_IMAGE"] == "example/hermes-tools:latest"
+        assert env["TERMINAL_DOCKER_EXTRA_ARGS"] == '["--network=host"]'
 
     def test_rejects_when_embedded_chat_disabled(self, monkeypatch):
         monkeypatch.setattr(self.ws_module, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", False)
