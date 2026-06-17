@@ -3928,6 +3928,7 @@ def _custom_provider_entry_to_provider_config(
         "rate_limit_delay",
         "discover_models",
         "extra_body",
+        "stale_timeout_seconds",
     ):
         if field in normalized:
             provider_entry[field] = normalized[field]
