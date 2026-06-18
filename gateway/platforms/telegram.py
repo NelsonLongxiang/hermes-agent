@@ -571,15 +571,23 @@ class TelegramAdapter(BasePlatformAdapter):
     def _kill_zombie_gateway_processes(self) -> None:
         """Kill leftover gateway processes that ``--replace`` missed.
 
-        Best-effort: scans for PIDs matching ``hermes gateway run`` and
-        sends SIGTERM to any that aren't us.  Prevents two instances
-        polling the same bot token simultaneously.
+        Best-effort: scans for PIDs matching ``hermes gateway run`` **with
+        the same ``--profile`` argument** and sends SIGTERM to any that
+        aren't us.  Different profiles may run concurrently (different bot
+        tokens), so only same-profile zombies are killed.
         """
         import signal as _signal
         import subprocess as _subprocess
 
         _MUST_CONTAIN = ("hermes", "gateway", "run")
+        # Extract our profile name from argv / cmdline to scope kills.
         my_pid = os.getpid()
+        my_cmdline = ""
+        try:
+            my_cmdline = _Path(f"/proc/{my_pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+        _my_profile = self._extract_profile_from_cmdline(my_cmdline)
         try:
             result = _subprocess.run(
                 ["pgrep", "-f", "hermes"],
@@ -601,6 +609,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     continue
                 if not all(tok in cmdline for tok in _MUST_CONTAIN):
                     continue
+                # Only kill processes with the same --profile.
+                their_profile = self._extract_profile_from_cmdline(cmdline)
+                if _my_profile is not None and their_profile != _my_profile:
+                    logger.debug(
+                        "[%s] Skipping PID %d (different profile: %s vs %s)",
+                        self.name, pid, their_profile, _my_profile,
+                    )
+                    continue
                 logger.warning(
                     "[%s] Killing zombie gateway process PID %d",
                     self.name, pid,
@@ -611,6 +627,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
         except Exception:
             pass  # Best effort
+
+    @staticmethod
+    def _extract_profile_from_cmdline(cmdline: str):
+        """Extract the --profile value from a command line string."""
+        if not cmdline:
+            return None
+        parts = cmdline.replace('\x00', ' ').split()
+        for i, part in enumerate(parts):
+            if part == "--profile" and i + 1 < len(parts):
+                return parts[i + 1]
+            if part.startswith("--profile="):
+                return part.split("=", 1)[1]
+            if part == "-p" and i + 1 < len(parts):
+                return parts[i + 1]
+        return None
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
