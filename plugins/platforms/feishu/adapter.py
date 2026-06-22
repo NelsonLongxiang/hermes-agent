@@ -4870,6 +4870,9 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        if metadata and metadata.get("thread_id"):
+            logger.info("[Feishu] _send_raw_message thread_id=%s reply_to=%s chat_id=%s",
+                        metadata.get("thread_id"), reply_to, chat_id)
         # Build mentions query param for Feishu API (SDK has no native support)
         _mentions_json = None
         _raw_mentions = (metadata or {}).get("mentions")
