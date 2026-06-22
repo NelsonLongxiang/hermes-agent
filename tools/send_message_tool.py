@@ -1044,7 +1044,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.DINGTALK:
             result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.FEISHU:
-            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id, mentions=mentions)
         elif platform == Platform.WECOM:
             result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.BLUEBUBBLES:
@@ -1314,12 +1314,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
 
 
-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
+async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None, **kwargs):
     """Dispatch a one-shot send through a migrated platform plugin's
     standalone_sender_fn (registry hook).  Used for platforms whose adapter
     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
     the legacy inline ``_send_<platform>`` helper now lives in the plugin as
     ``_standalone_send`` and is reached via the platform registry.
+
+    Extra kwargs (e.g. mentions for Feishu) are forwarded to the plugin's
+    standalone_sender_fn.
     """
     from gateway.platform_registry import platform_registry
     from hermes_cli.plugins import discover_plugins
@@ -1327,7 +1330,7 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id, **kwargs)
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
