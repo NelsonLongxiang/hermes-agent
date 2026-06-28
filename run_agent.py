@@ -1139,6 +1139,19 @@ class AIAgent:
         if env_timeout is not None:
             return float(env_timeout), False
 
+        # Reasoning-model floor: auto-mitigation for known reasoning models
+        # (Nemotron 3 Ultra, OpenAI o1/o3, Anthropic Opus 4.x thinking,
+        # DeepSeek R1, Qwen QwQ, xAI Grok reasoning, etc.) whose cloud
+        # gateways idle-kill before the model's thinking phase ends.
+        # uses_implicit_default is False here so the local-endpoint
+        # short-circuit in _compute_non_stream_stale_timeout does not
+        # disable stale detection for users running reasoning models on a
+        # local NIM endpoint.
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+        reasoning_floor = get_reasoning_stale_timeout_floor(self.model)
+        if reasoning_floor is not None:
+            return reasoning_floor, False
+
         return 90.0, True
 
     def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
@@ -1355,14 +1368,26 @@ class AIAgent:
         return False
 
     def _is_ollama_glm_backend(self) -> bool:
-        """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
+        """Detect Ollama-hosted GLM models affected by stop misreports.
+
+        Ollama can misreport truncated output as finish_reason='stop'.
+        Detection relies on explicit Ollama signatures:
+        - Port 11434 (Ollama default)
+        - "ollama" in the base URL (e.g. ollama.local, /ollama/ path)
+        - provider explicitly set to "ollama"
+
+        Crucially it does NOT match arbitrary local/private endpoints
+        (LiteLLM/sglang/vLLM/LM Studio proxies, Tailscale boxes), which
+        report finish_reason correctly and were the source of #13971's
+        false-positive truncation continuations.
+        """
         model_lower = (self.model or "").lower()
         provider_lower = (self.provider or "").lower()
         if "glm" not in model_lower and provider_lower != "zai":
             return False
         if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
             return True
-        return bool(self.base_url and is_local_endpoint(self.base_url))
+        return provider_lower == "ollama"
 
     def _should_treat_stop_as_truncated(
         self,
@@ -1400,10 +1425,13 @@ class AIAgent:
         user_message: str,
         assistant_content: str,
         messages: List[Dict[str, Any]],
+        require_workspace: bool = True,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.looks_like_codex_intermediate_ack``."""
         from agent.agent_runtime_helpers import looks_like_codex_intermediate_ack
-        return looks_like_codex_intermediate_ack(self, user_message, assistant_content, messages)
+        return looks_like_codex_intermediate_ack(
+            self, user_message, assistant_content, messages, require_workspace
+        )
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_reasoning``."""
@@ -3658,16 +3686,28 @@ class AIAgent:
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
                 return client
+            old_client = client
+            try:
+                new_client = self._create_openai_client(
+                    self._client_kwargs, reason=reason, shared=True
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to recreate closed OpenAI client (%s) %s error=%s",
+                    reason,
+                    self._client_log_context(),
+                    exc,
+                )
+                raise RuntimeError("Failed to recreate closed OpenAI client") from exc
+            self.client = new_client
 
         logger.warning(
-            "Detected closed shared OpenAI client; recreating before use (%s) %s",
+            "Detected closed shared OpenAI client; recreated before use (%s) %s",
             reason,
             self._client_log_context(),
         )
-        if not self._replace_primary_openai_client(reason=f"recreate_closed:{reason}"):
-            raise RuntimeError("Failed to recreate closed OpenAI client")
-        with self._openai_client_lock():
-            return self.client
+        self._close_openai_client(old_client, reason=f"replace:{reason}", shared=True)
+        return new_client
 
     def _cleanup_dead_connections(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.cleanup_dead_connections``."""

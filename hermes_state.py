@@ -19,6 +19,7 @@ import logging
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -51,8 +52,7 @@ _BRANCH_CHILD_SQL = (
 _COMPRESSION_CHILD_SQL = (
     "EXISTS (SELECT 1 FROM sessions p"
     "        WHERE p.id = {a}.parent_session_id"
-    "        AND p.end_reason = 'compression'"
-    "        AND {a}.started_at >= p.ended_at)"
+    "        AND p.end_reason = 'compression')"
 )
 
 # Rows that surface in pickers: roots + branch children (subagent runs and
@@ -242,6 +242,41 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     return str(mode).strip().lower() if mode is not None else None
 
 
+def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
+    """Enable ``PRAGMA checkpoint_fullfsync`` on macOS (no-op elsewhere).
+
+    On Darwin, ``synchronous=FULL`` (the WAL default) issues a plain
+    ``fsync()``, which Apple documents does *not* guarantee that data
+    has reached stable storage or that writes are not reordered — see
+    the ``fsync(2)`` man page.  SQLite's WAL corruption-safety guarantee
+    assumes the OS honors the fsync write barrier; macOS does not unless
+    the app uses ``F_FULLFSYNC``.
+
+    During a launchd *system* shutdown/reboot the OS page cache is
+    dropped (effectively a power-loss event for in-flight pages), so a
+    WAL checkpoint whose ``fsync()`` "reported" durable may never have
+    hit the platter — corrupting ``state.db`` with a malformed image.
+    This is the trigger in issue #30636 ("SIGTERM during launchd
+    shutdown under high load"), distinct from a plain in-session kill
+    (which the page cache survives and SQLite recovers from).
+
+    ``checkpoint_fullfsync=1`` forces an ``F_FULLFSYNC`` barrier only at
+    checkpoint boundaries — where WAL frames land in the main DB — so the
+    cost amortizes to roughly +0.1 ms/commit (vs ~+4 ms for the broader
+    ``fullfsync=1`` that flushes on every commit's WAL sync).  Guarded by
+    ``sys.platform == "darwin"`` because ``F_FULLFSYNC`` is macOS-only;
+    on other platforms the PRAGMA is a no-op, so we skip it entirely.
+
+    Best-effort: never raises.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        conn.execute("PRAGMA checkpoint_fullfsync=1")
+    except sqlite3.OperationalError:
+        pass
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -272,12 +307,14 @@ def apply_wal_with_fallback(
     try:
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
         if current_mode and current_mode[0] == "wal":
+            _apply_macos_checkpoint_barrier(conn)
             return "wal"
     except sqlite3.OperationalError:
         pass
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+        _apply_macos_checkpoint_barrier(conn)
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
@@ -404,7 +441,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
     malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
-    ``sessions`` read.
+    ``sessions`` read, and finally a rolled-back ``messages`` write so that
+    FTS5 index corruption — which leaves base-table reads and
+    ``integrity_check`` passing while every ``INSERT INTO messages`` fails
+    through the FTS triggers — is reported as unhealthy rather than slipping
+    past as a false "ok" (#50502).
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
@@ -414,6 +455,36 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         if problems:
             return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+
+        # FTS write probe: drive a row through the messages_fts* triggers in a
+        # transaction that is always rolled back, so a corrupt FTS index that
+        # rejects writes is caught even though reads look healthy. The probe is
+        # best-effort — if the messages/sessions tables don't exist yet (brand
+        # new file mid-init) the OperationalError is treated as "not yet a
+        # populated DB", not corruption.
+        probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (probe_session_id, "_health_probe", time.time()),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (probe_session_id, "user", "_fts_health_probe", time.time()),
+            )
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError as exc:
+            # Missing tables / FTS disabled — not the corruption class we probe.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            msg = str(exc).lower()
+            if "no such table" in msg or "no such column" in msg:
+                return None
+            return str(exc)
         return None
     except sqlite3.DatabaseError as exc:
         return str(exc)
@@ -422,16 +493,23 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
 
 
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
-    """Repair a state.db whose ``sqlite_master`` schema is malformed.
+    """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
+    FTS indexes reject writes.
 
-    Handles the "duplicate object definition" / malformed-schema class where
-    even ``PRAGMA`` statements fail. Tries least-destructive recovery first
-    and escalates:
+    Handles two corruption classes: the "duplicate object definition" /
+    malformed-schema class where even ``PRAGMA`` statements fail, and the FTS
+    write-corruption class (#50502) where base tables read fine and
+    ``integrity_check`` passes but writes fail through the ``messages_fts*``
+    triggers. Tries least-destructive recovery first and escalates:
 
-      1. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
+      1. **Rebuild FTS indexes in place** via the FTS5 ``'rebuild'`` command,
+         which rewrites the internal b-tree segments from the canonical
+         ``messages`` rows without dropping or recreating anything. Fixes the
+         FTS write-corruption class while preserving the schema intact.
+      2. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
          ``type``/``name``). Fixes the canonical "table X already exists"
          case and PRESERVES the existing FTS index intact.
-      2. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
+      3. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
          The next ``SessionDB()`` open rebuilds the FTS indexes from the
          canonical ``messages`` table.
 
@@ -453,9 +531,42 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["error"] = f"{db_path} does not exist"
         return report
 
+    if _db_opens_cleanly(db_path) is None:
+        report["repaired"] = True
+        report["strategy"] = "already_healthy"
+        return report
+
     if backup:
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
+
+    # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
+    # The FTS5 'rebuild' command rewrites the internal index from the canonical
+    # content table. This is the recommended, least-destructive recovery for a
+    # corrupt FTS index that rejects message writes while reads still succeed.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            for table_name in ("messages_fts", "messages_fts_trigram"):
+                try:
+                    conn.execute(
+                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                    )
+                except sqlite3.OperationalError:
+                    # Table absent (FTS disabled / trigram off) — skip it.
+                    continue
+        finally:
+            conn.close()
+        if _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "rebuild_fts"
+            logger.warning(
+                "state.db FTS indexes rebuilt in place (schema preserved): %s",
+                db_path,
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
@@ -2049,7 +2160,6 @@ class SessionDB:
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
-                      AND child.started_at >= parent.ended_at
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -2059,7 +2169,6 @@ class SessionDB:
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
-                      AND child.started_at >= parent.ended_at
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -2155,37 +2264,64 @@ class SessionDB:
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
-        A compression continuation is a child session where:
-        1. The parent's ``end_reason = 'compression'``
-        2. The child was created AFTER the parent was ended (started_at >= ended_at)
+        A compression continuation is a child of a session whose
+        ``end_reason = 'compression'``.  Older builds tried to distinguish
+        continuations from branches/subagents by requiring
+        ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
+        gateway + compression races can insert the real continuation row before
+        the parent row's ``ended_at`` is written, while a stale websocket later
+        creates/reuses a sibling that *does* satisfy the timestamp test.  The
+        visible symptom is brutal: desktop resume follows the stale sibling and
+        the user's latest messages look "lost" even though they are persisted in
+        the real continuation chain.
 
-        The second condition distinguishes compression continuations from
-        delegate subagents or branch children, which can also have a
-        ``parent_session_id`` but were created while the parent was still live.
-
-        Returns the session_id of the latest continuation in the chain, or the
-        input ``session_id`` if it isn't part of a compression chain (or if the
-        input itself doesn't exist).
+        Instead, only follow children of compression-ended parents, exclude
+        explicit branch/delegate/tool children, and prefer children that are
+        themselves continuing the compression chain (``end_reason='compression'``)
+        or still live over stale closed siblings such as ``ws_orphan_reap``.
+        Returns the latest continuation tip, or the input id when no
+        continuation exists.
         """
         current = session_id
+        seen = {current} if current else set()
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
-                    "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+                    """
+                    SELECT child.id
+                    FROM sessions parent
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY
+                      CASE
+                        WHEN child.end_reason = 'compression' THEN 0
+                        WHEN child.ended_at IS NULL THEN 1
+                        ELSE 2
+                      END,
+                      COALESCE(
+                        (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = child.id),
+                        child.started_at
+                      ) DESC,
+                      child.started_at DESC,
+                      child.id DESC
+                    LIMIT 1
+                    """,
+                    (current,),
                 )
                 row = cursor.fetchone()
             if row is None:
                 return current
-            current = row["id"]
+            child_id = row["id"]
+            if not child_id or child_id in seen:
+                return current
+            seen.add(child_id)
+            current = child_id
         return current
 
     def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
@@ -2315,10 +2451,12 @@ class SessionDB:
             # still surfacing old compression roots whose live tip is fresh.
             #
             # The CTE seeds from rows the outer WHERE admits (roots + branch
-            # children), then recursively joins forward through
-            # compression-continuation edges using the same criteria as
-            # get_compression_tip (parent.end_reason='compression' AND
-            # child.started_at >= parent.ended_at).
+            # children), then recursively joins forward through robust
+            # compression-continuation edges. Do NOT require
+            # child.started_at >= parent.ended_at here: real desktop/gateway
+            # races can insert the continuation row before the parent's
+            # ended_at is written, while stale websocket siblings may satisfy
+            # the timestamp test and hijack resume/list projection.
             outer_where = where_sql
             id_params: List[Any] = []
             if id_needle:
@@ -2350,7 +2488,9 @@ class SessionDB:
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
-                      AND child.started_at >= parent.ended_at
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
                     SELECT
@@ -3119,9 +3259,14 @@ class SessionDB:
         it before compression. See #15000.
 
         This helper walks ``parent_session_id`` forward from ``session_id`` and
-        returns the first descendant in the chain that has at least one message
-        row. If the original session already has messages, or no descendant
-        has any, the original ``session_id`` is returned unchanged.
+        returns the descendant in the chain that has the **most recent** messages.
+        Unlike the original logic, it does NOT short-circuit when the starting
+        session already has messages — a descendant that was created by
+        compression may hold the continuation content and should be preferred
+        by the WebUI and gateway for ``--resume`` and session loading.
+
+        If no descendant (including the starting session) has any messages,
+        the original ``session_id`` is returned unchanged.
 
         The chain is always walked via the child whose ``started_at`` is
         latest; that matches the single-chain shape that compression creates.
@@ -3149,48 +3294,49 @@ class SessionDB:
             session_id = tip
 
         with self._lock:
-            # If this session already has messages, nothing to redirect.
-            try:
-                row = self._conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone()
-            except Exception:
-                return session_id
-            if row is not None:
-                return session_id
-
-            # Walk descendants: at each step, pick the most-recently-started
-                # child session; stop once we find one with messages.
             current = session_id
             seen = {current}
+            best = None  # tracks the last (deepest) node with messages
+
             for _ in range(32):
+                # Check if the current node has messages.
+                try:
+                    row = self._conn.execute(
+                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                except Exception:
+                    return session_id
+                if row is not None:
+                    best = current
+
+                # Walk to the most-recently-started child — but skip explicit
+                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
+                # and tool children. They also carry a ``parent_session_id`` yet
+                # are NOT compression continuations; following them would hijack
+                # the resume target to an unrelated session (e.g. a subagent
+                # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
                         "SELECT id FROM sessions "
                         "WHERE parent_session_id = ? "
+                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(source, '') != 'tool' "
                         "ORDER BY started_at DESC, id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:
                     return session_id
                 if child_row is None:
-                    return session_id
+                    break
                 child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
                 if not child_id or child_id in seen:
-                    return session_id
+                    break
                 seen.add(child_id)
-                try:
-                    msg_row = self._conn.execute(
-                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                        (child_id,),
-                    ).fetchone()
-                except Exception:
-                    return session_id
-                if msg_row is not None:
-                    return child_id
                 current = child_id
-        return session_id
+
+            return best if best is not None else session_id
 
     def get_messages_as_conversation(
         self,
