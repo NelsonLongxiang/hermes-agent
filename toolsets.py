@@ -33,8 +33,6 @@ _HERMES_CORE_TOOLS = [
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
-    # Claude Code session management
-    "claude_session",
     # Read the desktop GUI's embedded terminal pane, and close an agent's
     # read-only terminal tab (both gated on HERMES_DESKTOP via check_fn —
     # hidden outside the GUI).
@@ -165,12 +163,6 @@ TOOLSETS = {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
         "includes": []
-    },
-
-    "claude_session": {
-        "description": "Claude Code session management — intelligent tmux-based control with state awareness",
-        "tools": ["claude_session"],
-        "includes": ["terminal"]
     },
 
     "moa": {
