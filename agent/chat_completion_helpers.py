@@ -3006,6 +3006,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
+    elif _stale_from_provider_config:
+        # Explicit provider/model configuration is authoritative. Context
+        # scaling is a safety floor for implicit defaults only; overriding an
+        # operator-selected timeout can multiply one wedged request across
+        # every outer retry.
+        _stream_stale_timeout = _stream_stale_timeout_base
     else:
         # Scale the stale timeout for large contexts: slow models (like Opus)
         # can legitimately think for minutes before producing the first token

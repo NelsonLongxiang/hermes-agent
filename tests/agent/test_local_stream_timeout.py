@@ -169,6 +169,9 @@ class TestStreamingStaleTimeoutLocalBypass:
         if not _stale_from_provider_config and base_url and is_local_endpoint(base_url):
             return float("inf")
 
+        if _stale_from_provider_config:
+            return _stream_stale_timeout_base
+
         if est_tokens > 100_000:
             return max(_stream_stale_timeout_base, 300.0)
         elif est_tokens > 50_000:
@@ -217,6 +220,16 @@ class TestStreamingStaleTimeoutLocalBypass:
             "http://localhost:8317/v1",
             env_stale="300",
             provider_config_stale=120.0,
+        )
+        assert timeout == 120.0
+
+    @pytest.mark.parametrize("est_tokens", [68_000, 120_000])
+    def test_provider_config_remote_is_not_context_scaled(self, est_tokens):
+        """Explicit provider timeout remains authoritative for large contexts."""
+        timeout = self._resolve_streaming_stale_timeout(
+            "https://api.openai.com",
+            provider_config_stale=120.0,
+            est_tokens=est_tokens,
         )
         assert timeout == 120.0
 
