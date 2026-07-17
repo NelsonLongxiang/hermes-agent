@@ -177,9 +177,8 @@ class TestFeishuFallbackThreadRouting:
     """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
 
     @pytest.mark.asyncio
-    async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+    async def test_thread_send_without_reply_anchor_fails_closed(self):
+        """A topic send without a valid om_ reply anchor must fail closed."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -215,29 +214,9 @@ class TestFeishuFallbackThreadRouting:
             metadata={"thread_id": "omt_topic_abc"},
         )
 
-        # Verify message.create was called (not message.reply)
-        mock_client.im.v1.message.create.assert_called_once()
-
-        # The request should have receive_id_type="thread_id"
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
-        # The contributor's branch had the lark SDK installed, the test environment
-        # may not — handle both shapes.
-        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
-        assert body is not None, "request has neither .body nor .request_body"
-        # receive_id should be the thread_id, not the chat_id
-        receive_id = getattr(body, "receive_id", None)
-        if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "omt_topic_abc", (
-            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
-        )
-        # And receive_id_type must be 'thread_id', not 'chat_id'
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "thread_id", (
-            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
-        )
+        assert result.success is False
+        assert "no message_id available" in result.error
+        mock_client.im.v1.message.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_uses_chat_id_when_no_thread(self):

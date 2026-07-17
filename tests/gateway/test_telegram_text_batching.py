@@ -38,6 +38,10 @@ def _make_adapter():
     adapter._media_group_tasks = {}
     adapter._polling_error_task = None
     adapter._polling_heartbeat_task = None
+    adapter._background_tasks = set()
+    adapter._expected_cancelled_tasks = set()
+    adapter._session_tasks = {}
+    adapter._text_debounce = {}
     adapter._app = None
     adapter._bot = None
     adapter._set_status_indicator = AsyncMock()
