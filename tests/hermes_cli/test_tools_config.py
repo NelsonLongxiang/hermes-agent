@@ -186,8 +186,17 @@ def test_get_platform_tools_context_engine_respects_explicit_empty_selection():
     assert "context_engine" not in enabled
 
 
-def test_get_platform_tools_default_telegram_includes_messaging():
+def test_get_platform_tools_default_telegram_excludes_messaging():
     enabled = _get_platform_tools({}, "telegram")
+
+    assert "messaging" not in enabled
+
+
+def test_get_platform_tools_explicit_telegram_includes_messaging():
+    enabled = _get_platform_tools(
+        {"platform_toolsets": {"telegram": ["messaging"]}},
+        "telegram",
+    )
 
     assert "messaging" in enabled
 
