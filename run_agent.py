@@ -121,38 +121,8 @@ from agent.vision_message_prep import VisionMessagePrepMixin
 from agent.reasoning_params import ReasoningParamsMixin
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.session_activity import ActivityProvenance
-from agent.model_metadata import (
-    estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
-    is_local_endpoint,
-)
-from agent.usage_pricing import normalize_usage
-# Re-exported for tests that monkeypatch these symbols on run_agent.
-from agent.context_compressor import (  # noqa: F401
-    COMPRESSED_SUMMARY_METADATA_KEY,
-    ContextCompressor,
-)
-from agent.retry_utils import jittered_backoff  # noqa: F401
-from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
-    DEFAULT_AGENT_IDENTITY,
-    build_skills_system_prompt,
-    build_context_files_prompt,
-    build_environment_hints,
-    load_soul_md,
-    load_action_md,
-)
-from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
-from agent.message_sanitization import (  # noqa: F401
-    _SURROGATE_RE,
-    _sanitize_surrogates,
-    _sanitize_structure_surrogates,
-    _sanitize_messages_surrogates,
-    _escape_invalid_chars_in_json_strings,
-    _repair_tool_call_arguments,
-    _strip_non_ascii,
-    _sanitize_messages_non_ascii,
-    _sanitize_tools_non_ascii,
-    _strip_images_from_messages,
-    _sanitize_structure_non_ascii,
+from agent.model_metadata import is_local_endpoint
+from agent.message_sanitization import (
     coalesce_tool_call_id as _sanitize_coalesce_tool_call_id,
     deterministic_call_id as _codex_deterministic_call_id,
     uniquify_tool_call_ids as _sanitize_uniquify_tool_call_ids,

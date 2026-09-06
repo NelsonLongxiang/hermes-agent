@@ -111,7 +111,9 @@ class TestFeishuFallbackThreadRouting:
 
     @pytest.mark.asyncio
     async def test_thread_send_without_reply_anchor_fails_closed(self):
-        """A topic send without a valid om_ reply anchor must fail closed."""
+        """FORK (topic-mode): a topic send without a valid om_ reply anchor
+        must fail closed — never fall back to chat-level create, which would
+        leak the message out of the topic."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -147,6 +149,8 @@ class TestFeishuFallbackThreadRouting:
             metadata={"thread_id": "omt_topic_abc"},
         )
 
+        # FORK behavior: without an om_ anchor the send fails closed and
+        # message.create is never reached (no chat-level fallback).
         assert result.success is False
         assert "no message_id available" in result.error
         mock_client.im.v1.message.create.assert_not_called()

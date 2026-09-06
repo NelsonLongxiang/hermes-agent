@@ -22,17 +22,6 @@ logger = logging.getLogger(__name__)
 
 _BYTES_TO_MB = 1024 * 1024
 
-# RSS guardrails — enabled via environment variables (default: disabled).
-# Soft limit: trigger gc.collect() when exceeded.
-# Hard limit: os._exit(137) to let the service manager restart the process
-# before the kernel OOM killer strikes indiscriminately.
-_RSS_SOFT_LIMIT_MB: Optional[int] = (
-    int(v) if (v := os.getenv("HERMES_RSS_LIMIT_MB", "0").strip()).isdigit() and int(v) > 0 else None
-)
-_RSS_HARD_LIMIT_MB: Optional[int] = (
-    int(v) if (v := os.getenv("HERMES_RSS_HARD_LIMIT_MB", "0").strip()).isdigit() and int(v) > 0 else None
-)
-
 _monitor_thread: Optional[threading.Thread] = None
 _stop_event: Optional[threading.Event] = None
 _start_time: Optional[float] = None
@@ -56,36 +45,6 @@ def _get_rss_mb() -> Optional[int]:
         return None
 
 
-def _get_current_rss_mb() -> Optional[int]:
-    """Return the *current* RSS in MB (not the high-water mark).
-
-    Used for limit enforcement where accuracy matters — ``ru_maxrss``
-    never decreases within a process lifetime, so it would trigger
-    false-positive kills after a transient spike.
-    """
-    # On Linux, /proc/self/status has VmRSS which is the actual current RSS.
-    if sys.platform == "linux":
-        try:
-            with open("/proc/self/status", "r") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        # "VmRSS:    123456 kB"
-                        kb = int(line.split()[1])
-                        return int(kb / 1024)
-        except Exception:
-            pass
-    # Fallback: psutil gives current RSS on all platforms.
-    try:
-        import psutil  # type: ignore
-
-        rss = psutil.Process(os.getpid()).memory_info().rss
-        return int(rss / _BYTES_TO_MB)
-    except Exception:
-        pass
-    # Last resort: ru_maxrss (high-water mark, less accurate for limits).
-    return _get_rss_mb()
-
-
 def log_memory_usage(prefix: str = "") -> None:
     """Log ``[MEMORY] [<prefix> ]rss=... gc=... threads=... uptime=...``; safe from any thread."""
     rss = _get_rss_mb()
@@ -96,39 +55,12 @@ def log_memory_usage(prefix: str = "") -> None:
     )
 
 
-def _check_rss_limits() -> None:
-    """Check RSS against soft/hard limits and act if exceeded.
-
-    Called from the monitor thread.  Soft limit triggers ``gc.collect()``;
-    hard limit calls ``os._exit(137)`` (mimics OOM-kill so service managers
-    treat it as a crash and restart the gateway).
-    """
-    rss = _get_current_rss_mb()
-    if rss is None:
-        return
-    if _RSS_SOFT_LIMIT_MB and rss > _RSS_SOFT_LIMIT_MB:
-        logger.warning(
-            "[MEMORY] RSS %dMB exceeds soft limit %dMB — triggering gc",
-            rss, _RSS_SOFT_LIMIT_MB,
-        )
-        gc.collect()
-    if _RSS_HARD_LIMIT_MB and rss > _RSS_HARD_LIMIT_MB:
-        log_memory_usage(prefix="oom-guard")
-        logger.error(
-            "[MEMORY] RSS %dMB exceeds hard limit %dMB — exiting to prevent OOM kill",
-            rss, _RSS_HARD_LIMIT_MB,
-        )
-        os._exit(137)  # 128+9 = SIGKILL exit code
-
-
 def _monitor_loop(stop_event: threading.Event, interval: float) -> None:
     """Background thread body — log every ``interval`` seconds until stopped."""
     while not stop_event.wait(interval):
         try:
             log_memory_usage()
-            _check_rss_limits()
-        except Exception as e:
-            # Never let the monitor crash the gateway; just log and carry on.
+        except Exception as e:  # never let the monitor crash the gateway
             logger.debug("Memory monitor iteration failed: %s", e)
 
 
@@ -153,13 +85,7 @@ def start_memory_monitoring(interval_seconds: float = 300.0) -> bool:
             target=_monitor_loop, args=(_stop_event, float(interval_seconds)), name="gateway-memory-monitor", daemon=True
         )
         _monitor_thread.start()
-
-        logger.info(
-            "[MEMORY] Periodic memory monitoring started (interval: %ds, soft_limit=%sMB, hard_limit=%sMB)",
-            int(interval_seconds),
-            _RSS_SOFT_LIMIT_MB or "off",
-            _RSS_HARD_LIMIT_MB or "off",
-        )
+        logger.info("[MEMORY] Periodic memory monitoring started (interval: %ds)", int(interval_seconds))
         return True
 
 

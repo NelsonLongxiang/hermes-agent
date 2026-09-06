@@ -392,19 +392,6 @@ def _platform_hint(agent: Any) -> str:
             _default_hint = (_entry and _entry.platform_hint) or ""
         except Exception:
             pass
-    if platform_key == "telegram" and _default_hint:
-        # LOCAL: append AML syntax hints only if the AML CLI is available.
-        try:
-            from gateway.aml_renderer import _check_aml_cli
-            if _check_aml_cli():
-                _default_hint += (
-                    "\n\nAML markup is available. Use AML tags to render rich "
-                    "content: <b>bold</b>, <i>italic</i>, <code>code</code>, "
-                    "<pre>block</pre>, <a href=\"url\">link</a>. "
-                    "Prefer AML over markdown for structured output."
-                )
-        except Exception:
-            pass
     if platform_key == "telegram" and _default_hint and _telegram_rich_messages_enabled():
         _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
     _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
@@ -500,23 +487,10 @@ def _memory_parts(agent: Any) -> List[str]:
 def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool]:
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
-    Returns ``(parts, soul_loaded)``.
-    LOCAL: also loads ACTION.md — interaction-behavior layer immediately after
-    identity (upstream has no ACTION.md slot)."""
+    Returns ``(parts, soul_loaded)``."""
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
-    parts: List[str] = []
-    soul_loaded = False
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
-    if _soul_content:
-        parts.append(_soul_content)
-        soul_loaded = True
-    else:
-        parts.append(DEFAULT_AGENT_IDENTITY)
-    if wants_soul:
-        _action_content = _pb.load_action_md(home_override=_agent_home(agent))
-        if _action_content:
-            parts.append(_action_content)
-    return parts, soul_loaded
+    return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 
 def _guidance_parts(agent: Any) -> List[str]:
@@ -658,35 +632,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     volatile_parts.append(_timestamp_line(agent))
-    # LOCAL: pending skill creates from background review — ask user to confirm.
-    # Read once at build time; the prompt stays byte-stable for the session.
-    try:
-        _pending_path = get_hermes_home() / "pending_skill_creates.jsonl"
-        if _pending_path.exists():
-            import json as _json
-            _lines = _pending_path.read_text(encoding="utf-8").strip().splitlines()
-            if _lines:
-                _names = []
-                _valid_lines = []
-                for _line in _lines:
-                    try:
-                        _entry = _json.loads(_line)
-                        _names.append(_entry.get("name", "?"))
-                        _valid_lines.append(_line)
-                    except Exception:
-                        pass
-                if _names:
-                    volatile_parts.append(
-                        "⚠️ Pending skill creates from background review awaiting your confirmation:\n"
-                        + "\n".join(f"  - {n}" for n in _names)
-                        + "\nAsk the user if they want to approve or reject these. "
-                        "If approved, use skill_manage(action='create') for each. "
-                        "Then delete ~/.hermes/pending_skill_creates.jsonl."
-                    )
-                    # Rewrite file with only valid entries (cleanup corrupt lines)
-                    _pending_path.write_text("\n".join(_valid_lines) + "\n", encoding="utf-8")
-    except Exception:
-        pass
     return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
 
 

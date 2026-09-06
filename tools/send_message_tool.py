@@ -17,7 +17,7 @@ from tools.send_message_senders import (
     _adapter_media_method, _error, _live_adapter, _media_caption_split, _plugin_standalone_sender,
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
-from tools.registry import registry, tool_error
+from tools.registry import tool_error
 
 # NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
 # (the agent must not fire cross-platform messages on its own); cron delivery, the
@@ -98,19 +98,6 @@ def _handle_react(args, remove=False):
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
-def _sanitize_mentions(raw):
-    """Validate [[open_id, name], ...] mention pairs; returns the clean list.
-    LOCAL (Feishu group sends): invalid entries are collected for an error hint."""
-    if not isinstance(raw, list):
-        return []
-    safe = []
-    for entry in raw:
-        if (isinstance(entry, (list, tuple)) and len(entry) == 2
-                and all(isinstance(x, str) and x.strip() for x in entry)):
-            safe.append([entry[0].strip(), entry[1].strip()])
-    return safe
-
-
 def _handle_send(args):
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
@@ -153,14 +140,8 @@ def _handle_send(args):
         from model_tools import _run_async
         # Only custom plugin handlers receive the complete typed request.
         handler_args = {"args": args} if entry is not None and entry.send_message_handler is not None else {}
-        # LOCAL: Feishu/Lark requires validated mentions ([[open_id, name], ...]).
-        # Kwarg only forwarded when non-empty so plugin senders without the
-        # parameter keep working.
-        _safe_mentions = _sanitize_mentions(args.get("mentions") or [])
-        _mention_kwargs = {"mentions": _safe_mentions} if _safe_mentions else {}
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
-                                              **_mention_kwargs,
                                               **handler_args))
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
@@ -488,7 +469,7 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, mentions=None, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -561,18 +542,7 @@ SEND_MESSAGE_SCHEMA = {
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
         "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first.\n\n"
-        "CRITICAL — when to use vs when NOT to use:\n"
-        "- DO use this tool: for cron job output, background script results, proactive "
-        "notifications, or any scenario where the AI is pushing content to a destination "
-        "OUTSIDE the current conversation.\n"
-        "- DO NOT use this tool to send files/media to the user in an active chat. "
-        "Instead, output MEDIA:/path/to/file directly in your text response — the "
-        "platform gateway handles delivery automatically. Using send_message for this "
-        "causes target resolution failures and duplicate sends.\n\n"
-        "FEISHU/LARK @-MENTION: When sending to Feishu/Lark, the 'mentions' parameter is REQUIRED. "
-        "Each entry is [open_id, display_name]. The tool prepends <at> tags automatically. "
-        "Without 'mentions', the call will be rejected with an error asking you to retry with the parameter."
+        "to the home channel without listing first."
     ),
     "parameters": {
         "type": "object",
@@ -589,16 +559,6 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
-            },
-            "mentions": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 2,
-                    "maxItems": 2
-                },
-                "description": "Feishu/Lark REQUIRED. Users to @-mention in group chats. Each entry is [open_id, display_name], e.g. [['ou_abc123', '张三'], ['ou_def456', '李四']]. Ignored on other platforms."
             },
             "emoji": {
                 "type": "string",
@@ -628,35 +588,3 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
-
-def _check_send_message():
-    """Gate send_message on gateway running (messaging platforms always pass).
-
-    Kanban workers pass via ``HERMES_KANBAN_TASK`` (their profile HOME has no
-    ``gateway.pid`` even though the parent gateway is alive). Kept from the
-    pre-merge fork alongside the LOCAL OVERRIDE registration below.
-    """
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return True
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-    if platform and platform != "local":
-        return True
-    try:
-        from gateway.status import is_gateway_running
-        return is_gateway_running()
-    except Exception:
-        return False
-
-
-# LOCAL OVERRIDE: re-expose send_message as an agent-callable tool in the
-# standalone "messaging" toolset (not in _HERMES_CORE_TOOLS). Kept from the
-# pre-merge fork; upstream deliberately removed agent-callable registration.
-registry.register(
-    name="send_message",
-    toolset="messaging",
-    schema=SEND_MESSAGE_SCHEMA,
-    handler=send_message_tool,
-    check_fn=_check_send_message,
-    emoji="📨",
-)
