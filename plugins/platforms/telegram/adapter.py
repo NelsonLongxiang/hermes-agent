@@ -3,15 +3,10 @@
 import asyncio
 import contextlib
 import dataclasses
-import functools
-import faulthandler
 import inspect
 import json
 import logging
 import os
-import tempfile
-import time
-
 import html as _html
 import re
 import time
@@ -139,8 +134,6 @@ except ImportError:
     class _MockContextTypes:
         DEFAULT_TYPE = Any
     ContextTypes = _MockContextTypes
-
-from gateway.aml_renderer import is_aml_content, render_aml_telegram
 
 import sys
 from pathlib import Path as _Path
@@ -294,59 +287,8 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 from gateway.platforms.helpers import (
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables)
 
-from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE,
-    convert_table_to_bullets as _wrap_markdown_tables,
-)
-
-
-class _BotConcurrencyLimiter:
-    """Transparent proxy that wraps a Bot, applying a semaphore to all async API calls.
-
-    Prevents the httpx connection pool from being overwhelmed by unbounded
-    concurrent TG API calls.  Zero changes required at existing ``self._bot.*``
-    call sites — the proxy intercepts attribute access and wraps async
-    callables automatically.
-    """
-
-    __slots__ = ("_lim_wrapped", "_lim_semaphore", "_lim_cache")
-
-    def __init__(self, bot: Any, semaphore: asyncio.Semaphore) -> None:
-        object.__setattr__(self, "_lim_wrapped", bot)
-        object.__setattr__(self, "_lim_semaphore", semaphore)
-        object.__setattr__(self, "_lim_cache", {})
-
-    def __getattr__(self, name: str) -> Any:
-        cache = object.__getattribute__(self, "_lim_cache")
-        if name in cache:
-            return cache[name]
-        attr = getattr(object.__getattribute__(self, "_lim_wrapped"), name)
-        if callable(attr) and asyncio.iscoroutinefunction(attr):
-            sem = object.__getattribute__(self, "_lim_semaphore")
-
-            @functools.wraps(attr)
-            async def _wrapper(*args: Any, **kwargs: Any) -> Any:
-                async with sem:
-                    return await attr(*args, **kwargs)
-
-            cache[name] = _wrapper
-            return _wrapper
-        return attr
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        setattr(object.__getattribute__(self, "_lim_wrapped"), name, value)
-
-    def __repr__(self) -> str:
-        return f"_BotConcurrencyLimiter({object.__getattribute__(self, '_lim_wrapped')!r})"
-# ---------------------------------------------------------------------------
-# Rich-message newline normalization
-# ---------------------------------------------------------------------------
-
-# Matches a protected region whose internal newlines must stay bare in the
-# rich-message path: a fenced code block (```...```) OR a GFM pipe-table block
-# (a header row, a delimiter row of dashes/pipes, then any pipe data rows).
-# Telegram renders both natively, so injecting Markdown hard breaks inside them
-# would corrupt the code block / table.
+# Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
+# fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
 _RICH_PROTECTED_REGION_RE = re.compile(
     r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
     r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
@@ -558,61 +500,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}  # topic_name -> message_thread_id
         self._forum_command_registered: set[int] = set()  # forum chats with commands registered
         self._forum_lock = asyncio.Lock()
-        # Concurrency limiter for outgoing TG API calls — prevents the httpx
-        # connection pool from being overwhelmed by unbounded parallel sends.
-        _raw_conc = os.getenv("HERMES_TELEGRAM_API_CONCURRENCY", "").strip()
-        _conc = int(_raw_conc) if _raw_conc.isdigit() and int(_raw_conc) > 0 else 32
-        self._api_semaphore = asyncio.Semaphore(_conc)
-        # Pool health tracking — incremented on any send failure, reset on success.
-        self._consecutive_pool_timeouts: int = 0
-        self._last_pool_drain_time: float = 0.0  # monotonic; cooldown guard
-        self._request_pool_config: Optional[Dict[str, Any]] = None  # for pool replacement
-        # Status indicator: opt-in via extra.status_indicator
-        self._status_indicator_enabled: bool = bool(
-            self.config.extra.get("status_indicator", False)
-        )
-        self._status_online_text: str = str(
-            self.config.extra.get("status_online", "Online")
-        )
-        self._status_offline_text: str = str(
-            self.config.extra.get("status_offline", "Offline")
-        )
-        # DM Topics config from extra.dm_topics
-        self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
-        # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
-        self._dm_topic_chat_ids: Set[str] = {
-            str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
-        }
-        # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
-        # locally-hosted telegram-bot-api server (configured via extra.base_url)
-        # raises that to 2GB, so the presence of base_url is the opt-in.
-        self._max_doc_bytes: int = (
-            2 * 1024 * 1024 * 1024
-            if self.config.extra.get("base_url")
-            else 20 * 1024 * 1024
-        )
-        # Interactive model picker state per chat
-        self._model_picker_state: Dict[str, dict] = {}
-        self._choice_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
-        self._approval_ts: Dict[int, float] = {}  # TTL tracking
-        # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
-        # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
-        self._slash_confirm_state: Dict[str, str] = {}
-        self._slash_confirm_ts: Dict[str, float] = {}  # TTL tracking
-        # Clarify button state: clarify_id → session_key (for the clarify tool's
-        # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
-        self._clarify_state: Dict[str, str] = {}
-        self._clarify_ts: Dict[str, float] = {}  # TTL tracking
-        # Notification mode for message sends.
-        # "important" — only final responses, approvals, and slash confirmations
-        #               trigger notifications; tool progress, streaming, status
-        #               messages are delivered silently via disable_notification.
-        #               This is the default — Telegram users found per-tool-call
-        #               push notifications too noisy.
-        # "all"       — every message triggers a push notification (legacy
-        #               behavior; opt-in via display.platforms.telegram.notifications).
         # Status indicator: bot short description "Online"/"Offline" on connect/clean disconnect. Off by
         # default because it mutates the GLOBAL profile; opt in via extra.status_indicator.
         self._status_indicator_enabled: bool = bool(extra.get("status_indicator", False))
@@ -711,113 +598,6 @@ class TelegramAdapter(BasePlatformAdapter):
         """True once teardown/fatal started: delayed flushes must not dispatch onto a torn-down session.
         Callers must NOT destroy the event (PTB already advanced the offset) — hold and redispatch."""
         return bool(getattr(self, "_drop_delayed_deliveries", False))
-
-    def _kill_zombie_gateway_processes(self) -> None:
-        """Kill leftover gateway processes that ``--replace`` missed.
-
-        Best-effort: scans for PIDs matching ``hermes gateway run`` **with
-        the same ``--profile`` argument** and sends SIGTERM to any that
-        aren't us.  Different profiles may run concurrently (different bot
-        tokens), so only same-profile zombies are killed.
-        """
-        import signal as _signal
-        import subprocess as _subprocess
-
-        _MUST_CONTAIN = ("hermes", "gateway", "run")
-        # Extract our profile name from argv / cmdline to scope kills.
-        my_pid = os.getpid()
-        my_cmdline = ""
-        try:
-            my_cmdline = _Path(f"/proc/{my_pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
-        except (FileNotFoundError, PermissionError, OSError):
-            pass
-        _my_profile = self._extract_profile_from_cmdline(my_cmdline)
-        try:
-            result = _subprocess.run(
-                ["pgrep", "-f", "hermes"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-                try:
-                    pid = int(line.strip())
-                except ValueError:
-                    continue
-                if pid == my_pid:
-                    continue
-                # Verify cmdline contains all required tokens to avoid false positives.
-                try:
-                    cmdline = _Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
-                except (FileNotFoundError, PermissionError, OSError):
-                    continue
-                if not all(tok in cmdline for tok in _MUST_CONTAIN):
-                    continue
-                # Only kill processes with the same --profile.
-                their_profile = self._extract_profile_from_cmdline(cmdline)
-                if _my_profile is not None and their_profile != _my_profile:
-                    logger.debug(
-                        "[%s] Skipping PID %d (different profile: %s vs %s)",
-                        self.name, pid, their_profile, _my_profile,
-                    )
-                    continue
-                logger.warning(
-                    "[%s] Killing zombie gateway process PID %d",
-                    self.name, pid,
-                )
-                try:
-                    os.kill(pid, _signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-        except Exception:
-            pass  # Best effort
-
-    @staticmethod
-    def _extract_profile_from_cmdline(cmdline: str):
-        """Extract the --profile value from a command line string."""
-        if not cmdline:
-            return None
-        parts = cmdline.replace('\x00', ' ').split()
-        for i, part in enumerate(parts):
-            if part == "--profile" and i + 1 < len(parts):
-                return parts[i + 1]
-            if part.startswith("--profile="):
-                return part.split("=", 1)[1]
-            if part == "-p" and i + 1 < len(parts):
-                return parts[i + 1]
-        return None
-
-    def _notification_kwargs(
-        self, metadata: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Return disable_notification kwargs when the adapter is in silent mode.
-
-        The disconnect drop-guard (#55971) correctly prevents dispatch into a torn-down session. Destroying
-        the event is wrong: by the time we reach enqueue/flush, python-telegram-bot has already acked the
-        update and advanced the offset — silent permanent loss, no log, no error.
-        """
-        if self._is_permanent_fatal():
-            logger.warning(
-                "[Telegram] Discarding inbound under non-retryable fatal (%s, %d chars)", where, len(getattr(event, "text", None) or ""))
-            return
-        held = getattr(self, "_held_inbound_events", None)
-        if held is None:
-            self._held_inbound_events = held = []
-        if any(existing is event for existing in held):
-            return
-        max_n = int(getattr(self, "HELD_INBOUND_MAX", 64) or 64)
-        while len(held) >= max_n:
-            dropped = held.pop(0)
-            logger.warning(
-                "[Telegram] Held-inbound queue full (%d); dropping oldest (%d chars)", max_n, len(getattr(dropped, "text", None) or ""))
-        held.append(event)
-        logger.warning(
-            "[Telegram] Holding inbound (%s, %d chars, queue=%d)%s", where, len(getattr(event, "text", None) or ""), len(held),
-            " - will redispatch on reconnect" if self._should_drop_delayed_delivery() else (" - scheduling redispatch" if schedule else ""))
-        # A live-path hold must not orphan the event waiting for a reconnect that never comes.
-        if schedule and not self._should_drop_delayed_delivery():
-            self._schedule_held_inbound_redispatch()
-
 
     def _schedule_held_inbound_redispatch(self) -> None:
         """Ensure a tracked drain runs when held events exist and delivery is live (no-op while
@@ -1796,53 +1576,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_accepting = False
         self._send_path_degraded = True
 
-    async def _drain_request_connections(self) -> None:
-        """Replace the httpx connection pool used for general API requests.
-
-        Creates a **new** ``HTTPXRequest`` instance and swaps it into
-        ``Bot._request[1]``, then shuts down the old pool.  This is more
-        effective than in-place ``shutdown()+initialize()`` because the old
-        pool's internal buffers, TLS state, and connection objects become
-        unreferenced and eligible for garbage collection.
-        """
-        if not (self._app and self._app.bot):
-            return
-        try:
-            real_bot = self._app.bot
-            old_req = real_bot._request[1]  # general request pool
-        except Exception:
-            return
-        pool_cfg = self._request_pool_config
-        if pool_cfg is None:
-            return
-        try:
-            new_req = HTTPXRequest(**pool_cfg)
-            await new_req.initialize()
-            real_bot._request[1] = new_req
-        except Exception:
-            logger.debug(
-                "[%s] Pool replacement failed, falling back to in-place drain",
-                self.name, exc_info=True,
-            )
-            try:
-                await old_req.shutdown()
-                await old_req.initialize()
-            except Exception:
-                logger.debug(
-                    "[%s] In-place drain also failed",
-                    self.name, exc_info=True,
-                )
-            return
-        # Old pool — best-effort shutdown; don't block on it.
-        try:
-            await old_req.shutdown()
-        except Exception:
-            pass
-        logger.info(
-            "[%s] Request pool fully replaced (old pool discarded) after %d consecutive failures",
-            self.name, self._consecutive_pool_timeouts,
-        )
-
     def _begin_polling_generation(self) -> tuple[int, asyncio.Event]:
         """Start accepting progress for a new getUpdates polling generation."""
         if self._teardown_started:
@@ -2014,88 +1747,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_error_task = loop.create_task(coro)
         self._background_tasks.add(self._polling_error_task)
         self._polling_error_task.add_done_callback(self._background_tasks.discard)
-
-    async def _pool_health_monitor(self) -> None:
-        """Background task that monitors TG request pool health.
-
-        Periodically checks ``_consecutive_pool_timeouts`` and triggers
-        :meth:`_drain_request_connections` when the count exceeds the
-        threshold, clearing stale httpcore connections that ``is_closed()``
-        and ``has_expired()`` fail to reclaim.
-
-        The counter is reset *before* the drain so that failures caused
-        by the drain itself (``ClosedResourceError`` / ``not initialized``)
-        don't immediately re-trigger a second drain.  A minimum cooldown
-        of 120 s between drains prevents the drain cycle from becoming a
-        self-sustaining failure loop.
-        """
-        import time as _time
-
-        POOL_DRAIN_THRESHOLD = 5
-        CHECK_INTERVAL = 30
-        DRAIN_COOLDOWN = 120  # seconds between drains
-
-        while not self.has_fatal_error:
-            try:
-                await asyncio.wait_for(asyncio.Event().wait(), timeout=CHECK_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-            if self._consecutive_pool_timeouts < POOL_DRAIN_THRESHOLD:
-                continue
-            now = _time.monotonic()
-            if now - self._last_pool_drain_time < DRAIN_COOLDOWN:
-                continue
-            count = self._consecutive_pool_timeouts
-            # Reset BEFORE draining so drain-induced failures don't
-            # immediately re-trigger.
-            self._consecutive_pool_timeouts = 0
-            self._last_pool_drain_time = now
-            logger.warning(
-                "[%s] Request pool saturated (%d consecutive send failures), auto-draining",
-                self.name, count,
-            )
-            await self._drain_request_connections()
-
-    async def _periodic_state_cleanup(self) -> None:
-        """Evict stale entries from interactive state dictionaries.
-
-        Approval, clarify, and slash-confirm state entries are normally
-        cleared on user callback, but if the user never responds the entry
-        stays forever.  This task sweeps every 5 minutes and removes any
-        entry older than 30 minutes.
-        """
-        import time as _time
-
-        MAX_AGE = 1800  # 30 minutes
-        SWEEP_INTERVAL = 300  # 5 minutes
-
-        while not self.has_fatal_error:
-            try:
-                await asyncio.wait_for(asyncio.Event().wait(), timeout=SWEEP_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-            now = _time.monotonic()
-            total_evicted = 0
-            for state_dict, ts_dict in [
-                (self._approval_state, self._approval_ts),
-                (self._clarify_state, self._clarify_ts),
-                (self._slash_confirm_state, self._slash_confirm_ts),
-            ]:
-                stale = [k for k, t in ts_dict.items() if now - t > MAX_AGE]
-                for k in stale:
-                    state_dict.pop(k, None)
-                    ts_dict.pop(k, None)
-                total_evicted += len(stale)
-            if total_evicted:
-                logger.debug(
-                    "[%s] State cleanup: evicted %d stale interactive entries",
-                    self.name, total_evicted,
-                )
-            # Also cap status_message_ids to prevent unbounded growth
-            if len(self._status_message_ids) > 200:
-                oldest_keys = list(self._status_message_ids.keys())[:50]
-                for k in oldest_keys:
-                    self._status_message_ids.pop(k, None)
 
     def _recovery_in_flight(self) -> bool:
         return bool(self._polling_error_task and not self._polling_error_task.done())
@@ -2343,17 +1994,8 @@ class TelegramAdapter(BasePlatformAdapter):
         stuck_task_since = 0.0
         while True:
             try:
-                # Use the loop timer directly instead of asyncio.sleep().
-                # Retry tests replace asyncio.sleep with an instant AsyncMock;
-                # sharing that patched primitive made this lifetime task
-                # busy-spin and starve the reconnect coroutine it monitors.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.Event().wait(), timeout=HEARTBEAT_INTERVAL
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                if getattr(self, "_polling_teardown_started", False):
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if self._teardown_started or self.has_fatal_error:
                     return
                 # A recovery task hung on an unbounded await gates every other recovery path forever
                 # (alive but deaf): force retryable-fatal so the reconnector rebuilds the adapter.
@@ -3142,12 +2784,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
             request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
-        # LOCAL: stash connection params for connect()'s _request_pool_config
-        # (pool-health-monitor full replacement — fork-only feature).
-        self._last_connection_params = {
-            "fallback_ips": list(fallback_ips), "proxy_url": proxy_url, "disable_fallback": disable_fallback,
-            "request_kwargs": dict(request_kwargs),
-        }
         return request, self._instrument_polling_request(get_updates_request)
 
     async def _initialize_app_with_retries(self, builder) -> None:
@@ -3204,9 +2840,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if rebuild_app and _attempt < _max_connect - 1:
                     old_app = self._app
                     self._app = builder.build()
-                    self._bot = _BotConcurrencyLimiter(self._app.bot, self._api_semaphore)  # LOCAL limiter parity
-                    self._wire_plugin_handlers(self._app)  # keep plugin + core + observer handlers in lockstep
-                    self._register_handlers(self._app)
+                    self._bot = self._app.bot
+                    self._register_handlers(self._app)  # keep core and observer handlers in lockstep
                     with contextlib.suppress(Exception):
                         await _shutdown_abandoned_app(old_app)
 
@@ -3292,14 +2927,6 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
-
-            # Kill any zombie gateway processes that --replace missed.
-            # Skip under pytest: the scan kills same-profile PIDs, and test
-            # runners share the profile with the live gateway.
-            if not os.environ.get("PYTEST_CURRENT_TEST"):
-                self._kill_zombie_gateway_processes()
-
-            # Build the application
             builder = Application.builder().token(self.config.token)
             custom_base_url = self.config.extra.get("base_url")
             if custom_base_url:
@@ -3314,19 +2941,7 @@ class TelegramAdapter(BasePlatformAdapter):
             request, get_updates_request = await self._build_ptb_requests()
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
-            # LOCAL: wrap the bot with the concurrency limiter (4-layer pool defense).
-            self._bot = _BotConcurrencyLimiter(self._app.bot, self._api_semaphore)
-            # LOCAL: stash pool config for the pool-health-monitor full replacement.
-            _cp = getattr(self, "_last_connection_params", None) or {}
-            _fb, _px, _df = _cp.get("fallback_ips") or [], _cp.get("proxy_url"), _cp.get("disable_fallback")
-            _rk = _cp.get("request_kwargs") or {}
-            if _fb and not _px and not _df:
-                self._request_pool_config = {
-                    **_rk, "httpx_kwargs": {"transport": TelegramFallbackTransport(_fb)}}
-            elif _px:
-                self._request_pool_config = {**_rk, "proxy": _px}
-            else:
-                self._request_pool_config = {**_rk}
+            self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
             self._register_handlers(self._app)
@@ -3348,16 +2963,6 @@ class TelegramAdapter(BasePlatformAdapter):
             # permanently stalled at "attempt 1/8" on the console — the logging illusion in #90835. Both
             # sides of the connect transition must share a terminal-visible level so a real hang is the
             # *absence* of this line, not ambiguity.
-
-            # Start pool health monitor for auto-recovery from connection pool saturation.
-            health_task = asyncio.ensure_future(self._pool_health_monitor())
-            self._background_tasks.add(health_task)
-            health_task.add_done_callback(self._background_tasks.discard)
-            # Start periodic state cleanup to evict stale interactive entries.
-            cleanup_task = asyncio.ensure_future(self._periodic_state_cleanup())
-            self._background_tasks.add(cleanup_task)
-            cleanup_task.add_done_callback(self._background_tasks.discard)
-            # Start the persistent heartbeat loop in polling mode. Webhook mode
             if not self._webhook_mode:
                 self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
             # Seed the live identity from PTB's initialize() cache; polling rides the heartbeat's get_me(),
@@ -3729,20 +3334,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         error_types = self._telegram_error_types()
         try:
-            # ── AML rendering path ──
-            if is_aml_content(content):
-                aml_result = await render_aml_telegram(content)
-                if aml_result is not None:
-                    return await self._send_aml(
-                        chat_id, aml_result, reply_to, metadata,
-                    )
-                # AML rendering failed — fall through to rich/MarkdownV2 path
-
-            # Bot API 10.1 rich fast-path: send the raw agent markdown via
-            # sendRichMessage so tables/task lists/etc. render natively. Falls
-            # through to the legacy MarkdownV2 path on permanent/capability
-            # errors or DM-topic routing skips; returns directly on success or
-            # on a transient failure (which must NOT be legacy-resent).
+            # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
+            # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
             if self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
@@ -3790,143 +3383,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=(self._looks_like_connect_timeout(e) or self._looks_like_pool_timeout(e) or not is_timeout),
                 error_kind=error_kind)
 
-    # ------------------------------------------------------------------
-    # AML helper methods
-    # ------------------------------------------------------------------
-
-    def _build_inline_keyboard(
-        self, aml_output: Dict[str, Any],
-    ) -> Optional[Any]:
-        """Build an InlineKeyboardMarkup from AML output, or None."""
-        keyboard_json = aml_output.get("keyboard")
-        if not keyboard_json or not isinstance(keyboard_json, dict):
-            return None
-        try:
-            rows = keyboard_json.get("inline_keyboard", [])
-            kb_rows = []
-            for row in rows:
-                kb_row = []
-                for btn in row:
-                    kb_row.append(InlineKeyboardButton(
-                        text=btn["text"],
-                        callback_data=btn.get("callback_data", ""),
-                    ))
-                kb_rows.append(kb_row)
-            return InlineKeyboardMarkup(kb_rows)
-        except Exception as exc:
-            logger.warning("[%s] Failed to build inline keyboard: %s", self.name, exc)
-            return None
-
-    async def _send_aml(
-        self,
-        chat_id: str,
-        aml_output: Dict[str, Any],
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send an AML-rendered message via Telegram HTML parse mode."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
-
-        text = aml_output.get("text", "")
-        if not text or not text.strip():
-            return SendResult(success=True, message_id=None)
-
-        reply_markup = self._build_inline_keyboard(aml_output)
-
-        thread_id = self._metadata_thread_id(metadata)
-        reply_to_id = int(reply_to) if reply_to else None
-        thread_kwargs = self._thread_kwargs_for_send(
-            chat_id,
-            thread_id,
-            metadata,
-            reply_to_message_id=reply_to_id,
-        )
-
-        try:
-            chunks = self.truncate_message(
-                text, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-
-            message_ids = []
-            for i, chunk in enumerate(chunks):
-                should_thread = (i == 0) if reply_to_id else False
-                rid = reply_to_id if should_thread else None
-
-                msg = None
-                for _attempt in range(2):
-                    try:
-                        msg = await self._bot.send_message(
-                            chat_id=int(chat_id),
-                            text=chunk,
-                            parse_mode=ParseMode.HTML,
-                            reply_to_message_id=rid,
-                            **thread_kwargs,
-                            **self._link_preview_kwargs(),
-                            **self._notification_kwargs(metadata),
-                        )
-                        break
-                    except Exception as send_err:
-                        if _attempt == 0 and "timed out" not in str(send_err).lower():
-                            await asyncio.sleep(1)
-                            continue
-                        raise
-                if msg:
-                    message_ids.append(str(msg.message_id))
-
-            return SendResult(
-                success=True,
-                message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids},
-            )
-
-        except Exception as e:
-            logger.error("[%s] Failed to send AML message: %s", self.name, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
-
-    async def _edit_aml_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        aml_output: Dict[str, Any],
-    ) -> SendResult:
-        """Edit an existing message to AML-rendered HTML (stream final edit)."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
-
-        text = aml_output.get("text", "")
-        if not text or not text.strip():
-            return SendResult(success=True, message_id=message_id)
-
-        reply_markup = self._build_inline_keyboard(aml_output)
-
-        try:
-            await self._bot.edit_message_text(
-                chat_id=int(chat_id),
-                message_id=int(message_id),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
-            return SendResult(success=True, message_id=message_id)
-        except Exception as e:
-            if "not modified" in str(e).lower():
-                return SendResult(success=True, message_id=message_id)
-            logger.warning("[%s] AML HTML edit failed, fallback to plain text: %s", self.name, e)
-            # Best-effort: send as plain text without parse_mode so the
-            # user sees something instead of raw AML markup.
-            try:
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=text,
-                )
-                return SendResult(success=True, message_id=message_id)
-            except Exception as fb_err:
-                if "not modified" in str(fb_err).lower():
-                    return SendResult(success=True, message_id=message_id)
-                logger.error("[%s] AML fallback edit also failed: %s", self.name, fb_err)
-                return SendResult(success=False, error=str(fb_err))
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
@@ -4021,43 +3477,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
-
-            # On final stream edit, re-render AML content as HTML.
-            try:
-                if is_aml_content(content):
-                    aml_result = await render_aml_telegram(content)
-                    if aml_result:
-                        return await self._edit_aml_message(
-                            chat_id, message_id, aml_result,
-                        )
-            except Exception as exc:
-                logger.debug("[%s] AML final-edit failed, fallback to MarkdownV2: %s", self.name, exc)
-
-            formatted = self.format_message(content)
-            try:
-                await self._bot.edit_message_text(
-                    chat_id=normalize_telegram_chat_id(chat_id),
-                    message_id=int(message_id),
-                    text=formatted,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                )
-            except Exception as fmt_err:
-                # "Message is not modified" is a no-op, not an error
-                if "not modified" in str(fmt_err).lower():
-                    return SendResult(success=True, message_id=message_id)
-                # Fallback: strip MarkdownV2 escapes and retry as clean plain text
-                safe_format_error = _redact_telegram_error_text(fmt_err)
-                logger.warning(
-                    "[%s] MarkdownV2 edit failed, falling back to plain text: %s",
-                    self.name,
-                    safe_format_error,
-                )
-                _plain = _strip_mdv2(content) if content else content
-                await self._bot.edit_message_text(
-                    chat_id=normalize_telegram_chat_id(chat_id),
-                    message_id=int(message_id),
-                    text=_plain,
-                )
+            await self._edit_markdown_or_plain(
+                chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
+                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
