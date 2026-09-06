@@ -3479,12 +3479,6 @@ class _StreamingCall:
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",
                 self.agent.base_url, self._stream_stale_timeout)
             return
-        # LOCAL FIX: an explicit provider/model stale_timeout_seconds is authoritative.
-        # Context scaling is a safety floor for implicit defaults only; overriding an
-        # operator-selected timeout can multiply one wedged request across every retry.
-        if get_provider_stale_timeout(self.agent.provider, self.agent.model) is not None:
-            self._stream_stale_timeout = base
-            return
         self._stream_stale_timeout = _cloud_stale_timeout(base, self.api_kwargs)
 
     def _partial_stream_stub(self):

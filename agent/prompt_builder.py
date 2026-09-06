@@ -96,7 +96,15 @@ def _scan_context_content(content: str, filename: str) -> str:
 def _find_git_root(start: Path) -> Optional[Path]:
     """Nearest ancestor (or *start* itself) containing ``.git``, else None."""
     current = start.resolve()
-    return next((p for p in (current, *current.parents) if (p / ".git").exists()), None)
+    # A parent the process may not stat (locked-down /home on shared hosts) is "no .git here", not a crash.
+    return next((p for p in (current, *current.parents) if _exists_or_denied(p / ".git")), None)
+
+
+def _exists_or_denied(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 def _find_hermes_md(cwd: Path) -> Optional[Path]:
@@ -592,11 +600,6 @@ PLATFORM_HINTS = {
         "[links](url), ## headers. Prefer bullets or labeled lines for structured data (no tables). "
         f"{_MEDIA_NATIVE}Images (.png, .jpg, .webp) send as photos, videos (.mp4) play inline; image URLs via ![alt](url) send as "
         "photos. Audio: add [[audio_as_voice]] on its own line to send ANY audio file as a native voice bubble "
-        "\n**IMPORTANT: Do NOT use the send_message tool to send files in this chat.** "
-        "Just write MEDIA:/path/to/file directly in your response text — the gateway "
-        "delivers it automatically. The send_message tool is only for pushing content "
-        "to OTHER destinations (cron jobs, background scripts, proactive notifications). "
-        "Using it here causes target resolution failures."
         "(non-Opus transcodes automatically); without it, .mp3/.m4a arrive as audio files, other formats as documents."
     ),
     "discord": (
@@ -850,13 +853,6 @@ def _tenv_read(name: str, default: str = "") -> str:
 
 _BACKEND_IMAGE_KEYS = {b: f"{b}_image" for b in ("docker", "singularity", "modal", "daytona")}
 # (config key, default) pairs forwarded to _create_environment's container_config.
-_CONTAINER_CONFIG_DEFAULTS = (
-    ("container_cpu", 1), ("container_memory", 5120), ("container_disk", 51200), ("container_persistent", True),
-    ("modal_mode", "auto"), ("docker_volumes", []), ("docker_mount_cwd_to_workspace", False),
-    ("docker_forward_env", []), ("docker_env", {}), ("docker_run_as_host_user", False), ("docker_extra_args", []),
-    ("docker_shm_size", "1g"), ("docker_persist_across_processes", True), ("docker_shared_container_key", ""),
-    ("docker_orphan_reaper", True),
-)
 # Single-line POSIX probe; `2>/dev/null` keeps a missing binary from polluting output.
 _BACKEND_PROBE_CMD = (
     "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\" "
@@ -867,31 +863,33 @@ _BACKEND_PROBE_CMD = (
 
 def _run_backend_probe(env_type: str, terminal_tool) -> str:
     """Execute the probe command inside a freshly built backend; "" when it yields nothing."""
-    from tools.terminal_tool_backends import _create_environment, _ssh_config_from_config
+    from tools.terminal_tool_backends import _container_config_from_config, _create_environment, _ssh_config_from_config
     from tools.terminal_tool_lifecycle import _cleanup_env
 
     config = terminal_tool._get_env_config()
-    # Mirrors tools/terminal_tool.py's live-command assembly (`_create_environment` is the factory).
+    # Same container_config shaper as the live terminal path: a private copy of the key table here
+    # drifted (no docker_network) and gave the probe a bridge-networked container under lockdown.
     env = _create_environment(
         env_type=env_type, image=config.get(_BACKEND_IMAGE_KEYS[env_type], "") if env_type in _BACKEND_IMAGE_KEYS else "", cwd=config.get("cwd", ""),
         timeout=config.get("timeout", 180),
         ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
-        container_config=({k: config.get(k, d) for k, d in _CONTAINER_CONFIG_DEFAULTS}
+        container_config=(_container_config_from_config(config)
                           if terminal_tool._is_container_backend(env_type) else None),
         task_id="prompt-backend-probe", host_cwd=config.get("host_cwd"),
+        # Only ssh honors this: an isolated ControlMaster socket and no remote dir setup / file sync /
+        # snapshot. A normal SSHEnvironment would upload the whole ~/.hermes tree just to run `uname`,
+        # and its later __del__ would sync_back() and close the master shared with the agent's own env.
+        probe_only=True,
     )
     try:
         result = env.execute(_BACKEND_PROBE_CMD, timeout=4)
     finally:
         # One-shot `uname`; without teardown the backend leaves a second idle sandbox
         # (task_id="prompt-backend-probe") running for the whole process next to the agent's own.
-        # ssh is left alone: no task-scoped sandbox, and its cleanup() closes a ControlMaster socket
-        # (keyed by user@host:port) shared with the agent's real environment; ControlPersist expires it.
-        if env_type != "ssh":
-            try:
-                _cleanup_env(env, force_remove=True)
-            except Exception:
-                logger.debug("Backend probe cleanup failed", exc_info=True)
+        try:
+            _cleanup_env(env, force_remove=True)
+        except Exception:
+            logger.debug("Backend probe cleanup failed", exc_info=True)
     if result.get("returncode") != 0:
         logger.debug("Backend probe returned non-zero: %r", result)
         return ""
@@ -1446,44 +1444,22 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
     ContextVar falls back to the launch home and reads the wrong profile's SOUL.md (#50233, same class as
     the skills-index leak fixed in #86313).
     """
-    return _load_hermes_home_md("SOUL.md", context_length=context_length, home_override=home_override)
-
-
-def load_action_md(home_override: "Path | None" = None) -> Optional[str]:
-    """Load ACTION.md from HERMES_HOME and return its content, or None.
-
-    Used as the agent interaction-behavior layer (slot #2 in the system
-    prompt, immediately after SOUL.md).  Covers "how the agent interacts
-    with users" — service standards, reply discipline, workflow rules.
-    Profile-isolated via ``get_hermes_home()`` (same as SOUL.md).
-    ``home_override`` matches ``load_soul_md`` (#50233 profile pinning).
-    """
-    return _load_hermes_home_md("ACTION.md", home_override=home_override)
-
-
-def _load_hermes_home_md(
-    filename: str,
-    *,
-    context_length: Optional[int] = None,
-    home_override: "Path | None" = None,
-) -> Optional[str]:
-    """Shared loader for SOUL.md / ACTION.md from HERMES_HOME."""
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()
     except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading %s: %s", filename, e)
-    path = (Path(home_override) if home_override is not None else get_hermes_home()) / filename
-    if not path.exists():
+        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+    if not soul_path.exists():
         return None
     try:
-        content = (_read_text_with_timeout(path) or "").strip()
+        content = (_read_text_with_timeout(soul_path) or "").strip()
         if not content:
             return None
-        return _truncate_content(_scan_context_content(content, filename), filename,
-                                 context_length=context_length, read_path=str(path))
+        return _truncate_content(_scan_context_content(content, "SOUL.md"), "SOUL.md", context_length=context_length,
+                                 read_path=str(soul_path))
     except Exception as e:
-        logger.debug("Could not read %s from %s: %s", filename, path, e)
+        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
         return None
 
 

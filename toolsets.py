@@ -100,10 +100,14 @@ TOOLSETS = {
         "instructions and knowledge",
         ["skills_list", "skill_view", "skill_manage"],
     ),
+    # web_search belongs to `web`/`search` only. Listing it here too let
+    # `disabled_toolsets: [browser]` (headless/Docker deployments) strip
+    # web_search from every session, because disabled toolsets are a strict
+    # end-of-pipeline subtraction (#17309, #64503).
     "browser": _ts(
         "Browser automation for web interaction (navigate, click, type, scroll, "
-        "iframes, hold-click) with web search for finding URLs",
-        [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_")] + ["web_search"],
+        "iframes, hold-click)",
+        [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_")],
     ),
     "cronjob": _ts(
         "Cronjob management tool - create, list, update, pause, resume, remove, and "
@@ -122,13 +126,6 @@ TOOLSETS = {
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
-    # LOCAL OVERRIDE: cross-platform messaging stays an explicit opt-in toolset
-    # (NOT in _HERMES_CORE_TOOLS). send_message registers itself with
-    # toolset="messaging" in tools/send_message_tool.py.
-    "messaging": _ts(
-        "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
-        ["send_message"],
-    ),
 
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
@@ -171,8 +168,6 @@ TOOLSETS = {
 
     # Coding posture, auto-selected in a code workspace (agent/coding_context.py).
     # `desktop_ui` is folded in separately by the GUI gateway for desktop sessions.
-    # LOCAL: cross-platform outbound messaging remains an explicitly enabled
-    # toolset rather than a core tool (see "messaging" above).
     # posture=True: per-session posture, never auto-recovered into platform tool
     # config (see the non-configurable-toolset recovery loop in hermes_cli/tools_config.py).
     "coding": _ts(
@@ -286,8 +281,14 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
         return toolset if toolset else None
 
     if toolset:
-        merged_tools = sorted(set(toolset.get("tools", [])) | set(registry.get_tool_names_for_toolset(name)))
-        return {**toolset, "tools": merged_tools}
+        merged_tools = set(toolset.get("tools", [])) | set(registry.get_tool_names_for_toolset(name))
+        # An MCP server named like a built-in toolset ("homeassistant", "browser") registers a bare
+        # alias to its `mcp-<name>` toolset; without this union the static entry shadows it and the
+        # server's tools never reach the model even though discovery registered them.
+        alias_target = registry.get_toolset_alias_target(name)
+        if alias_target and alias_target != name:
+            merged_tools |= set(registry.get_tool_names_for_toolset(alias_target))
+        return {**toolset, "tools": sorted(merged_tools)}
 
     if name in _get_plugin_toolset_names():
         # Plugin toolset; shown as its MCP server alias when one exists.
@@ -413,10 +414,14 @@ def _plugin_display_names() -> List[str]:
 def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
     """All toolset definitions: static plus plugin-registered."""
     result = dict(TOOLSETS)
+    aliases = _get_registry_toolset_aliases()
     for display_name in _plugin_display_names():
         toolset = None if display_name in result else get_toolset(display_name)
         if toolset:
             result[display_name] = toolset
+    # Static names an MCP server also aliases show the merged view get_toolset() resolves.
+    for name in TOOLSETS.keys() & aliases.keys():
+        result[name] = get_toolset(name) or result[name]
     return result
 
 

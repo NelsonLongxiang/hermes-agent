@@ -134,8 +134,6 @@ def _make_adapter():
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
-    adapter._slash_confirm_ts = {}
-    adapter._consecutive_pool_timeouts = 0
     adapter.platform = Platform.TELEGRAM
     return adapter
 

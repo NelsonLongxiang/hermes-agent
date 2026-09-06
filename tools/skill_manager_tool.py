@@ -757,31 +757,6 @@ def skill_manage(
     # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
     # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
     _ledger_before = None
-
-    # LOCAL (SOUL gate): if the active profile's SOUL.md forbids autonomous skill
-    # creation, defer "create" to the pending-confirmation queue instead of executing.
-    # Upstream has no equivalent; each profile owns its SOUL.md independently.
-    if action == "create" and not _skill_gate_bypass.get():
-        try:
-            from hermes_constants import get_hermes_home
-            _soul_text = (get_hermes_home() / "SOUL.md").read_text(encoding="utf-8").lower()
-            _forbidden_keywords = ("禁止随意创建技能", "禁止 self-improvement", "禁止随意更新技能", "do not auto-create skills", "forbid self-improvement")
-            if any(kw in _soul_text for kw in _forbidden_keywords):
-                _pending_path = get_hermes_home() / "pending_skill_creates.jsonl"
-                _pending_entry = {"name": name, "content": content, "category": category, "reason": "soul_deferred"}
-                _pending_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(_pending_path, "a", encoding="utf-8") as _pf:
-                    _pf.write(json.dumps(_pending_entry, ensure_ascii=False) + "\n")
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        f"SOUL.md forbids autonomous skill creation. "
-                        f"Skill '{name}' saved to pending queue. "
-                        f"Ask the user to confirm before creating skills."
-                    ),
-                }, ensure_ascii=False)
-        except Exception:
-            pass  # no SOUL.md or unreadable — allow by default
     with suppress(Exception):
         from tools import skill_ledger as _ledger
         _pre = _find_skill(name)
