@@ -378,15 +378,24 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
 
 
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
-    """Build the validated provider-routing object shared by request paths."""
-    preferences: Dict[str, Any] = {}
-    for key, value in (("only", agent.providers_allowed), ("ignore", agent.providers_ignored),
-        ("order", agent.providers_order), ("sort", _validated_openrouter_provider_sort(agent.provider_sort)),
-        ("require_parameters", True if agent.provider_require_parameters else None),
-        ("data_collection", agent.provider_data_collection)):
-        if value:
-            preferences[key] = value
-    return preferences
+    """Build the validated provider-routing object shared by request paths.
+
+    ``provider_routing.models.<id>`` overlays the flat constructor values for the CURRENT
+    ``agent.model`` (so ``/model`` switches, fallbacks, and delegated children on another
+    model each get their own pins without any surface re-plumbing the kwargs)."""
+    flat = {"only": agent.providers_allowed, "ignore": agent.providers_ignored, "order": agent.providers_order,
+        "sort": agent.provider_sort, "require_parameters": agent.provider_require_parameters,
+        "data_collection": agent.provider_data_collection}
+    per_model = {}
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import resolve_per_model_provider_routing
+        _pr = load_config_readonly().get("provider_routing")
+        per_model = resolve_per_model_provider_routing(agent.model, (_pr or {}).get("models") if isinstance(_pr, dict) else None)
+    merged = {**flat, **{k: v for k, v in per_model.items() if k in flat}}
+    merged["sort"] = _validated_openrouter_provider_sort(merged["sort"])
+    merged["require_parameters"] = True if merged["require_parameters"] else None
+    return {key: value for key, value in merged.items() if value}
 
 
 def _prompt_cache_scope_for_agent(agent) -> "str | None":
@@ -1797,8 +1806,10 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
 
 
 def _is_anthropic_wire_url(url: str) -> bool:
-    """Same host match as determine_api_mode() / _detect_api_mode_for_url()."""
-    return url.rstrip("/").lower().endswith("/anthropic") or base_url_hostname(url) == "api.anthropic.com"
+    """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
+    a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
+    from hermes_cli.providers import host_mandated_api_mode
+    return host_mandated_api_mode(url) == "anthropic_messages"
 
 
 def _fallback_api_mode_hint(fb: dict, fb_provider: str, fb_base_url_hint: Optional[str]) -> tuple[bool, str]:
@@ -3338,6 +3349,132 @@ class _StreamingCall:
             self.clients.close_once(
                 "stream_request_complete" if self.result["response"] is not None else "stream_error_cleanup")
 
+    # ── poll-loop monitor (heartbeat / stale kill / interrupt) ──────────
+
+    def _run_call(self):
+        try:
+            self._call()
+        finally:
+            self._call_done.set()
+
+    def _poll_local_load_notice(self, now: float) -> bool:
+        """Managed local server: surface a cold model's weight-load progress
+        instead of the 30s "provider may be slow" copy. Polled ~1s only while no
+        REAL chunk arrived for 2s+ (never during healthy token flow); in-memory,
+        no network. True while loading = heartbeat liveness, skip the rest of
+        this iteration (the stale detector's local floor dwarfs any load)."""
+        m = self._mon
+        if now - self.last_chunk_time["t"] < 2.0 or now - m.last_load_poll < 1.0:
+            return False
+        m.last_load_poll = now
+        _load_notice = _managed_local_load_notice(self.agent, self.api_kwargs)
+        if _load_notice is not None:
+            self.agent._emit_wait_notice(_load_notice)
+            self.agent._touch_activity("local model loading")
+            m.load_notice_shown, m.load_notice_misses, m.last_heartbeat = True, 0, now  # loading IS liveness
+            return True
+        if m.load_notice_shown:
+            # One missed sample is routine (probe timeout under load); clearing on it strobed the line.
+            m.load_notice_misses += 1
+            if m.load_notice_misses >= 3:
+                m.load_notice_shown, m.load_notice_misses = False, 0
+                self.agent._emit_wait_notice("")
+        return False
+
+    def _heartbeat(self, waiting_secs: int, interval: float) -> None:
+        """Gateway inactivity heartbeat: the start-to-first-chunk gap (thinking,
+        local prefill) can exceed the gateway timeout."""
+        if waiting_secs >= interval:
+            # No chunks for 30s+: say WHAT the wait is and WHEN recovery kicks in.
+            stale = self._stream_stale_timeout
+            _recovery = f"; auto-reconnect at {int(stale)}s" if stale is not None and stale != float("inf") else ""
+            self.agent._emit_wait_notice(
+                f"⏳ waiting on {self.api_kwargs.get('model', 'the provider')} — {waiting_secs}s with no output yet "
+                f"(provider may be slow or overloaded, or the model is thinking{_recovery})")
+        else:
+            # Chunks are flowing — keep the tracker fresh, leave the display alone.
+            self.agent._touch_activity(f"waiting for stream response ({waiting_secs}s, no chunks yet)")
+
+    def _kill_stale_stream(self, elapsed: float) -> None:
+        """SSE pings but no chunks: cancel the attempt and abort the request-local
+        client so the retry loop opens a fresh one. The shared client is never
+        closed from this (stranger) thread — earlier stale-killed workers may
+        still be unwinding SSL BIOs (FD-recycle corruption); the OpenAI primary
+        is replaced lazily."""
+        _est_ctx = estimate_request_context_tokens(self.api_kwargs)
+        logger.warning(
+            "Stream stale for %.0fs (threshold %.0fs) — no chunks received. model=%s context=~%s tokens. Killing connection.",
+            elapsed, self._stream_stale_timeout, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+        )
+        self.agent._buffer_status(
+            f"⚠️ No response from provider for {int(elapsed)}s (model: {self.api_kwargs.get('model', 'unknown')}, "
+            f"context: ~{_est_ctx:,} tokens). Reconnecting...")
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("stale_stream_kill")
+            self.clients.close_once("stale_stream_kill")
+        _bump_stale_streak(self.agent)  # circuit breaker, see ``_stale_streak()``
+        # Reset the timer so we don't kill repeatedly while the worker unwinds.
+        self.last_chunk_time["t"] = time.time()
+        self.agent._emit_wait_notice(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
+        self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
+
+    def _abort_for_interrupt(self, stale_elapsed: float) -> None:
+        """/stop seen by the monitor: mark cancelled, abort the request-local
+        socket, wait for the worker, flag the interrupt."""
+        # The stale branch already counted this iteration if its deadline won the race.
+        if stale_elapsed <= self._stream_stale_timeout:
+            _record_interrupted_provider_wait(self.agent, stale_elapsed, response_started=self.deltas_were_sent["yes"])
+        # Mark cancelled BEFORE force-closing so the worker treats the forced
+        # transport error as a cancel, not a network error (#6600).
+        self._request_cancelled["value"] = True
+        logger.debug("Force-closing streaming httpx client due to interrupt (not a network error).")
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("stream_interrupt_abort")
+            # Kind-aware: only the request-local socket; the shared _anthropic_client is never closed here.
+            self.clients.close_once("stream_interrupt_abort")
+        # Let the worker unwind Relay-managed scopes first; raising first lets
+        # turn teardown race a still-open scope and corrupt the LIFO stack.
+        if self.worker is not None:
+            _join_worker_for_relay_teardown(self.worker, label="Streaming")
+        self._monitor_interrupted["yes"] = True
+
+    def _monitor_loop(self) -> None:
+        _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
+        self._mon = SimpleNamespace(last_heartbeat=time.time(), last_load_poll=0.0, load_notice_shown=False, load_notice_misses=0)
+        _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
+        while not self._call_done.is_set():
+            self._call_done.wait(timeout=0.3)
+            _hb_now = time.time()
+            if _is_local_base and self._poll_local_load_notice(_hb_now):
+                continue
+            if _hb_now - self._mon.last_heartbeat >= _HEARTBEAT_INTERVAL:
+                self._mon.last_heartbeat = _hb_now
+                self._heartbeat(int(_hb_now - self.last_chunk_time["t"]), _HEARTBEAT_INTERVAL)
+            _stale_elapsed = time.time() - self.last_chunk_time["t"]
+            if _stale_elapsed > self._stream_stale_timeout:
+                self._kill_stale_stream(_stale_elapsed)
+            if self.agent._interrupt_requested:
+                self._abort_for_interrupt(_stale_elapsed)
+                return
+
+    # ── orchestration ───────────────────────────────────────────────────
+
+    def _resolve_stale_timeout(self) -> None:
+        """Set ``_stream_stale_timeout``. Local endpoints (unless the env is set) get
+        long but FINITE patience — 900s / ``agent.local_stream_stale_timeout`` /
+        HERMES_LOCAL_STREAM_STALE_TIMEOUT — an infinite one stalled sessions on a
+        crashed endpoint forever. Cloud values scale with context size and are
+        floored for known reasoning models (else BrokenPipeError from the gateway)."""
+        base = _configured_stale_base(self.agent)
+        if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
+            _local_default = 900.0
+            with contextlib.suppress(Exception):
+                from hermes_cli.config import load_config_readonly
+                _cfg = load_config_readonly()  # read-only consumer — no deepcopy
+                _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else None
+                _v = _agent_cfg.get("local_stream_stale_timeout") if isinstance(_agent_cfg, dict) else None
+                if isinstance(_v, (int, float)):
+                    _local_default = float(_v)
             self._stream_stale_timeout = env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default)
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",
                 self.agent.base_url, self._stream_stale_timeout)
