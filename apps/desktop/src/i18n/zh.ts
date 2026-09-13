@@ -207,7 +207,10 @@ export const zh = defineLocale({
       errorTitle: 'MCP 服务器无法连接',
       errorMessage: name => `${name} MCP 健康检查失败。`,
       signIn: '登录',
-      view: '查看'
+      view: '查看',
+      disable: '禁用',
+      disabledMessage: name => `已禁用 ${name} MCP。可随时在「能力 → MCP」中重新启用。`,
+      disableFailed: name => `无法禁用 ${name} MCP。`
     },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT 需要 ELEVENLABS_API_KEY。',
@@ -2084,6 +2087,10 @@ export const zh = defineLocale({
     restartGateway: '重启网关',
     openBrowser: '打开浏览器',
     gatewayRestartFailed: '网关重启失败。',
+    sharedGatewayRestartTitle: '重启共享网关？',
+    sharedGatewayRestartDescription: bots => `此设备上的所有机器人都会重新连接：${bots}`,
+    sharedGatewayRestartConfirm: '全部重启',
+    sharedGatewayRestarted: count => `共享网关已重启（${count} 个机器人）`,
     updateHermes: '更新 Hermes',
     reloadWindow: '重新载入窗口',
     actionRunning: '运行中',
@@ -2177,6 +2184,7 @@ export const zh = defineLocale({
     },
     unknown: '未知',
     hintPendingRestart: '在状态栏重启网关以应用此更改。',
+    sharedListenerUrl: '通过共享网关监听器提供，地址为',
     hintGatewayStopped: '在状态栏启动网关以建立连接。',
     credentialsSet: '凭据已设置',
     needsSetup: '需要设置',
