@@ -18,7 +18,7 @@ from pathlib import Path
 
 from hermes_cli.config import get_hermes_home  # noqa: F401  (re-exported; patched via update_cmd)
 from hermes_cli.update_cmd_common import _best_effort
-from hermes_constants import get_default_hermes_root, venv_python_path
+from hermes_constants import get_default_hermes_root, project_venv_dir, venv_python_path
 
 # Re-exports: every split-module name stays reachable (and monkeypatchable) as update_cmd.<name>.
 from hermes_cli.update_abort_recovery import (  # noqa: F401
@@ -43,7 +43,7 @@ from hermes_cli.update_cmd_windows import (  # noqa: F401
 from hermes_cli.update_cmd_fleet import (  # noqa: F401
     _FLEET_RESTART_PENDING_NAME, _FRESH_RESTART_SUPERVISORS, _GatewayRestartOutcome,
     _apply_pending_fleet_restart_catchup, _clear_fleet_restart_pending_marker,
-    _current_checkout_sha, _drain_or_signal_gateway_for_update, _fleet_probe_expected_runtimes,
+    _current_checkout_sha, _defer_fleet_restart_after_update, _drain_or_signal_gateway_for_update, _fleet_probe_expected_runtimes,
     _fleet_restart_pending_marker_path, _for_each_systemd_gateway_unit,
     _gateway_recovery_partition, _gateway_service_matches_profile, _pending_fleet_restart_needed,
     _receipt_looks_unfinished, _receipt_reports_stale_runtime, _resolve_manage_cmd,
@@ -613,11 +613,11 @@ def _repair_venv_on_current_checkout(
     from hermes_cli.managed_uv import ensure_uv
     repair_uv = ensure_uv()
     # Venv gone entirely (repair interrupted after the old one was moved aside): recreate.
-    venv_python_missing = not (
-        venv_python_path(_m().PROJECT_ROOT / "venv", windows=_m()._is_windows())).exists()
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / "venv"
+    venv_python_missing = not venv_python_path(venv_dir, windows=_m()._is_windows()).exists()
     if venv_python_missing and repair_uv:
         print("→ Recreating virtual environment...")
-        subprocess.run([repair_uv, "venv", "venv"], cwd=_m().PROJECT_ROOT, check=False)
+        subprocess.run([repair_uv, "venv", venv_dir.name], cwd=_m().PROJECT_ROOT, check=False)
     repair_prefix, repair_env = _pip_install_prefix(repair_uv)
     _m()._install_python_dependencies_with_optional_fallback(repair_prefix, env=repair_env, group="all")
     _m()._refresh_active_lazy_features(repair_prefix, env=repair_env, features=active_lazy_features)
@@ -655,7 +655,7 @@ def _pip_install_prefix(uv_bin) -> tuple[list[str], dict | None]:
         # See #83914.
         from hermes_cli.managed_uv import managed_python_env
         env = managed_python_env()
-        env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
+        env["VIRTUAL_ENV"] = str(project_venv_dir(_m().PROJECT_ROOT) or _m().PROJECT_ROOT / "venv")
         return [uv_bin, "pip"], env
     return [sys.executable, "-m", "pip"], None
 
@@ -671,7 +671,7 @@ def _repair_current_checkout(
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
     runtime_repairs = []
     update_managed_uv(repair_observer=runtime_repairs.append)
-    ensure_uv(repair_observer=runtime_repairs.append)
+    repair_uv = ensure_uv(repair_observer=runtime_repairs.append)
     runtime_repaired = next((result for result in runtime_repairs if result.repaired), None)
 
     # A current checkout does NOT imply a healthy install (a prior sync may have died
@@ -695,6 +695,23 @@ def _repair_current_checkout(
             active_tool_dependencies=active_tool_dependencies,
             _windows_gateway_resume=_windows_gateway_resume)
     else:
+        if runtime_repaired is not None:
+            # A successful SQLite repair swaps in a venv built from uv.lock alone, so core
+            # imports pass while lazily-installed backends and ``hermes tools`` dependencies
+            # are gone (#112571). Restore the pre-cutover snapshots exactly as the pull path
+            # and the unhealthy-venv repair do; the healthy core set needs no reinstall.
+            repair_prefix, repair_env = _pip_install_prefix(repair_uv)
+            # Same marker discipline as the pull path: an interrupted or failed lazy restore
+            # must leave the breadcrumb so the next `hermes` run finishes the repair.
+            _write_lazy_refresh_incomplete_marker()
+            if _m()._refresh_active_lazy_features(
+                    repair_prefix, env=repair_env, features=active_lazy_features):
+                _m()._clear_lazy_refresh_incomplete_marker()
+            else:
+                print("  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
+                      "to finish import-based venv repair.")
+            _m()._restore_active_tool_dependencies(
+                active_tool_dependencies, repair_prefix, env=repair_env)
         current_checkout_complete = _repair_node_deps_on_current_checkout(
             _print_verified_update_completion, assume_yes=assume_yes, gateway_mode=gateway_mode,
             pre_update_snapshot_id=pre_update_snapshot_id,
@@ -972,6 +989,7 @@ class _UpdateOptions:
     keep_stash: bool
     switch_branch: bool
     discard_local_changes: bool
+    no_gateway_restart: bool = False
 
 
 def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
@@ -997,6 +1015,10 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
     # branch's history; only meaningful with parked_branch_strategy "update_in_place".
     # See #89507.
     switch_branch = bool(getattr(args, "switch_branch", False))
+    # --no-gateway-restart (cron inside the gateway's own cgroup): update code
+    # and dependencies but defer the fleet restart so the updater is not killed
+    # by its own restart. The pending-restart marker is kept for catch-up.
+    no_gateway_restart = bool(getattr(args, "no_gateway_restart", False))
 
     # Interactive terminals always stash-and-ask; only non-interactive updates consult
     # updates.non_interactive_local_changes (auto-restore vs discard).
@@ -1010,7 +1032,8 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
         active_lazy_features=active_lazy_features,
         active_tool_dependencies=active_tool_dependencies, pre_update_version=pre_update_version,
         gw_input_fn=gw_input_fn, assume_yes=assume_yes, keep_stash=keep_stash,
-        switch_branch=switch_branch, discard_local_changes=discard_local_changes)
+        switch_branch=switch_branch, discard_local_changes=discard_local_changes,
+        no_gateway_restart=no_gateway_restart)
 
 
 def _begin_update_receipt_and_plan(args):
@@ -1182,7 +1205,8 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, *, assume_yes: bool, gateway_mode: bool,
     gw_input_fn, pre_update_snapshot_id, had_desktop_app_before_update: bool,
-    active_lazy_features, active_tool_dependencies, _windows_gateway_resume) -> None:
+    active_lazy_features, active_tool_dependencies, _windows_gateway_resume,
+    no_gateway_restart: bool = False) -> None:
     """"Already up to date" path: restore stash/branch, repair the checkout, catch up the fleet.
     ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
     _invalidate_update_cache()
@@ -1217,8 +1241,9 @@ def _finish_already_up_to_date(
     # Catch up even on the "Already up to date" path — that early return is what left the gateway on stale
     # code for two days. Runs BEFORE the runtime-verification exit gate below: a vulnerable SQLite runtime
     # demotes the outcome to partial, but must not strand the fleet on stale code (#91277 fleet contract —
-    # the pending-restart check always executes).
-    _apply_pending_fleet_restart_catchup()
+    # the pending-restart check always executes). Under --no-gateway-restart the
+    # catch-up is deferred instead (executing it would kill the cron's own gateway).
+    _apply_pending_fleet_restart_catchup(defer=no_gateway_restart)
     if not current_checkout_complete:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
@@ -1275,6 +1300,28 @@ def _apply_pulled_update(
     # the marker would never land and the new gateway's watcher would time out spuriously.
     if gateway_mode:
         _write_gateway_update_exit_code(update_complete)
+
+    if opts.no_gateway_restart:
+        # Cron inside the gateway's own cgroup: restarting the fleet now would
+        # SIGUSR1-drain this updater's own gateway and systemd would SIGKILL the
+        # updater with it. Defer instead — the pending marker written above is
+        # kept for the next normal update. Skipping the restart phase also skips
+        # its stale-module purge: this live interpreter still serves pre-update
+        # code and must not have its sys.modules graph mutated mid-flight.
+        # Windows pause/resume still runs (paused gateways must be resumed onto
+        # pre-update code); only the fleet restart + verification are deferred.
+        # The resume outcome is RETAINED (not discarded): a failed resume must
+        # still make this update partial, exactly as on the normal path.
+        resume_outcome = _GatewayRestartOutcome(
+            incomplete=False, phase_errors=[], pre_restart_gateway_pids=[],
+            restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
+            externally_supervised_profiles=[], killed_pids=set(),
+        )
+        _resume_windows_gateways_and_merge_outcome(
+            resume_outcome, _windows_gateway_resume, gateway_mode)
+        _defer_fleet_restart_after_update(
+            update_complete=update_complete, resume_incomplete=resume_outcome.incomplete)
+        return
 
     _restart = _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode)
     _resume_windows_gateways_and_merge_outcome(_restart, _windows_gateway_resume, gateway_mode)
@@ -1385,7 +1432,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 had_desktop_app_before_update=had_desktop_app_before_update,
                 active_lazy_features=opts.active_lazy_features,
                 active_tool_dependencies=opts.active_tool_dependencies,
-                _windows_gateway_resume=_windows_gateway_resume)
+                _windows_gateway_resume=_windows_gateway_resume,
+                no_gateway_restart=opts.no_gateway_restart)
             return
 
         if commit_count > 0:

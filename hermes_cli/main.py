@@ -183,6 +183,28 @@ def _run_and_exit_oneshot(
         _exit_after_oneshot(rc)
 
 
+def _warn_if_unsupervised_pid1(pid: "int | None" = None) -> None:
+    """Warn when this process is PID 1 with nothing above it to reap orphans.
+
+    The official image's ENTRYPOINT (``docker/entrypoint-dispatch.sh`` -> s6-overlay's
+    ``/init``) is the reaper for orphaned grandchildren (browser tooling, MCP servers, shell
+    children). A Compose service that overrides ``entrypoint:`` to invoke hermes directly makes
+    hermes itself PID 1 — nothing then ``wait()``s on those orphans and they accumulate as
+    zombies without bound (#111577). Outside a container a user process is never PID 1, so
+    this is quiet everywhere else; it mirrors the dispatcher's own non-PID-1 warning.
+    """
+    if (pid if pid is not None else os.getpid()) != 1:
+        return
+    print(
+        "[hermes] WARNING: this process is PID 1 with no init above it "
+        "(entrypoint override?). Orphaned child processes will not be "
+        "reaped and will accumulate as zombies. Use the image's default "
+        "ENTRYPOINT (docker/entrypoint-dispatch.sh) instead of overriding "
+        "it, or run with `docker run --init` / `init: true` in Compose.",
+        file=sys.stderr,
+    )
+
+
 def _set_process_title() -> None:
     """Cosmetic: show 'hermes' instead of 'python3.xx' in ps/top/htop.
 
@@ -491,13 +513,13 @@ def _resolve_sudo_user_profile_env(name: str) -> str | None:
     """
     if name == "default":
         return None
-    from hermes_constants import sudo_invoker_default_home
+    from hermes_constants import named_profile_is_live, sudo_invoker_default_home
 
     sudo_home = sudo_invoker_default_home()
     if sudo_home is None:
         return None
     candidate = sudo_home / "profiles" / name
-    return str(candidate) if candidate.is_dir() else None
+    return str(candidate) if named_profile_is_live(candidate) else None
 
 
 def _under_gateway_supervisor(argv: list) -> bool:
@@ -1750,6 +1772,9 @@ def cmd_chat(args):
     # --source: tag session source for filtering (e.g. 'tool' for integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
+        # Explicit flag, not a label inherited from a parent TUI/Desktop session — one-shot
+        # runs must keep it (see run_agent._session_source_for_agent).
+        os.environ["HERMES_SESSION_SOURCE_EXPLICIT"] = "1"
 
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
@@ -2439,11 +2464,13 @@ def _dashboard_lifecycle_flags(args, token_file) -> None:
             print("No hermes dashboard processes running.")
             sys.exit(0)
         # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`;
-        # it prints outcomes itself. Exit 1 only if every pid was unkillable.
+        # it prints outcomes itself. Exit 1 only if a pid was unkillable — judged
+        # from the kill result, not a re-scan: a launchd KeepAlive job respawns
+        # its backend on a fresh PID, which is not a failed stop.
         from hermes_cli.dashboard_procs import _kill_stale_dashboard_processes
 
-        _kill_stale_dashboard_processes(reason="requested via --stop")
-        sys.exit(1 if _find_stale_dashboard_pids() else 0)
+        result = _kill_stale_dashboard_processes(reason="requested via --stop")
+        sys.exit(1 if result["failed"] else 0)
 
 
 def _dashboard_validate_serve_args(args, headless_backend, token_file):
@@ -3394,6 +3421,7 @@ def _default_to_chat(args) -> None:
 def main():
     """Main entry point for hermes CLI."""
     _set_process_title()
+    _warn_if_unsupervised_pid1()
     _advertise_agent_env()
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
