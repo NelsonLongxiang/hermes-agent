@@ -417,7 +417,6 @@ def _cli_config_defaults():
             "persist_prompts": True,  # one-line summary of resolved modal prompts into scrollback
             "skin": "default",
         },
-        "clarify": {"timeout": 120},  # seconds before a clarify prompt auto-proceeds
         "code_execution": {"timeout": 300, "max_tool_calls": 50},
         "auxiliary": {"vision": {"provider": "auto", "model": "", "base_url": "", "api_key": ""}},
         # delegation: empty model/provider = inherit parent; api_key falls back to OPENAI_API_KEY
@@ -2511,6 +2510,7 @@ class _ChatTurn:
     """
 
     result: Optional[dict] = None
+    mute_notification_reply: bool = False
     use_streaming_tts: bool = False
     box_opened: bool = False
     thinking_started: bool = False
@@ -2683,7 +2683,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         # --api-key wins; otherwise a URL-bearing startup alias carries its own credential.
         # See #28660.
         self._explicit_api_key = api_key or _startup_api_key_override or None
-        self._explicit_base_url = base_url
+        self._explicit_base_url = base_url or _startup_base_url_override or None
 
         # Resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
@@ -2775,6 +2775,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         # — resolved through the shared chokepoint in hermes_constants (Closes #21256).
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        self._explicit_reasoning_config = None
         # --reasoning wins for this run only (never persisted); unparseable -> warn and ignore.
         if reasoning is not None and str(reasoning).strip():
             _cli_reasoning = _parse_reasoning_config(reasoning)
@@ -2782,6 +2783,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
                 logger.warning("Unknown --reasoning '%s', keeping the configured level", reasoning)
             else:
                 self.reasoning_config = _cli_reasoning
+                self._explicit_reasoning_config = _cli_reasoning
         self.service_tier = _parse_service_tier_config(CLI_CONFIG["agent"].get("service_tier", ""))
 
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
@@ -2851,20 +2853,24 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             logger.warning("Failed to initialize SessionDB — session will NOT be indexed for search: %s", e)
             from hermes_state_user_copy import describe_storage_failure, storage_failure_details
             failure = describe_storage_failure(e)
-            try:
-                Console(stderr=True).print(
-                    "[bold yellow]⚠ Session store unavailable[/bold yellow] — "
-                    "this conversation will [bold]NOT be saved[/bold] and cannot be resumed later. "
-                    "Searching past sessions is also disabled.\n"
-                    f"  Reason: {failure.gloss}.\n"
-                    f"  {failure.action}\n"
-                    f"  [dim]Details: {storage_failure_details(e)}[/dim]"
-                )
-            except Exception:
-                print(
-                    "WARNING: Session store unavailable — this conversation will NOT be "
-                    f"saved and cannot be resumed later. Reason: {failure.gloss}. {failure.action}"
-                )
+            def _present_store_warning():
+                try:
+                    Console(stderr=True).print(
+                        "[bold yellow]⚠ Session store unavailable[/bold yellow] — "
+                        "this conversation will [bold]NOT be saved[/bold] and cannot be resumed later. "
+                        "Searching past sessions is also disabled.\n"
+                        f"  Reason: {failure.gloss}.\n"
+                        f"  {failure.action}\n"
+                        f"  [dim]Details: {storage_failure_details(e)}[/dim]"
+                    )
+                except Exception:
+                    print(
+                        "WARNING: Session store unavailable — this conversation will NOT be "
+                        f"saved and cannot be resumed later. Reason: {failure.gloss}. {failure.action}"
+                    )
+            # Same automatic diagnostic the gateway gates for its home channel (run_notifications).
+            from gateway.warning_notifications import render_notification
+            render_notification(_present_store_warning, platform="cli")
         _run_state_db_auto_maintenance(self._session_db)
         _run_checkpoint_auto_maintenance()
 
@@ -3055,7 +3061,8 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
 
             notice = default_downgrade_notice()
             if notice:
-                self._console_print(f"[yellow]⚠ {notice}[/yellow]")
+                from gateway.warning_notifications import render_notification
+                render_notification(lambda: self._console_print(f"[yellow]⚠ {notice}[/yellow]"), platform="cli")
         except Exception:
             logger.debug("browser backend notice failed", exc_info=True)
 
@@ -3651,10 +3658,10 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._show_browser_backend_notice()
 
         # First-run: an unconfigured install routes into provider onboarding instead of
-        # a chat that spins ~30s and fails with a provider-specific error. TTY only.
+        # a chat that spins ~30s and fails with a provider-specific error. TTY only. A
+        # configured profile whose credential is benched or signed out gets the reason instead.
         try:
-            if sys.stdin.isatty() and not self._runtime_credentials_ready():
-                self._offer_first_run_setup()
+            self._maybe_offer_first_run_setup()
         except Exception:
             logger.debug("first-run setup offer failed", exc_info=True)
 
@@ -4146,10 +4153,13 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     from agent.turn_author import take_turn_author_from_env
     from hermes_cli.quiet_single_query import (
         adopt_unanswered_turn, bind_quiet_session_key, continue_quiet_notify_completions,
-        quiet_notify_linger_seconds,
+        quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
     )
 
     author = take_turn_author_from_env()
+    # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
+    # report, written before the linger below; popped so tool subprocesses do not inherit it.
+    turn_report_path = take_turn_report_path()
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
@@ -4167,6 +4177,12 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
+        # The turn is over and persisted: the one-shot exit linger that follows protects nested
+        # notify_on_complete replies and is NOT part of the spawner's delivery (#113608).
+        write_turn_report(
+            turn_report_path, exit_code=_single_query_exit_code(result),
+            error=str(result.get("error") or "") if isinstance(result, dict) else "agent turn did not run",
+        )
         if isinstance(result, dict) and not result.get("failed"):
             history = result.get("messages") or cli.conversation_history
 

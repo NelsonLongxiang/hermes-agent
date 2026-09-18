@@ -635,6 +635,9 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
+    from agent.notification_presentation import event_presentation_muted
+    if event_presentation_muted(event, sid):
+        return False
     return write_json(_event_frame(event, sid, payload))
 
 
@@ -1246,12 +1249,15 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         # callers that know the workspace pass it.
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
+        profile = _current_profile_name()
         browser_control_principal = browser_control_transport_family = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
         if sess is not None:
             source = _session_source(sess)
+            # App-global backends multiplex profiles: prefer the live session's own home.
+            profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
@@ -1259,6 +1265,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
+            profile=profile,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
             ui_session_id=ui_session_id, cron_session="")
@@ -2241,6 +2248,9 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
         return resolution.selected_model, resolution.runtime
+    if resolution.runtime.get("source") == "local-runtime":
+        # Live supervisor beat any persisted loopback URL for this identity.
+        overrides.pop("base_url", None)
     resolution.runtime.update({k: v for k, v in overrides.items() if v})
     return model, resolution.runtime
 

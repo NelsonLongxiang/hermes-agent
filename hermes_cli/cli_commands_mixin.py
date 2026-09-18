@@ -632,6 +632,12 @@ class CLICommandsMixin:
         # --all / --force: classic full restore, overwriting user edits too.
         restore_all = any(a.lower() in ("--all", "--force") for a in args)
         args = [a for a in args if a.lower() not in ("--all", "--force")]
+        if reason := mgr.unsupported_backend_reason():  # CLI: no session key, the "default" container
+            # Container-backed session: any host checkpoint listed here belongs to another tree,
+            # so diff/restore are refused; the list stays visible for local administration.
+            print(f"  {reason}")
+            if args:
+                return
         if not args:
             # No checkpoints for this dir → cross-project view (writes may sit under the session cwd).
             checkpoints = mgr.list_checkpoints(cwd)
@@ -758,6 +764,8 @@ class CLICommandsMixin:
             "  (Plain /diff still works — it uses git directly.)"))
         if mgr is None:
             return
+        if reason := mgr.unsupported_backend_reason():  # host baseline is not this session's tree
+            return print(f"  {reason}")
         result = mgr.session_diff(cwd)
         if not result.get("success"):
             return print(f"  {result.get('error', 'Could not generate diff')}")
