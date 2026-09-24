@@ -3036,12 +3036,14 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        # Feishu groups with topic-mode assign omt_ thread_id to every message.
-        # Unlike Telegram forum topics / Discord threads, Feishu group topics
-        # are visual groupings — all messages share one context.
-        # We preserve thread_id so outbound sends route to the correct topic,
-        # but build_session_key in session.py ignores it for Feishu groups.
-        raw_thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None)
+        # Only a native ``thread_id`` that starts with omt_ marks a Feishu group
+        # topic (#20548 upstream: root_id is present on every quoted reply too,
+        # so using it as a fallback turned ordinary quote replies into topic
+        # sessions and pushed the bot's answer into a fresh thread).
+        # FORK topic-mode: omt_ prefix is additionally required so plain quoted
+        # replies never route into a topic; build_session_key in session.py
+        # ignores thread_id for Feishu groups (one shared context).
+        raw_thread_id = getattr(message, "thread_id", None)
         thread_id = raw_thread_id if (raw_thread_id and raw_thread_id.startswith("omt_")) else None
         reply_to_message_id = (
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
