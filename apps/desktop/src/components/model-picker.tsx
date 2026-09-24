@@ -1,16 +1,19 @@
+import type { ModelOptionProvider, ModelPricing } from '@hermes/shared'
+import { fuzzyRank, modelSearchText } from '@hermes/shared'
+import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import { modelSearchText } from '@/lib/model-search-text'
+import { catalogProviderMatches, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
-import { normalize } from '@/lib/text'
+import { foldIncludes, normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { $customModels, addCustomModel, customModelCandidate, withCustomModels } from '@/store/custom-models'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { $localRuntimeJobs, runningModelDownloads, watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
-import type { LocalModelLoadProgress, ModelOptionProvider, ModelPricing } from '@/types/hermes'
+import type { LocalModelLoadProgress } from '@/types/hermes'
 
 import type { HermesGateway } from '../hermes'
 import { cn } from '../lib/utils'
@@ -61,9 +64,13 @@ export function ModelPickerDialog({
   // Own the search term so we can filter manually. cmdk's built-in
   // shouldFilter reorders items by its fuzzy-match score (≈alphabetical with
   // an empty query), which destroys the backend's curated order. We disable
-  // it and do a plain substring filter that preserves array order — matching
-  // the `hermes model` CLI picker, which shows the curated list verbatim.
+  // it: an empty query shows the curated list verbatim (like the `hermes
+  // model` CLI picker) and a query ranks with the shared fuzzyRank.
   const [search, setSearch] = useState('')
+  // "Add custom model…" flips the search into slug entry: the typed id is
+  // offered per provider even while it fuzzy-matches catalog rows.
+  const [slugEntry, setSlugEntry] = useState(false)
+  const searchRef = useRef<HTMLInputElement>(null)
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, sessionId, ownerConnectionId),
@@ -146,7 +153,8 @@ export function ModelPickerDialog({
     })
   }, [open, refetchOptions])
 
-  const providers = modelOptions.data?.providers ?? []
+  const customModels = useStore($customModels)
+  const providers = withCustomModels(modelOptions.data?.providers ?? [], customModels)
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
     { model: currentModel, provider: currentProvider },
@@ -166,6 +174,11 @@ export function ModelPickerDialog({
     onOpenChange(false)
   }
 
+  const selectCustomModel = (provider: ModelOptionProvider, model: string) => {
+    addCustomModel(provider.slug, model, provider)
+    selectModel(provider, model)
+  }
+
   // Open the full onboarding provider selector to add/switch a provider.
   // Reuses the entire onboarding flow (OAuth rows, API-key form, device-code,
   // model-confirm) instead of duplicating provider UI here. Closes the picker
@@ -173,6 +186,11 @@ export function ModelPickerDialog({
   const addProvider = () => {
     startManualOnboarding()
     onOpenChange(false)
+  }
+
+  const enterSlug = () => {
+    setSlugEntry(true)
+    searchRef.current?.focus()
   }
 
   return (
@@ -190,7 +208,13 @@ export function ModelPickerDialog({
         </DialogHeader>
 
         <Command className="rounded-none bg-card" shouldFilter={false}>
-          <CommandInput autoFocus onValueChange={setSearch} placeholder={copy.search} value={search} />
+          <CommandInput
+            autoFocus
+            onValueChange={setSearch}
+            placeholder={slugEntry ? copy.customModelPlaceholder : copy.search}
+            ref={searchRef}
+            value={search}
+          />
           <CommandList className="max-h-96">
             {!loading && !error && <CommandEmpty>{copy.noModels}</CommandEmpty>}
             <ModelResults
@@ -200,6 +224,8 @@ export function ModelPickerDialog({
               error={error}
               loading={loading}
               loadingModels={loadingModels}
+              offerCustom={slugEntry}
+              onSelectCustomModel={selectCustomModel}
               onSelectModel={selectModel}
               providers={providers}
               search={search}
@@ -208,6 +234,9 @@ export function ModelPickerDialog({
         </Command>
 
         <DialogFooter className="flex-row items-center justify-end gap-2 bg-card p-3">
+          <Button className="mr-auto" onClick={enterSlug} variant="ghost">
+            {copy.addCustomModelAction}
+          </Button>
           <Button onClick={addProvider} variant="ghost">
             {copy.addProvider}
           </Button>
@@ -229,16 +258,21 @@ function ModelResults({
   downloads,
   loadingModels,
   onSelectModel,
+  onSelectCustomModel,
+  offerCustom,
   search
 }: {
   loading: boolean
   error: string | null
-  providers: ModelOptionProvider[]
+  providers: readonly ModelOptionProvider[]
   currentModel: string
   currentProvider: string
   downloads: { jobId: string; target: string }[]
   loadingModels: Record<string, LocalModelLoadProgress>
   onSelectModel: (provider: ModelOptionProvider, model: string) => void
+  onSelectCustomModel: (provider: ModelOptionProvider, model: string) => void
+  /** Offer the typed id as a custom model even while catalog rows match. */
+  offerCustom: boolean
   search: string
 }) {
   const { t } = useI18n()
@@ -264,11 +298,16 @@ function ModelResults({
 
   const q = normalize(search)
 
-  const matches = (provider: ModelOptionProvider, model: string) =>
-    !q ||
-    modelSearchText(model).toLowerCase().includes(q) ||
-    provider.name.toLowerCase().includes(q) ||
-    provider.slug.toLowerCase().includes(q)
+  // Model rows rank with the same fuzzyRank + modelSearchText the web and TUI
+  // pickers use, so one query orders identically on every surface. A query
+  // that names the provider itself keeps its whole curated list, in order.
+  const rankModels = (provider: ModelOptionProvider, models: readonly string[]) => {
+    if (!q || foldIncludes(provider.name, q) || foldIncludes(provider.slug, q)) {
+      return [...models]
+    }
+
+    return fuzzyRank(models, q, modelSearchText).map(r => r.item)
+  }
 
   // Only configured providers (those with curated models) are selectable
   // here. Switching to a NOT-yet-configured provider goes through the
@@ -285,16 +324,34 @@ function ModelResults({
   // In-flight local downloads render as disabled progress rows: inside the
   // Local group when it exists, else as their own group (first download —
   // nothing staged yet, so the backend reports no Local provider at all).
-  const visibleDownloads = downloads.filter(job => !q || (job.target || '').toLowerCase().includes(q))
+  const visibleDownloads = downloads.filter(job => !q || foldIncludes(job.target || '', q))
   const hasLocalGroup = configured.some(p => p.slug === LOCAL_PROVIDER_SLUG)
+
+  const groups = configured.map(provider => ({
+    provider,
+    // Empty query: the backend's curated order, verbatim.
+    models: rankModels(provider, provider.models ?? []),
+    downloads: provider.slug === LOCAL_PROVIDER_SLUG ? visibleDownloads : []
+  }))
+
+  const hasMatches = groups.some(g => g.models.length > 0 || g.downloads.length > 0)
+
+  // A typed id nothing lists: one row per configured provider, current
+  // provider first, so the slug is one Enter away and remembered afterwards.
+  // While the query still matches catalog rows the section stays out of the
+  // way unless the user asked for it via "Add custom model…".
+  const customSlug = offerCustom || !hasMatches ? customModelCandidate(search, configured) : null
+
+  const customProviders = customSlug
+    ? [...configured].sort(
+        (a, b) =>
+          Number(catalogProviderMatches(b, currentProvider)) - Number(catalogProviderMatches(a, currentProvider))
+      )
+    : []
 
   return (
     <>
-      {configured.map(provider => {
-        // Preserve the backend's curated order — filter in place, no re-sort.
-        const models = (provider.models ?? []).filter(m => matches(provider, m))
-        const groupDownloads = provider.slug === LOCAL_PROVIDER_SLUG ? visibleDownloads : []
-
+      {groups.map(({ provider, models, downloads: groupDownloads }) => {
         if (models.length === 0 && groupDownloads.length === 0) {
           return null
         }
@@ -311,7 +368,7 @@ function ModelResults({
               </div>
             )}
             {models.map(model => {
-              const isCurrent = model === currentModel && provider.slug === currentProvider
+              const isCurrent = model === currentModel && catalogProviderMatches(provider, currentProvider)
               const price = provider.pricing?.[model]
               const locked = unavailable.has(model)
               // Managed local model loading into memory right now: show the
@@ -337,7 +394,7 @@ function ModelResults({
                   value={`${provider.slug}:${model}`}
                 >
                   <span className="min-w-0 flex-1 truncate">
-                    <HighlightMatches query={search} text={model} />
+                    <HighlightMatches foldSeparators query={search} text={model} />
                   </span>
                   {loadProgress && (
                     <span className="flex shrink-0 items-center gap-1.5" title={copy.loadingIntoMemory}>
@@ -372,6 +429,21 @@ function ModelResults({
         <CommandGroup heading={copy.localDownloadsHeading} key="local-downloads">
           {visibleDownloads.map(job => (
             <DownloadingModelRow jobId={job.jobId} key={job.jobId} target={job.target} />
+          ))}
+        </CommandGroup>
+      )}
+      {customSlug && customProviders.length > 0 && (
+        <CommandGroup heading={copy.customModel} key="custom-model">
+          {customProviders.map(provider => (
+            <CommandItem
+              className="flex items-center gap-2 pl-6 font-mono"
+              key={`custom:${provider.slug}`}
+              onSelect={() => onSelectCustomModel(provider, customSlug)}
+              value={`custom:${provider.slug}:${customSlug}`}
+            >
+              <span className="min-w-0 flex-1 truncate">{customSlug}</span>
+              <span className="shrink-0 text-[0.66rem] text-muted-foreground">{provider.name}</span>
+            </CommandItem>
           ))}
         </CommandGroup>
       )}
@@ -499,9 +571,12 @@ function ProviderHeading({ provider }: { provider: ModelOptionProvider }) {
   const { t } = useI18n()
   const copy = t.modelPicker
 
-  // free_tier is only set for Nous. true → "Free tier", false → "Pro".
+  // Two different facts wear the same badge: `free_tier` is a signed-in Nous
+  // account on the free plan; `free_tier_row` is the no-account route's own
+  // row. Either way the user is on free inference, so say so. Never match the
+  // route by name — the label is copy.
   const tierBadge =
-    provider.free_tier === true ? (
+    provider.free_tier === true || provider.free_tier_row === true ? (
       <span className="rounded-sm bg-emerald-500/15 px-1 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
         {copy.freeTier}
       </span>
