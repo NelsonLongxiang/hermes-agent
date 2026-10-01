@@ -27,11 +27,11 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def submit(self, fn, /, *args, **kwargs):
-        """Submit a callable, propagating the caller's contextvars. Stdlib only does
-        this from 3.14; on 3.11-3.13 a bare worker starts with an EMPTY Context and
-        drops profile secret scope / HERMES_HOME override — under the multiplexed
-        gateway a credential read then fails closed with ``UnscopedSecretError``.
-        Unconditional: on 3.14+ ``ctx.run`` re-applies the same context (no-op)."""
+        """Keep each task in its caller's profile scope, even on a reused worker.
+
+        Thread-start context cannot track later submissions from other profiles
+        (#54937). The stdlib worker context manages initialization, not contextvars.
+        """
         ctx = copy_context()
 
         def _run_with_context(*call_args, **call_kwargs):
@@ -74,16 +74,10 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
                     self._initargs,
                 )
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-            # right profile (#54937).
-            if _IS_PY314:
-                t = threading.Thread(
-                    name=thread_name, target=_worker, daemon=True,
-                    args=(weakref.ref(self, weakref_cb), self._create_worker_context(), self._work_queue),
-                )
-            else:
-                t = threading.Thread(
-                    name=thread_name, target=_worker, daemon=True,
-                    args=(weakref.ref(self, weakref_cb), self._work_queue, self._initializer, self._initargs),
-                )
+            # right profile (#54937). Worker args branch is unified into worker_args above (upstream refactor).
+            t = threading.Thread(
+                name=thread_name, target=_worker, daemon=True,
+                args=worker_args,
+            )
             t.start()
             self._threads.add(t)
