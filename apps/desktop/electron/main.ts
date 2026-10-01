@@ -448,6 +448,7 @@ import { capturePreviewContents } from './preview-capture'
 import { onPreviewWatchOwnerDestroyed, sendPreviewFileChangedToOwner } from './preview-file-watch'
 import { hasClosePreviewFlag, previewGuestInputAction } from './preview-guest-escape'
 import { PreviewReachRegistry } from './preview-reach'
+import { previewHttpUrlTarget } from './preview-url-target'
 import {
   createPrimaryRemoteConnection,
   FirstRunSetupResetError,
@@ -625,6 +626,7 @@ import { createStoreStrategy } from './updater/store-client'
 import { isExternalVenvHolder, isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import { guardedWatch } from './watch-storm-breaker'
 import { windowAcceleratorAction } from './window-accelerator'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import { bindWindowChromeEvents } from './window-chrome-events'
@@ -1702,7 +1704,6 @@ const MEDIA_MIME_TYPES = {
 const PREVIEW_HTML_EXTENSIONS = new Set(['.html', '.htm'])
 const PREVIEW_PDF_EXTENSIONS = new Set(['.pdf'])
 const PREVIEW_WATCH_DEBOUNCE_MS = 120
-const LOCAL_PREVIEW_HOSTS = new Set(['0.0.0.0', '127.0.0.1', '::1', '[::1]', 'localhost'])
 const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 
 const PREVIEW_LANGUAGE_BY_EXT = {
@@ -6052,10 +6053,6 @@ async function writeComposerImage(buffer, ext = '.png', name = '') {
   return filePath
 }
 
-function previewLabelForUrl(url) {
-  return `${url.host}${url.pathname === '/' ? '' : url.pathname}`
-}
-
 function expandUserPath(filePath) {
   const value = String(filePath || '').trim()
 
@@ -6184,30 +6181,6 @@ async function previewFileTarget(rawTarget, baseDir) {
   }
 }
 
-function previewUrlTarget(rawTarget) {
-  const raw = String(rawTarget || '').trim()
-  const url = new URL(raw)
-
-  if (!['http:', 'https:'].includes(url.protocol)) {
-    return null
-  }
-
-  if (!LOCAL_PREVIEW_HOSTS.has(url.hostname.toLowerCase())) {
-    return null
-  }
-
-  if (url.hostname === '0.0.0.0') {
-    url.hostname = '127.0.0.1'
-  }
-
-  return {
-    kind: 'url',
-    label: previewLabelForUrl(url),
-    source: raw,
-    url: url.toString()
-  }
-}
-
 async function normalizePreviewTarget(rawTarget, baseDir) {
   const raw = String(rawTarget || '').trim()
 
@@ -6217,7 +6190,7 @@ async function normalizePreviewTarget(rawTarget, baseDir) {
 
   try {
     if (/^https?:\/\//i.test(raw)) {
-      return previewUrlTarget(raw)
+      return previewHttpUrlTarget(raw)
     }
 
     return await previewFileTarget(raw, baseDir)
@@ -6257,28 +6230,45 @@ async function watchPreviewFile(owner, rawUrl) {
   // it by whole quit-cycles waiting on a change event that never comes.
   const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(owner, () => stopPreviewFileWatch(id))
 
-  const watcher = fs.watch(watchDir, (_eventType, filename) => {
-    const changedName = filename ? path.basename(String(filename)) : ''
-
-    if (changedName && changedName !== targetName) {
+  const emit = () => {
+    if (!fileExists(filePath)) {
       return
     }
 
-    if (timer) {
-      clearTimeout(timer)
-    }
+    sendPreviewFileChangedToOwner(owner, { id, path: filePath, url: pathToFileURL(filePath).toString() }, () =>
+      stopPreviewFileWatch(id)
+    )
+  }
 
-    timer = setTimeout(() => {
-      timer = null
+  // guardedWatch: a win32 event storm closes the raw fs.watch and falls back
+  // to a slow stat poll instead of pinning the main thread (#118974).
+  const watcher = guardedWatch({
+    platform: process.platform,
+    watch: listener => fs.watch(watchDir, listener),
+    onEvent: (_eventType, filename) => {
+      const changedName = filename ? path.basename(String(filename)) : ''
 
-      if (!fileExists(filePath)) {
+      if (changedName && changedName !== targetName) {
         return
       }
 
-      sendPreviewFileChangedToOwner(owner, { id, path: filePath, url: pathToFileURL(filePath).toString() }, () =>
-        stopPreviewFileWatch(id)
-      )
-    }, PREVIEW_WATCH_DEBOUNCE_MS)
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      timer = setTimeout(() => {
+        timer = null
+        emit()
+      }, PREVIEW_WATCH_DEBOUNCE_MS)
+    },
+    snapshot: () => {
+      const stat = fs.statSync(filePath)
+
+      return `${stat.mtimeMs}:${stat.size}`
+    },
+    onPollChange: emit,
+    onTrip: ({ events, windowMs }) =>
+      console.warn(`[hermes] fs.watch storm on ${watchDir} (${events} events within ${windowMs}ms); polling instead`)
   })
 
   previewWatchers.set(id, {
@@ -6345,17 +6335,31 @@ function watchDirectory(owner, rawDir) {
   // watch must not keep polling the disk-plugin door until quit.
   const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(owner, () => stopPreviewFileWatch(id))
 
-  const watcher = fs.watch(watchDir, () => {
-    if (timer) {
-      clearTimeout(timer)
-    }
+  const emit = () => {
+    sendPreviewFileChangedToOwner(owner, { id, path: watchDir, url: pathToFileURL(watchDir).toString() }, () =>
+      stopPreviewFileWatch(id)
+    )
+  }
 
-    timer = setTimeout(() => {
-      timer = null
-      sendPreviewFileChangedToOwner(owner, { id, path: watchDir, url: pathToFileURL(watchDir).toString() }, () =>
-        stopPreviewFileWatch(id)
-      )
-    }, PREVIEW_WATCH_DEBOUNCE_MS)
+  // A win32 event storm here pinned a core at 100% (#118974): the breaker
+  // closes the raw watch and falls back to the readdir poll it replaced.
+  const watcher = guardedWatch({
+    platform: process.platform,
+    watch: listener => fs.watch(watchDir, listener),
+    onEvent: () => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      timer = setTimeout(() => {
+        timer = null
+        emit()
+      }, PREVIEW_WATCH_DEBOUNCE_MS)
+    },
+    snapshot: () => fs.readdirSync(watchDir).sort().join('\0'),
+    onPollChange: emit,
+    onTrip: ({ events, windowMs }) =>
+      console.warn(`[hermes] fs.watch storm on ${watchDir} (${events} events within ${windowMs}ms); polling instead`)
   })
 
   previewWatchers.set(id, {
