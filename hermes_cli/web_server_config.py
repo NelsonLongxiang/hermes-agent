@@ -15,6 +15,7 @@ from hermes_cli.config import (
     read_raw_config,
 )
 from hermes_cli.web_server_memory import _normalize_memory_provider_name
+from tools.transcription_common import STT_MODEL_CATALOG
 from tools.wake_word import _PROVIDER_PREFERENCE
 
 if TYPE_CHECKING:
@@ -123,17 +124,16 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "Text-to-speech provider",
         "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper",
     ),
-    # "mistral" temporarily removed — mistralai PyPI package quarantined
-    # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-    "stt.provider": _select("Speech-to-text provider", "local", "groq", "openai", "xai", "elevenlabs"),
-    "stt.local.model": _select("Local faster-whisper model size", "tiny", "base", "small", "medium", "large-v3"),
-    "stt.groq.model": _select(
-        "Groq Whisper model", "whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"
-    ),
-    "stt.openai.model": _select(
-        "OpenAI transcription model", "whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"
-    ),
-    "stt.elevenlabs.model_id": _select("ElevenLabs Scribe model", "scribe_v2", "scribe_v1"),
+    "stt.provider": _select(
+        "Speech-to-text provider", "local", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra"),
+    "stt.local.model": _select("Local faster-whisper model size", *STT_MODEL_CATALOG["local"]),
+    "stt.groq.model": _select("Groq Whisper model", *STT_MODEL_CATALOG["groq"]),
+    "stt.openai.model": _select("OpenAI transcription model", *STT_MODEL_CATALOG["openai"]),
+    "stt.openai.streaming_model": _select("OpenAI live transcription model (stt.streaming)", "gpt-live-transcribe",
+                                          "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"),
+    "stt.mistral.model": _select("Mistral Voxtral transcription model", *STT_MODEL_CATALOG["mistral"]),
+    "stt.xai.model": _select("xAI transcription model", *STT_MODEL_CATALOG["xai"]),
+    "stt.elevenlabs.model_id": _select("ElevenLabs Scribe model", *STT_MODEL_CATALOG["elevenlabs"]),
     "display.skin": _select("CLI visual theme", "default", "ares", "mono", "slate"),
     "dashboard.theme": _select(
         "Web dashboard visual theme", "default", "midnight", "ember", "mono", "cyberpunk", "rose"
@@ -549,7 +549,7 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
 # Canonical auxiliary task slots. Keep in sync with DEFAULT_CONFIG["auxiliary"]
 # in hermes_cli/config.py — listed here for deterministic ordering in the UI.
 _AUX_TASK_SLOTS: Tuple[str, ...] = (
-    "vision", "compression", "skills_hub", "approval", "mcp", "title_generation", "review",
+    "vision", "compression", "skills_hub", "approval", "mcp", "title_generation", "review", "voice_chat",
     "triage_specifier", "kanban_decomposer", "profile_describer", "curator",
 )
 
@@ -807,6 +807,12 @@ def _normalize_aux_reasoning_effort(value: Optional[str]) -> Optional[str]:
     return "none" if parsed.get("enabled") is False else parsed["effort"]
 
 
+def _aux_default_effort(slot: str) -> str:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    block = (DEFAULT_CONFIG.get("auxiliary") or {}).get(slot)
+    return str(block.get("reasoning_effort") or "") if isinstance(block, dict) else ""
+
+
 def _apply_aux_assignment_sync(cfg: dict, provider: str, model: str, task: str, base_url: str, api_key: str,
                                reasoning_effort: Optional[str] = _UNSET) -> dict:
     from hermes_cli.config import save_config
@@ -862,7 +868,12 @@ def _apply_aux_assignment_sync(cfg: dict, provider: str, model: str, task: str, 
             slot_cfg.pop("base_url", None)
             clear_model_endpoint_credentials(slot_cfg)
         if effort is None:
-            slot_cfg.pop("reasoning_effort", None)
+            # "Inherit" is an explicit "" where the slot ships a default (voice_chat: none); popping
+            # the key would bring that default straight back.
+            if _aux_default_effort(slot):
+                slot_cfg["reasoning_effort"] = ""
+            else:
+                slot_cfg.pop("reasoning_effort", None)
         elif effort is not _UNSET:
             slot_cfg["reasoning_effort"] = effort
         aux[slot] = slot_cfg
